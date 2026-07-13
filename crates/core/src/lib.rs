@@ -3,12 +3,13 @@
 //! unchanged into the desktop app, mobile shells, and the CLI harness.
 //! See docs/SPEC.md at the repo root.
 
-pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");
+pub mod error;
+pub mod gate;
+pub mod mel;
+pub mod synth;
+pub mod types;
 
-#[cfg(test)]
-mod tests {
-    #[test]
-    fn scaffold_builds() {
-        assert!(!super::CORE_VERSION.is_empty());
-    }
-}
+pub use error::{Error, Result};
+pub use types::{Event, EventType, Source, SAMPLE_RATE};
+
+pub const CORE_VERSION: &str = env!("CARGO_PKG_VERSION");

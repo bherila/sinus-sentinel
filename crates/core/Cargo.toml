@@ -4,4 +4,34 @@ version = "0.1.0"
 edition.workspace = true
 publish = false
 
+[features]
+default = []
+# Live microphone capture via cpal (+ resampling + lock-free transport).
+# Off by default so the core builds/tests on CI without ALSA/CoreAudio system libs.
+live-audio = ["dep:cpal", "dep:rubato", "dep:ringbuf"]
+# ort-backed YAMNet classifier. Off by default so tests never require the ONNX
+# Runtime shared library or the yamnet.onnx model file.
+onnx = ["dep:ort"]
+# OS keychain-backed token storage. Off by default (Linux needs dbus/secret-service).
+keyring = ["dep:keyring"]
+
 [dependencies]
+serde.workspace = true
+serde_json.workspace = true
+thiserror.workspace = true
+uuid.workspace = true
+chrono.workspace = true
+rand.workspace = true
+hound.workspace = true
+realfft.workspace = true
+rusqlite.workspace = true
+reqwest.workspace = true
+
+cpal = { workspace = true, optional = true }
+ringbuf = { workspace = true, optional = true }
+rubato = { workspace = true, optional = true }
+keyring = { workspace = true, optional = true }
+ort = { workspace = true, optional = true }
+
+[dev-dependencies]
+tiny_http.workspace = true
