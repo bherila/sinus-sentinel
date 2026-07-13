@@ -9,6 +9,7 @@ mod app;
 mod capture;
 mod shared;
 mod state;
+mod sync;
 
 use std::path::PathBuf;
 
@@ -44,6 +45,11 @@ fn main() -> eframe::Result<()> {
     // Shared, lock-free status bus between the capture/sync worker threads and the
     // tray/UI (SPEC §6). Cloned into each thread; the same cells are observed.
     let shared = shared::SharedStatus::default();
+
+    // The background sync thread drives SyncEngine off the UI thread (SPEC §4.3).
+    // It runs in every build (independent of audio) so stored events still upload
+    // and quiet-hours state is always published.
+    let _sync = sync::spawn_sync(dir.join("events.db"), shared.clone());
 
     // The live capture thread is only spawned when built with `live-audio` and
     // requires mic permission (granted by the OS on first run).

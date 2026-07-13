@@ -17,6 +17,10 @@ live-audio = ["sinus-core/live-audio"]
 # deterministic fallback. Fail-soft: a missing/unloadable model falls back to the
 # heuristic embedder with a "model missing" tray state (SPEC §4 stage ③).
 onnx = ["sinus-core/onnx"]
+# Store the PHR bearer token in the OS keychain for the sync thread (SPEC §7/§8).
+# Off by default so dev builds need no dbus/secret-service; the sync thread falls
+# back to an empty in-memory token store without it.
+keyring = ["sinus-core/keyring"]
 
 [dependencies]
 sinus-core = { path = "../../crates/core" }

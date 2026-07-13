@@ -14,6 +14,23 @@ pub trait TokenStore: Send + Sync {
     fn clear(&self) -> Result<()>;
 }
 
+/// Forward the trait through a boxed store, so callers that pick an implementation
+/// at runtime (e.g. keychain vs. in-memory by build feature) can hold a
+/// `Box<dyn TokenStore>` and still satisfy `SyncEngine<T: TokenStore>`.
+impl TokenStore for Box<dyn TokenStore> {
+    fn get_token(&self) -> Result<Option<String>> {
+        (**self).get_token()
+    }
+
+    fn set_token(&self, token: &str) -> Result<()> {
+        (**self).set_token(token)
+    }
+
+    fn clear(&self) -> Result<()> {
+        (**self).clear()
+    }
+}
+
 /// In-memory token store for tests and ephemeral use.
 #[derive(Debug, Default)]
 pub struct InMemoryTokenStore {

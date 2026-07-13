@@ -51,4 +51,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p sinus-core --features live-audio --all-targets -- -D warnings
       - run: cargo clippy -p sinus-desktop --all-targets -- -D warnings
+      - run: cargo clippy -p sinus-desktop --features live-audio,onnx,keyring --all-targets -- -D warnings
+      - run: cargo test -p sinus-desktop
       - run: cargo build -p sinus-desktop --features live-audio
+      - run: cargo build -p sinus-desktop --features live-audio,onnx,keyring

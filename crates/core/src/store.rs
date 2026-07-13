@@ -332,6 +332,17 @@ impl Store {
             })?)
     }
 
+    /// Count of events awaiting upload (same predicate as [`Store::pending_events`]).
+    /// Cheap for the tray's pending badge (SPEC §6) without materializing rows.
+    pub fn pending_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM events
+             WHERE uploaded_at IS NULL AND deleted = 0 AND reject_count < ?1",
+            params![MAX_REJECTIONS],
+            |r| r.get(0),
+        )?)
+    }
+
     // ----- settings -----------------------------------------------------------
 
     pub fn setting_get(&self, key: &str) -> Result<Option<String>> {

@@ -24,6 +24,7 @@ mod ids {
     pub const MODE_AUTO: &str = "mode_auto";
     pub const MODE_OFFLINE_FIRST: &str = "mode_offline_first";
     pub const MODE_OFFLINE_STRICT: &str = "mode_offline_strict";
+    pub const SYNC_NOW: &str = "sync_now";
     pub const OPEN_HISTORY: &str = "open_history";
     pub const OPEN_SETTINGS: &str = "open_settings";
     pub const QUIT: &str = "quit";
@@ -119,9 +120,15 @@ impl SinusApp {
                 ids::MODE_AUTO => self.set_mode(Mode::AutoBatch),
                 ids::MODE_OFFLINE_FIRST => self.set_mode(Mode::OfflineFirst),
                 ids::MODE_OFFLINE_STRICT => self.set_mode(Mode::OfflineStrict),
+                ids::SYNC_NOW => self.shared.request_sync_now(),
                 ids::OPEN_HISTORY => self.tab = Tab::History,
                 ids::OPEN_SETTINGS => self.tab = Tab::Settings,
-                ids::QUIT => ctx.send_viewport_cmd(egui::ViewportCommand::Close),
+                ids::QUIT => {
+                    // Signal the sync thread to attempt a final flush (auto-batch
+                    // flushes on quit, SPEC §4.3) before the window closes.
+                    self.shared.set_quitting(true);
+                    ctx.send_viewport_cmd(egui::ViewportCommand::Close);
+                }
                 _ => {}
             }
         }
@@ -282,6 +289,23 @@ impl eframe::App for SinusApp {
                 ui.label(format!("mode: {}", self.mode.as_str()));
                 ui.separator();
                 ui.label(format!("model: {}", self.shared.model().label()));
+                ui.separator();
+                ui.label(format!(
+                    "sync: {} ({} pending)",
+                    self.shared.sync().label(),
+                    self.shared.pending()
+                ));
+                if ui
+                    .button("Sync now")
+                    .on_hover_text("flush pending events to the PHR now")
+                    .clicked()
+                {
+                    self.shared.request_sync_now();
+                }
+                if self.shared.quiet() {
+                    ui.separator();
+                    ui.label("🌙 quiet hours");
+                }
                 if let Some(rem) = self.pause.remaining(Utc::now()) {
                     ui.separator();
                     ui.label(format!("paused {}m", rem.num_minutes() + 1));
@@ -324,6 +348,7 @@ fn build_tray() -> Result<tray_icon::TrayIcon, Box<dyn std::error::Error>> {
     let mode_auto = MenuItem::with_id(ids::MODE_AUTO, "Mode: Auto-batch", true, None);
     let mode_of = MenuItem::with_id(ids::MODE_OFFLINE_FIRST, "Mode: Offline-first", true, None);
     let mode_os = MenuItem::with_id(ids::MODE_OFFLINE_STRICT, "Mode: Offline-strict", true, None);
+    let sync_now = MenuItem::with_id(ids::SYNC_NOW, "Sync now", true, None);
     let history = MenuItem::with_id(ids::OPEN_HISTORY, "Open History", true, None);
     let settings = MenuItem::with_id(ids::OPEN_SETTINGS, "Settings", true, None);
     let quit = MenuItem::with_id(ids::QUIT, "Quit", true, None);
@@ -338,6 +363,7 @@ fn build_tray() -> Result<tray_icon::TrayIcon, Box<dyn std::error::Error>> {
         &mode_of,
         &mode_os,
         &PredefinedMenuItem::separator(),
+        &sync_now,
         &history,
         &settings,
         &PredefinedMenuItem::separator(),

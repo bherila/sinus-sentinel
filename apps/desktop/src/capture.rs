@@ -122,6 +122,13 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             continue;
         }
         if let Ok(events) = pipeline.push(&buf[..n]) {
+            // Quiet hours suppress detection *logging* (SPEC §6): keep running the
+            // pipeline (so state/floor/cooldowns stay continuous) but drop the
+            // events at the write site instead of persisting them. The flag is
+            // published by the sync thread from the quiet-hours setting.
+            if shared.quiet() {
+                continue;
+            }
             for detected in &events {
                 let event = pipeline.to_event(detected, &ctx);
                 let _ = store.insert_event(&event);
