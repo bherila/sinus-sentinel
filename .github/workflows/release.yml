@@ -1,0 +1,92 @@
+name: Release
+# Cut a GitHub Release with desktop binaries for the two supported OSes.
+# Trigger by pushing a `v*` tag, or run manually against an existing tag.
+on:
+  push:
+    tags: ['v*']
+  workflow_dispatch:
+    inputs:
+      tag:
+        description: 'Existing tag to (re)build a release for, e.g. v0.1.0-alpha'
+        required: true
+
+permissions:
+  contents: write
+
+concurrency:
+  group: release-${{ github.ref }}
+  cancel-in-progress: false
+
+jobs:
+  # Native release builds. macos-latest and windows-latest are the two OSes the
+  # tray/egui + cpal desktop shell targets; the full feature set matches real use.
+  build:
+    strategy:
+      fail-fast: false
+      matrix:
+        include:
+          - os: macos-latest
+            asset: sinus-sentinel-macos-arm64
+            bin: sinus-desktop
+          - os: windows-latest
+            asset: sinus-sentinel-windows-x64
+            bin: sinus-desktop.exe
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - name: Build desktop (release, full features)
+        run: cargo build --release -p sinus-desktop --features live-audio,onnx,keyring
+
+      - name: Package (macOS)
+        if: runner.os == 'macOS'
+        run: |
+          mkdir -p dist
+          cp "target/release/${{ matrix.bin }}" dist/
+          cp docs/SPEC.md dist/README-SPEC.md
+          tar -C dist -czf "${{ matrix.asset }}.tar.gz" .
+      - name: Package (Windows)
+        if: runner.os == 'Windows'
+        shell: pwsh
+        run: |
+          New-Item -ItemType Directory -Force -Path dist | Out-Null
+          Copy-Item "target/release/${{ matrix.bin }}" dist/
+          Copy-Item docs/SPEC.md dist/README-SPEC.md
+          Compress-Archive -Path dist/* -DestinationPath "${{ matrix.asset }}.zip"
+
+      - uses: actions/upload-artifact@v4
+        with:
+          name: ${{ matrix.asset }}
+          path: sinus-sentinel-*.*
+          if-no-files-found: error
+
+  # Collect the per-OS archives and publish (or update) the release for the tag.
+  release:
+    needs: build
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: actions/download-artifact@v4
+        with:
+          path: artifacts
+          merge-multiple: true
+      - name: Publish release
+        env:
+          GH_TOKEN: ${{ github.token }}
+          TAG: ${{ github.event.inputs.tag || github.ref_name }}
+        run: |
+          set -euo pipefail
+          # Alpha/beta/rc tags are marked as prereleases.
+          PRERELEASE=""
+          case "$TAG" in
+            *-alpha*|*-beta*|*-rc*) PRERELEASE="--prerelease" ;;
+          esac
+          if gh release view "$TAG" >/dev/null 2>&1; then
+            gh release upload "$TAG" artifacts/* --clobber
+          else
+            gh release create "$TAG" artifacts/* \
+              --title "$TAG" \
+              --generate-notes \
+              $PRERELEASE
+          fi
