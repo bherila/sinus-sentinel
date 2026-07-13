@@ -3,6 +3,7 @@
 //! unchanged into the desktop app, mobile shells, and the CLI harness.
 //! See docs/SPEC.md at the repo root.
 
+pub mod classify;
 pub mod error;
 pub mod gate;
 pub mod mel;
