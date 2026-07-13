@@ -8,6 +8,7 @@ pub mod classify;
 pub mod error;
 pub mod gate;
 pub mod mel;
+pub mod pipeline;
 pub mod session;
 pub mod store;
 pub mod sync;
