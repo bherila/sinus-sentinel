@@ -5,18 +5,50 @@ on:
   pull_request:
 
 jobs:
-  check:
+  # Formatting once (rustfmt is platform-independent).
+  fmt:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: rustfmt
+      - run: cargo fmt --check
+
+  # Core + CLI on all three target OSes. These build with default features (no
+  # cpal/ONNX system libs required), plus a compile-check of the ort-backed
+  # `onnx` feature (load-dynamic needs no runtime at build time).
+  core-cli:
     strategy:
+      fail-fast: false
       matrix:
-        # Both GitHub-hosted arm64 images (free minutes on public repos).
-        os: [ubuntu-24.04-arm, macos-latest]
+        os: [ubuntu-24.04-arm, macos-latest, windows-latest]
     runs-on: ${{ matrix.os }}
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
         with:
-          components: rustfmt, clippy
+          components: clippy
       - uses: Swatinem/rust-cache@v2
-      - run: cargo fmt --check
-      - run: cargo clippy --workspace --all-targets -- -D warnings
-      - run: cargo test --workspace
+      - run: cargo clippy -p sinus-core -p sinus-cli --all-targets -- -D warnings
+      - run: cargo test -p sinus-core -p sinus-cli
+      - name: onnx feature compile-check
+        run: cargo build -p sinus-core --features onnx
+
+  # cpal live capture + the egui/tray desktop shell need a display/audio stack
+  # that the Linux runner lacks, so build them only on macOS and Windows.
+  live-and-desktop:
+    strategy:
+      fail-fast: false
+      matrix:
+        os: [macos-latest, windows-latest]
+    runs-on: ${{ matrix.os }}
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p sinus-core --features live-audio --all-targets -- -D warnings
+      - run: cargo clippy -p sinus-desktop --all-targets -- -D warnings
+      - run: cargo build -p sinus-desktop --features live-audio

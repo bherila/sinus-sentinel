@@ -14,18 +14,50 @@ architecture, event taxonomy, sync modes, and milestones.
 
 ## Status
 
-Pre-alpha; scaffold + core pipeline under construction (spec milestones M0–M2).
+Alpha. The pure-Rust core pipeline is complete and tested end-to-end; the desktop
+shell compiles and runs (mic permission + tray require a real desktop session).
+
+### Roadmap (SPEC §11 milestones)
+
+- [x] **M1** — audio pipeline + log-mel + classifier scaffolding, CLI harness +
+  golden corpus. Gate ①, YAMNet log-mel ②, ONNX/prototype classifier ③④,
+  sessionizer ⑤, `cli classify/soak/calibrate`, deterministic golden test.
+- [x] **M2** — SQLite store (WAL) + sessionizer + history view (egui_plot);
+  events survive restart; false-positive ✕ tombstoning.
+- [x] **M3 (client side)** — batch sync engine: idempotent upload, per-event
+  accepted/duplicate/rejected, DELETE tombstones, jittered backoff, three modes.
+  *Backend endpoints (2025-website) are tracked separately.*
+- [x] **M4 (offline-strict)** — offline-strict is structurally incapable of
+  network I/O (no engine constructed); CSV/JSON export is still to wire into UI.
+- [~] **M0/M2 desktop shell** — tray + settings/history windows compile and run;
+  live cpal capture behind `--features live-audio`.
+- [ ] **M5** — teach-mode enrollment UI + Phase B-lite live recognition.
+- [ ] **M6** — mobile companion (stretch).
+
+The ONNX YAMNet backbone is behind the `onnx` feature; everything builds and
+tests **without** `model/yamnet.onnx` (a deterministic backbone drives tests).
 
 ## Layout
 
 - `crates/core` — audio pipeline, gate, DSP, inference, sessionizer, store, sync (no UI deps)
-- `crates/cli` — headless harness: classify WAV files, benchmarks, threshold calibration
+- `crates/cli` — headless harness: classify WAV files, soak, threshold calibration
 - `apps/desktop` — tray-icon + winit + egui app
 - `model/` — ONNX model artifacts (fetched, not committed — see model/README.md)
+- `testdata/` — synthetic golden-corpus WAVs
 
 ## Build
 
 ```bash
-cargo build          # workspace
-cargo test           # core tests incl. golden-WAV corpus (skips if model absent)
+cargo build --workspace
+cargo test  --workspace                       # incl. the golden-WAV corpus test
+
+# Feature-gated pieces (off by default so CI needs no system libs / model file):
+cargo build -p sinus-core --features onnx        # ort-backed YAMNet
+cargo build -p sinus-desktop --features live-audio   # cpal microphone capture
+
+# CLI
+cargo run -p sinus-cli -- gen-testdata testdata
+cargo run -p sinus-cli -- classify testdata/cough.wav
+cargo run -p sinus-cli -- soak --secs 10
+cargo run -p sinus-cli -- calibrate testdata
 ```
