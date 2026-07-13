@@ -17,9 +17,9 @@ use sinus_core::audio::{AudioSource, CpalAudioSource};
 use sinus_core::classify::embed::{BandHeuristicEmbedder, Embedder, WindowFeatures};
 use sinus_core::error::Result as CoreResult;
 use sinus_core::mel::MelPatch;
-use sinus_core::pipeline::{EventContext, Pipeline, PipelineConfig};
+use sinus_core::pipeline::{EventContext, PipelineConfig, StreamingPipeline};
 use sinus_core::store::Store;
-use sinus_core::types::{Source, SAMPLE_RATE};
+use sinus_core::types::Source;
 
 use crate::shared::{ModelStatus, SharedStatus};
 
@@ -98,40 +98,35 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
 
     let mut source = CpalAudioSource::open_default().map_err(|e| e.to_string())?;
     let embedder = build_embedder(&store, &shared);
-    let pipeline = Pipeline::new(PipelineConfig::default(), embedder);
 
-    // Analyze in ~3 s chunks (the gate keeps downstream near-zero when quiet).
-    let chunk_samples = (SAMPLE_RATE as usize) * 3;
+    // One StreamingPipeline for the life of the stream (SPEC §1, live capture):
+    // gate/sessionizer/mel state persists across reads, so events straddling a read
+    // boundary merge, cooldowns persist, and the noise floor converges. Detected
+    // events carry sample-counter timestamps relative to the stream start; map that
+    // origin to wall-clock ONCE, here, rather than doing per-chunk `Utc::now()` math.
+    let mut pipeline = StreamingPipeline::new(PipelineConfig::default(), embedder);
+    let stream_start = Utc::now();
+    let ctx = EventContext {
+        base_time: stream_start,
+        tz_offset_min: local_offset_minutes(),
+        device_id,
+        source: Source::current_desktop(),
+        model_version: pipeline.model_version(),
+    };
+
     let mut buf = vec![0.0f32; 4096];
-    let mut window: Vec<f32> = Vec::with_capacity(chunk_samples);
-
     loop {
         let n = source.read(&mut buf).map_err(|e| e.to_string())?;
         if n == 0 {
             std::thread::sleep(std::time::Duration::from_millis(20));
             continue;
         }
-        window.extend_from_slice(&buf[..n]);
-        if window.len() < chunk_samples {
-            continue;
-        }
-
-        let base_time = Utc::now()
-            - chrono::Duration::milliseconds((window.len() * 1000 / SAMPLE_RATE as usize) as i64);
-        if let Ok(result) = pipeline.process(&window) {
-            let ctx = EventContext {
-                base_time,
-                tz_offset_min: local_offset_minutes(),
-                device_id: device_id.clone(),
-                source: Source::current_desktop(),
-                model_version: pipeline.model_version(),
-            };
-            for detected in &result.events {
+        if let Ok(events) = pipeline.push(&buf[..n]) {
+            for detected in &events {
                 let event = pipeline.to_event(detected, &ctx);
                 let _ = store.insert_event(&event);
             }
         }
-        window.clear();
     }
 }
 

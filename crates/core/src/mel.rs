@@ -144,31 +144,55 @@ impl MelFrontend {
         for f in 0..n_frames {
             let start = f * HOP_LEN;
             let frame = &samples[start..start + FRAME_LEN];
-            for (i, slot) in indata.iter_mut().enumerate() {
-                *slot = if i < FRAME_LEN {
-                    frame[i] * self.window[i]
-                } else {
-                    0.0
-                };
-            }
-            self.r2c
-                .process(&mut indata, &mut spectrum)
-                .expect("realfft: fixed-size buffers");
-            for (m, c) in mag.iter_mut().zip(spectrum.iter()) {
-                *m = Complex::norm(*c);
-            }
-            let mut row = [0.0f32; N_MEL];
-            for (j, band) in row.iter_mut().enumerate() {
-                let fb = &self.filterbank[j];
-                let mut acc = 0.0f32;
-                for i in 0..N_SPEC_BINS {
-                    acc += mag[i] * fb[i];
-                }
-                *band = (acc + LOG_OFFSET).ln();
-            }
-            out.push(row);
+            out.push(self.mel_row(frame, &mut indata, &mut spectrum, &mut mag));
         }
         out
+    }
+
+    /// Compute one log-mel frame from exactly [`FRAME_LEN`] samples. Used by the
+    /// streaming pipeline, which carries a remainder buffer across `push` calls so
+    /// no frame is dropped at a chunk boundary (SPEC §4.1 ②). Allocates its own
+    /// scratch; batch callers should prefer [`Self::log_mel_frames`].
+    pub fn log_mel_frame(&self, frame: &[f32]) -> [f32; N_MEL] {
+        debug_assert_eq!(frame.len(), FRAME_LEN);
+        let mut indata = self.r2c.make_input_vec();
+        let mut spectrum = self.r2c.make_output_vec();
+        let mut mag = [0.0f32; N_SPEC_BINS];
+        self.mel_row(frame, &mut indata, &mut spectrum, &mut mag)
+    }
+
+    /// The shared inner STFT→mel→log computation for one frame (SPEC §4.1 ②). The
+    /// scratch buffers are passed in so batch framing reuses one allocation.
+    fn mel_row(
+        &self,
+        frame: &[f32],
+        indata: &mut [f32],
+        spectrum: &mut [Complex<f32>],
+        mag: &mut [f32; N_SPEC_BINS],
+    ) -> [f32; N_MEL] {
+        for (i, slot) in indata.iter_mut().enumerate() {
+            *slot = if i < FRAME_LEN {
+                frame[i] * self.window[i]
+            } else {
+                0.0
+            };
+        }
+        self.r2c
+            .process(indata, spectrum)
+            .expect("realfft: fixed-size buffers");
+        for (m, c) in mag.iter_mut().zip(spectrum.iter()) {
+            *m = Complex::norm(*c);
+        }
+        let mut row = [0.0f32; N_MEL];
+        for (j, band) in row.iter_mut().enumerate() {
+            let fb = &self.filterbank[j];
+            let mut acc = 0.0f32;
+            for i in 0..N_SPEC_BINS {
+                acc += mag[i] * fb[i];
+            }
+            *band = (acc + LOG_OFFSET).ln();
+        }
+        row
     }
 
     /// Assemble 96-frame patches (0.5 s hop) from a signal. Segments shorter than
