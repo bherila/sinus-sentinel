@@ -276,6 +276,7 @@ impl<T: TokenStore> SyncEngine<T> {
             }
             let results = self.upload_batch(&batch)?;
             let mut uploaded = Vec::new();
+            let mut rejected = Vec::new();
             for r in results {
                 match r.status {
                     EventStatus::Accepted => {
@@ -286,12 +287,20 @@ impl<T: TokenStore> SyncEngine<T> {
                         outcome.duplicate += 1;
                         uploaded.push(r.uuid);
                     }
-                    EventStatus::Rejected => outcome.rejected += 1,
+                    EventStatus::Rejected => {
+                        outcome.rejected += 1;
+                        rejected.push(r.uuid);
+                    }
                 }
             }
-            store.mark_uploaded(&uploaded, Utc::now())?;
+            let now = Utc::now();
+            store.mark_uploaded(&uploaded, now)?;
+            // Record rejections so a permanently-rejected event stops being re-sent
+            // after `MAX_REJECTIONS` (SPEC §4.3) instead of looping forever.
+            store.mark_rejected(&rejected, now)?;
             // If nothing was marked uploaded, avoid an infinite loop on a
-            // fully-rejected batch.
+            // fully-rejected batch — the rejected rows are now counted and will
+            // drop out of `pending_events` once they pass the cap.
             if uploaded.is_empty() {
                 break;
             }
@@ -332,6 +341,8 @@ mod tests {
             device_id: "dev".into(),
             uploaded_at: None,
             deleted: false,
+            reject_count: 0,
+            rejected_at: None,
         }
     }
 

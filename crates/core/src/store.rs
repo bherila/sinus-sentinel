@@ -33,6 +33,11 @@ pub struct StoredEnrollment {
     pub enrollment: Enrollment,
 }
 
+/// After this many server rejections an event stops being re-sent and is left for
+/// the history UI to surface (SPEC §4.3). Rejections are permanent verdicts, not
+/// transient failures, so re-sending forever is pointless.
+pub const MAX_REJECTIONS: i64 = 3;
+
 /// The SQLite-backed store.
 pub struct Store {
     conn: Connection,
@@ -106,6 +111,11 @@ impl Store {
                     value TEXT NOT NULL
                 );",
             ),
+            (
+                4,
+                "ALTER TABLE events ADD COLUMN reject_count INTEGER NOT NULL DEFAULT 0;
+                 ALTER TABLE events ADD COLUMN rejected_at TEXT NULL;",
+            ),
         ];
 
         let current: i64 = self.conn.query_row(
@@ -164,17 +174,32 @@ impl Store {
         Ok(())
     }
 
-    fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Event> {
+    /// Decode a row into an [`Event`], or `Ok(None)` if it is unparseable. A health
+    /// diary must never *misreport* a corrupt row (unknown `event_type`, malformed
+    /// `occurred_at`), so instead of silently coercing to a default we skip the row
+    /// and log it (SPEC §4 — fail loud, not silently wrong). Genuine column-type
+    /// errors still propagate as `Err`.
+    fn row_to_event(row: &rusqlite::Row) -> rusqlite::Result<Option<Event>> {
+        let uuid: String = row.get("uuid")?;
         let occurred: String = row.get("occurred_at")?;
         let uploaded: Option<String> = row.get("uploaded_at")?;
         let etype: String = row.get("event_type")?;
         let src: String = row.get("source")?;
-        Ok(Event {
-            uuid: row.get("uuid")?,
-            event_type: EventType::parse(&etype).unwrap_or(EventType::Cough),
-            occurred_at: DateTime::parse_from_rfc3339(&occurred)
-                .map(|d| d.with_timezone(&Utc))
-                .unwrap_or_else(|_| Utc::now()),
+        let rejected: Option<String> = row.get("rejected_at")?;
+
+        let Some(event_type) = EventType::parse(&etype) else {
+            eprintln!("store: skipping event {uuid}: unknown event_type {etype:?}");
+            return Ok(None);
+        };
+        let Ok(occurred_at) = DateTime::parse_from_rfc3339(&occurred) else {
+            eprintln!("store: skipping event {uuid}: unparseable occurred_at {occurred:?}");
+            return Ok(None);
+        };
+
+        Ok(Some(Event {
+            uuid,
+            event_type,
+            occurred_at: occurred_at.with_timezone(&Utc),
             tz_offset_min: row.get("tz_offset_min")?,
             duration_ms: row.get("duration_ms")?,
             confidence: row.get("confidence")?,
@@ -186,7 +211,11 @@ impl Store {
                 .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
                 .map(|d| d.with_timezone(&Utc)),
             deleted: row.get::<_, i64>("deleted")? != 0,
-        })
+            reject_count: row.get("reject_count")?,
+            rejected_at: rejected
+                .and_then(|s| DateTime::parse_from_rfc3339(&s).ok())
+                .map(|d| d.with_timezone(&Utc)),
+        }))
     }
 
     /// Fetch one event by uuid.
@@ -198,18 +227,24 @@ impl Store {
                 params![uuid],
                 Self::row_to_event,
             )
-            .optional()?)
+            .optional()?
+            .flatten())
     }
 
-    /// Events awaiting upload: not yet uploaded and not deleted, oldest first.
+    /// Events awaiting upload: not yet uploaded, not deleted, and not yet rejected
+    /// past [`MAX_REJECTIONS`], oldest first. Corrupt rows are skipped (logged).
     pub fn pending_events(&self, limit: usize) -> Result<Vec<Event>> {
         let mut stmt = self.conn.prepare(
             "SELECT * FROM events
-             WHERE uploaded_at IS NULL AND deleted = 0
+             WHERE uploaded_at IS NULL AND deleted = 0 AND reject_count < ?2
              ORDER BY occurred_at ASC LIMIT ?1",
         )?;
-        let rows = stmt.query_map(params![limit as i64], Self::row_to_event)?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        let rows = stmt.query_map(params![limit as i64, MAX_REJECTIONS], Self::row_to_event)?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// Uuids of already-uploaded events the user has since deleted — these need a
@@ -230,6 +265,21 @@ impl Store {
         for uuid in uuids {
             self.conn.execute(
                 "UPDATE events SET uploaded_at = ?2 WHERE uuid = ?1",
+                params![uuid, ts],
+            )?;
+        }
+        Ok(())
+    }
+
+    /// Record a server rejection: bumps `reject_count` and stamps `rejected_at`.
+    /// Once `reject_count` reaches [`MAX_REJECTIONS`] the event drops out of
+    /// [`Store::pending_events`] and is left for the history UI (SPEC §4.3).
+    pub fn mark_rejected(&self, uuids: &[String], at: DateTime<Utc>) -> Result<()> {
+        let ts = at.to_rfc3339();
+        for uuid in uuids {
+            self.conn.execute(
+                "UPDATE events SET reject_count = reject_count + 1, rejected_at = ?2
+                 WHERE uuid = ?1",
                 params![uuid, ts],
             )?;
         }
@@ -266,7 +316,11 @@ impl Store {
             params![from.to_rfc3339(), to.to_rfc3339()],
             Self::row_to_event,
         )?;
-        Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     /// Count of not-deleted events.
@@ -397,17 +451,19 @@ mod tests {
             device_id: "dev-1".to_string(),
             uploaded_at: None,
             deleted: false,
+            reject_count: 0,
+            rejected_at: None,
         }
     }
 
     #[test]
     fn migrations_apply_and_are_idempotent() {
         let store = Store::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
         // Re-running migrate on the same connection is a no-op.
         let mut store = store;
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 3);
+        assert_eq!(store.schema_version().unwrap(), 4);
     }
 
     #[test]
@@ -458,6 +514,60 @@ mod tests {
         assert_eq!(tomb, vec!["x".to_string()]);
         store.purge(&tomb).unwrap();
         assert!(store.get_event("x").unwrap().is_none());
+    }
+
+    #[test]
+    fn rejected_events_drop_out_of_pending_after_max_rejections() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_event(&sample_event("r")).unwrap();
+        assert_eq!(store.pending_events(10).unwrap().len(), 1);
+
+        // Two rejections: still pending (below the cap).
+        for _ in 0..(MAX_REJECTIONS - 1) {
+            store.mark_rejected(&["r".to_string()], Utc::now()).unwrap();
+        }
+        assert_eq!(store.pending_events(10).unwrap().len(), 1);
+
+        // The MAX_REJECTIONS-th rejection removes it from the pending set, but the
+        // row is retained (with its count/timestamp) for the history UI.
+        store.mark_rejected(&["r".to_string()], Utc::now()).unwrap();
+        assert!(store.pending_events(10).unwrap().is_empty());
+        let got = store.get_event("r").unwrap().unwrap();
+        assert_eq!(got.reject_count, MAX_REJECTIONS);
+        assert!(got.rejected_at.is_some());
+    }
+
+    #[test]
+    fn corrupt_rows_are_skipped_not_coerced() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_event(&sample_event("good")).unwrap();
+        // Hand-insert two corrupt rows: an unknown event_type and a malformed
+        // occurred_at. Neither should surface as a (mis-typed) event.
+        store
+            .conn
+            .execute(
+                "INSERT INTO events (uuid, event_type, occurred_at, tz_offset_min, duration_ms,
+                    confidence, burst_count, model_version, source, device_id, deleted)
+                 VALUES ('bad_type','not_a_class','2026-01-01T00:00:00Z',0,1,0.5,1,'m','desktop-mac','d',0)",
+                [],
+            )
+            .unwrap();
+        store
+            .conn
+            .execute(
+                "INSERT INTO events (uuid, event_type, occurred_at, tz_offset_min, duration_ms,
+                    confidence, burst_count, model_version, source, device_id, deleted)
+                 VALUES ('bad_date','cough','not-a-date',0,1,0.5,1,'m','desktop-mac','d',0)",
+                [],
+            )
+            .unwrap();
+
+        // Only the good row comes back; the corrupt ones are skipped (and logged).
+        let pending = store.pending_events(10).unwrap();
+        assert_eq!(pending.len(), 1);
+        assert_eq!(pending[0].uuid, "good");
+        assert!(store.get_event("bad_type").unwrap().is_none());
+        assert!(store.get_event("bad_date").unwrap().is_none());
     }
 
     #[test]

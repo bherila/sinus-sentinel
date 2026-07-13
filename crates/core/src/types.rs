@@ -135,6 +135,14 @@ pub struct Event {
     /// User removed a local false positive.
     #[serde(default)]
     pub deleted: bool,
+    /// Number of times the server has `rejected` this event on upload. After a
+    /// small cap it stops being re-sent and is surfaced in history instead
+    /// (SPEC §4.3 — a rejected event is a permanent no-op, not a retry loop).
+    #[serde(default)]
+    pub reject_count: i64,
+    /// When the most recent rejection was recorded (`None` = never rejected).
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub rejected_at: Option<chrono::DateTime<chrono::Utc>>,
 }
 
 #[cfg(test)]

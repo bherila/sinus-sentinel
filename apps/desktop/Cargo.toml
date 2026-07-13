@@ -13,6 +13,10 @@ default = []
 # Enable live microphone capture (cpal) — the real sensor path. Off by default so
 # the UI shell builds in CI without audio system libs; enabled for real use.
 live-audio = ["sinus-core/live-audio"]
+# Use the real ort-backed YAMNet backbone in the capture thread instead of the
+# deterministic fallback. Fail-soft: a missing/unloadable model falls back to the
+# heuristic embedder with a "model missing" tray state (SPEC §4 stage ③).
+onnx = ["sinus-core/onnx"]
 
 [dependencies]
 sinus-core = { path = "../../crates/core" }

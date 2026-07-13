@@ -174,7 +174,9 @@ impl<E: Embedder> Pipeline<E> {
 
             let mut sorted: Vec<(EventType, f32)> =
                 scores.scores.iter().map(|(&k, &v)| (k, v)).collect();
-            sorted.sort_by(|a, b| b.1.partial_cmp(&a.1).unwrap());
+            // `total_cmp` is NaN-safe: a zero-norm embedding can make a cosine score
+            // NaN, which would panic `partial_cmp().unwrap()` (SPEC §4.1 ④).
+            sorted.sort_by(|a, b| b.1.total_cmp(&a.1));
 
             if let Some(h) = hit {
                 for ev in sessionizer.observe(WindowObservation {
@@ -216,6 +218,8 @@ impl<E: Embedder> Pipeline<E> {
             device_id: ctx.device_id.clone(),
             uploaded_at: None,
             deleted: false,
+            reject_count: 0,
+            rejected_at: None,
         }
     }
 }

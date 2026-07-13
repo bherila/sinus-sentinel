@@ -170,13 +170,21 @@ impl Gate {
             edge = Some(GateEdge::Opened);
         }
 
-        // Update the adaptive floor: slow rise, fast fall.
-        let alpha = if rms_db > self.floor_db {
-            self.alpha_rise
-        } else {
-            self.alpha_fall
-        };
-        self.floor_db += alpha * (rms_db - self.floor_db);
+        // Update the adaptive floor: slow rise, fast fall — but ONLY while the gate
+        // is closed. Freezing the floor while the gate is open is standard
+        // noise-gate practice: an open gate is measuring signal+noise, not the room
+        // floor, so letting the ~3 s rise track a loud event would erode the
+        // open/close margin for the duration of a long event (SPEC §4.1 ①). The
+        // slow-rise "a persistent fan raises the floor" behaviour still holds while
+        // the gate is closed, where the ambient level is what's being measured.
+        if !self.open {
+            let alpha = if rms_db > self.floor_db {
+                self.alpha_rise
+            } else {
+                self.alpha_fall
+            };
+            self.floor_db += alpha * (rms_db - self.floor_db);
+        }
 
         HopReport {
             rms_db,
@@ -250,22 +258,54 @@ mod tests {
     }
 
     #[test]
-    fn persistent_noise_raises_floor_so_gate_recloses() {
-        // A steady moderate hiss should raise the floor (slow rise) and the gate,
-        // if it opened at all on the onset, should settle closed as the floor
-        // catches up — verifying adaptive-floor behaviour.
+    fn floor_rises_toward_ambient_while_gate_closed() {
+        // A steady low hiss that stays *below* the open threshold keeps the gate
+        // closed; the adaptive floor should slow-rise toward it (SPEC §4.1 — "a
+        // persistent fan raises the floor"). Amplitude 0.004 (~ -53 dBFS RMS) sits
+        // above the -60 dBFS init floor but below floor + 10 dB (-50), so the gate
+        // never opens and the floor tracks the ambient upward.
         let cfg = GateConfig::default();
         let mut gate = Gate::new(cfg.clone());
         let hop = cfg.hop_samples();
         let start_floor = gate.floor_db();
-        let noise = synth::white_noise_hops(400, hop, 0.05, 3);
+        let noise = synth::white_noise_hops(600, hop, 0.004, 3);
         for chunk in noise.chunks(hop) {
-            gate.process_hop(chunk);
+            let r = gate.process_hop(chunk);
+            assert!(!r.open, "quiet ambient must not open the gate");
         }
         assert!(
-            gate.floor_db() > start_floor + 10.0,
-            "floor should rise toward persistent noise: {} -> {}",
+            gate.floor_db() > start_floor + 5.0,
+            "floor should rise toward ambient while closed: {} -> {}",
             start_floor,
+            gate.floor_db()
+        );
+    }
+
+    #[test]
+    fn floor_frozen_while_gate_open() {
+        // Standard noise-gate behaviour: once the gate opens on a loud event, the
+        // noise floor is frozen so the long event can't erode the margin (SPEC
+        // §4.1, review finding #3). Verify the floor barely moves across a
+        // multi-second open span even though the signal is far above it.
+        let cfg = GateConfig::default();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+
+        // Open the gate with a loud tone.
+        let loud = synth::sine_hops(1, hop, cfg.sample_rate, 900.0, 0.5);
+        let r = gate.process_hop(&loud);
+        assert!(r.open, "loud tone should open the gate");
+        let floor_at_open = gate.floor_db();
+
+        // Hold it open for ~2 s of loud signal; the frozen floor must not drift.
+        let hold = synth::sine_hops(40, hop, cfg.sample_rate, 900.0, 0.5);
+        for chunk in hold.chunks(hop) {
+            let r = gate.process_hop(chunk);
+            assert!(r.open, "gate should stay open under sustained signal");
+        }
+        assert!(
+            (gate.floor_db() - floor_at_open).abs() < 0.01,
+            "floor must stay frozen while open: {floor_at_open} -> {}",
             gate.floor_db()
         );
     }

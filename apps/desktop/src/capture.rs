@@ -2,31 +2,93 @@
 //! microphone via `cpal`, runs the identical core pipeline, and writes detected
 //! events to the store. Requires OS mic permission (granted on first run).
 //!
-//! This uses the model-free `BandHeuristicEmbedder` as a placeholder backbone; a
-//! real deployment builds with `--features onnx` and swaps in `YamnetOnnx`
-//! (see model/README.md). The pipeline stages are otherwise identical to the CLI.
+//! Backbone selection (SPEC §4 stage ③): built with `--features onnx` the thread
+//! tries [`YamnetOnnx::load`] (model path from the `model_path` setting, default
+//! `model/yamnet.onnx`, honoring `ORT_DYLIB_PATH` via ort's load-dynamic). On any
+//! load failure it falls back to the model-free [`BandHeuristicEmbedder`] and
+//! surfaces a "model missing" state in the tray. Without the feature it always
+//! uses the heuristic backbone. The pipeline stages are otherwise identical.
 
 use std::path::PathBuf;
 use std::thread::JoinHandle;
 
 use chrono::Utc;
 use sinus_core::audio::{AudioSource, CpalAudioSource};
-use sinus_core::classify::embed::BandHeuristicEmbedder;
+use sinus_core::classify::embed::{BandHeuristicEmbedder, Embedder, WindowFeatures};
+use sinus_core::error::Result as CoreResult;
+use sinus_core::mel::MelPatch;
 use sinus_core::pipeline::{EventContext, Pipeline, PipelineConfig};
 use sinus_core::store::Store;
 use sinus_core::types::{Source, SAMPLE_RATE};
 
+use crate::shared::{ModelStatus, SharedStatus};
+
+/// The backbone the capture thread runs. An enum (not `dyn`) so the generic
+/// [`Pipeline`] stays monomorphized and the ONNX variant only exists when the
+/// feature is on.
+enum CaptureEmbedder {
+    Heuristic(BandHeuristicEmbedder),
+    #[cfg(feature = "onnx")]
+    Yamnet(sinus_core::classify::yamnet::YamnetOnnx),
+}
+
+impl Embedder for CaptureEmbedder {
+    fn model_version(&self) -> String {
+        match self {
+            CaptureEmbedder::Heuristic(e) => e.model_version(),
+            #[cfg(feature = "onnx")]
+            CaptureEmbedder::Yamnet(e) => e.model_version(),
+        }
+    }
+
+    fn embed(&self, patch: &MelPatch, energy_peak: bool) -> CoreResult<WindowFeatures> {
+        match self {
+            CaptureEmbedder::Heuristic(e) => e.embed(patch, energy_peak),
+            #[cfg(feature = "onnx")]
+            CaptureEmbedder::Yamnet(e) => e.embed(patch, energy_peak),
+        }
+    }
+}
+
+/// Pick the backbone, publishing the resulting [`ModelStatus`] to the tray.
+fn build_embedder(_store: &Store, shared: &SharedStatus) -> CaptureEmbedder {
+    #[cfg(feature = "onnx")]
+    {
+        let path = _store
+            .setting_get("model_path")
+            .ok()
+            .flatten()
+            .unwrap_or_else(|| "model/yamnet.onnx".to_string());
+        match sinus_core::classify::yamnet::YamnetOnnx::load(&path) {
+            Ok(y) => {
+                shared.set_model(ModelStatus::Onnx);
+                CaptureEmbedder::Yamnet(y)
+            }
+            Err(e) => {
+                eprintln!("capture: ONNX model unavailable ({e}); falling back to band-heuristic");
+                shared.set_model(ModelStatus::Missing);
+                CaptureEmbedder::Heuristic(BandHeuristicEmbedder)
+            }
+        }
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        shared.set_model(ModelStatus::Heuristic);
+        CaptureEmbedder::Heuristic(BandHeuristicEmbedder)
+    }
+}
+
 /// Spawn the capture thread. Returns its handle; the thread runs until the process
 /// exits. Errors (no device, permission denied) are logged, not fatal.
-pub fn spawn_capture(db_path: PathBuf) -> JoinHandle<()> {
+pub fn spawn_capture(db_path: PathBuf, shared: SharedStatus) -> JoinHandle<()> {
     std::thread::spawn(move || {
-        if let Err(e) = run(db_path) {
+        if let Err(e) = run(db_path, shared) {
             eprintln!("capture: {e}");
         }
     })
 }
 
-fn run(db_path: PathBuf) -> Result<(), String> {
+fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     let store = Store::open(&db_path).map_err(|e| e.to_string())?;
     let device_id = store
         .setting_get("device_id")
@@ -35,7 +97,8 @@ fn run(db_path: PathBuf) -> Result<(), String> {
         .unwrap_or_else(|| "unknown".to_string());
 
     let mut source = CpalAudioSource::open_default().map_err(|e| e.to_string())?;
-    let pipeline = Pipeline::new(PipelineConfig::default(), BandHeuristicEmbedder);
+    let embedder = build_embedder(&store, &shared);
+    let pipeline = Pipeline::new(PipelineConfig::default(), embedder);
 
     // Analyze in ~3 s chunks (the gate keeps downstream near-zero when quiet).
     let chunk_samples = (SAMPLE_RATE as usize) * 3;

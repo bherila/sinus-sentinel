@@ -7,6 +7,7 @@
 mod app;
 #[cfg(feature = "live-audio")]
 mod capture;
+mod shared;
 mod state;
 
 use std::path::PathBuf;
@@ -40,10 +41,14 @@ fn main() -> eframe::Result<()> {
         std::process::exit(1);
     });
 
+    // Shared, lock-free status bus between the capture/sync worker threads and the
+    // tray/UI (SPEC §6). Cloned into each thread; the same cells are observed.
+    let shared = shared::SharedStatus::default();
+
     // The live capture thread is only spawned when built with `live-audio` and
     // requires mic permission (granted by the OS on first run).
     #[cfg(feature = "live-audio")]
-    let _capture = capture::spawn_capture(dir.join("events.db"));
+    let _capture = capture::spawn_capture(dir.join("events.db"), shared.clone());
 
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
@@ -55,6 +60,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Sinus Sentinel",
         native_options,
-        Box::new(move |cc| Ok(Box::new(app::SinusApp::new(cc, store)))),
+        Box::new(move |cc| Ok(Box::new(app::SinusApp::new(cc, store, shared)))),
     )
 }

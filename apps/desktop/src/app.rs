@@ -12,6 +12,7 @@ use sinus_core::store::Store;
 use sinus_core::sync::Mode;
 use sinus_core::types::EventType;
 
+use crate::shared::{ModelStatus, SharedStatus};
 use crate::state::{self, PauseState};
 
 /// Menu item ids.
@@ -52,10 +53,11 @@ pub struct SinusApp {
     #[cfg(not(test))]
     _tray: Option<tray_icon::TrayIcon>,
     device_id: String,
+    shared: SharedStatus,
 }
 
 impl SinusApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, store: Store) -> Self {
+    pub fn new(_cc: &eframe::CreationContext<'_>, store: Store, shared: SharedStatus) -> Self {
         let sensitivity = store
             .setting_get("sensitivity")
             .ok()
@@ -92,6 +94,7 @@ impl SinusApp {
             #[cfg(not(test))]
             _tray: build_tray().ok(),
             device_id,
+            shared,
         }
     }
 
@@ -127,9 +130,12 @@ impl SinusApp {
     fn status_glyph(&mut self) -> &'static str {
         let now = Utc::now();
         self.pause = self.pause.normalized(now);
+        // A missing model (fail-soft fallback in the capture thread) is a warning
+        // state (SPEC §6 tray "⚠"), shown ahead of the plain listening glyph.
         match self.mode {
             Mode::OfflineStrict => "📴",
             _ if self.pause.is_paused(now) => "⏸",
+            _ if self.shared.model() == ModelStatus::Missing => "⚠",
             _ => "🟢",
         }
     }
@@ -274,6 +280,8 @@ impl eframe::App for SinusApp {
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
                 ui.separator();
                 ui.label(format!("mode: {}", self.mode.as_str()));
+                ui.separator();
+                ui.label(format!("model: {}", self.shared.model().label()));
                 if let Some(rem) = self.pause.remaining(Utc::now()) {
                     ui.separator();
                     ui.label(format!("paused {}m", rem.num_minutes() + 1));

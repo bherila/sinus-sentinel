@@ -128,6 +128,8 @@ mod tests {
             device_id: "d".into(),
             uploaded_at: None,
             deleted: false,
+            reject_count: 0,
+            rejected_at: None,
         }
     }
 
