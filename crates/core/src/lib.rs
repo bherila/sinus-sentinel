@@ -7,6 +7,8 @@ pub mod classify;
 pub mod error;
 pub mod gate;
 pub mod mel;
+pub mod session;
+pub mod store;
 pub mod synth;
 pub mod types;
 
