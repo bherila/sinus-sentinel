@@ -9,7 +9,9 @@ pub mod gate;
 pub mod mel;
 pub mod session;
 pub mod store;
+pub mod sync;
 pub mod synth;
+pub mod token;
 pub mod types;
 
 pub use error::{Error, Result};
