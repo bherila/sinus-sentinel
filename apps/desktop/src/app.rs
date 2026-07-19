@@ -318,10 +318,16 @@ impl SinusApp {
 
         ui.heading("Today");
         ui.horizontal_wrapped(|ui| {
+            let dark = ui.visuals().dark_mode;
             for et in EventType::ALL {
                 let n = today.get(&et).copied().unwrap_or(0);
                 if n > 0 {
-                    ui.label(format!("{}: {n}", et.as_str()));
+                    // The colored square ties the count to its series in the
+                    // chart below; the text itself stays in normal ink.
+                    ui.horizontal(|ui| {
+                        ui.label(egui::RichText::new("■").color(class_color(et, dark)));
+                        ui.label(format!("{}: {n}", et.as_str().replace('_', " ")));
+                    });
                     ui.separator();
                 }
             }
@@ -340,17 +346,95 @@ impl SinusApp {
         ui.separator();
         ui.heading("Last 7 days");
         let hist = state::daily_histogram(&self.store, 7, now);
-        let bars: Vec<Bar> = hist
-            .iter()
-            .enumerate()
-            .map(|(i, day)| Bar::new(i as f64, day.total() as f64).name(day.date.to_string()))
-            .collect();
-        Plot::new("trend_7d")
-            .legend(Legend::default())
-            .height(160.0)
-            .show(ui, |plot_ui| {
-                plot_ui.bar_chart(BarChart::new(bars).name("events/day"));
-            });
+        let dark = ui.visuals().dark_mode;
+        let surface = ui.visuals().panel_fill;
+
+        // One stacked series per class that occurred this week, in fixed class
+        // order with class-bound colors — a week without sneezes must not
+        // recolor the remaining series.
+        let mut charts: Vec<BarChart> = Vec::new();
+        for class in EventType::ALL {
+            let counts: Vec<i64> = hist
+                .iter()
+                .map(|day| day.counts.get(&class).copied().unwrap_or(0))
+                .collect();
+            if counts.iter().all(|&count| count == 0) {
+                continue;
+            }
+            let color = class_color(class, dark);
+            let bars: Vec<Bar> = counts
+                .iter()
+                .enumerate()
+                .map(|(i, &count)| {
+                    let bar = Bar::new(i as f64, count as f64).width(0.72).fill(color);
+                    // A surface-colored hairline separates stacked segments;
+                    // zero-height bars get none so empty days stay blank.
+                    if count > 0 {
+                        bar.stroke(egui::Stroke::new(1.5_f32, surface))
+                    } else {
+                        bar
+                    }
+                })
+                .collect();
+            let label = class.as_str().replace('_', " ");
+            let dates: Vec<String> = hist
+                .iter()
+                .map(|day| day.date.format("%b %-d").to_string())
+                .collect();
+            let mut chart = BarChart::new(bars).name(&label).color(color).element_formatter(
+                Box::new(move |bar, _| {
+                    let date = dates
+                        .get(bar.argument.round() as usize)
+                        .cloned()
+                        .unwrap_or_default();
+                    format!("{label}: {} — {date}", bar.value.round() as i64)
+                }),
+            );
+            let stacked_below: Vec<&BarChart> = charts.iter().collect();
+            chart = chart.stack_on(&stacked_below);
+            charts.push(chart);
+        }
+
+        if charts.is_empty() {
+            ui.label("no events in the last 7 days");
+        } else {
+            let day_labels: Vec<String> = hist
+                .iter()
+                .map(|day| day.date.format("%a").to_string())
+                .collect();
+            Plot::new("trend_7d")
+                .legend(Legend::default())
+                .height(180.0)
+                // A fixed 7-day window has nothing to pan or zoom; leaving the
+                // defaults on makes the chart eat window-scroll gestures.
+                .allow_drag(false)
+                .allow_zoom(false)
+                .allow_scroll(false)
+                .allow_boxed_zoom(false)
+                .allow_double_click_reset(false)
+                .include_y(0.0)
+                .x_axis_formatter(move |mark, _range| {
+                    let index = mark.value;
+                    if index.fract().abs() < f64::EPSILON && index >= 0.0 {
+                        day_labels.get(index as usize).cloned().unwrap_or_default()
+                    } else {
+                        String::new()
+                    }
+                })
+                // Event counts are integers; suppress fractional gridline labels.
+                .y_axis_formatter(|mark, _range| {
+                    if mark.value.fract().abs() < f64::EPSILON && mark.value >= 0.0 {
+                        format!("{}", mark.value as i64)
+                    } else {
+                        String::new()
+                    }
+                })
+                .show(ui, |plot_ui| {
+                    for chart in charts {
+                        plot_ui.bar_chart(chart);
+                    }
+                });
+        }
 
         ui.separator();
         ui.heading("Recent events");
@@ -642,6 +726,29 @@ impl SinusApp {
         ui.label("macOS: Sinus Sentinel stays in the menu bar without a Dock icon. Closing this window hides it; use the menu-bar icon to reopen or quit.");
         ui.label(format!("device id: {}", self.device_id));
         ui.label("Privacy: only event metadata is stored/sent — never audio.");
+    }
+}
+
+/// Fixed per-class chart colors. Bound to the class, never the visible-series
+/// index, so a week without some class never repaints the others. Slots follow
+/// the classes' declaration order; both mode variants were validated (CVD
+/// adjacent-pair separation, normal-vision floor, chroma/lightness bands)
+/// against the actual egui panel surfaces — light #f8f8f8, dark #1b1b1b.
+fn class_color(class: EventType, dark: bool) -> egui::Color32 {
+    match (class, dark) {
+        (EventType::Cough, false) => egui::Color32::from_rgb(0x2a, 0x78, 0xd6),
+        (EventType::Cough, true) => egui::Color32::from_rgb(0x39, 0x87, 0xe5),
+        (EventType::ThroatClearing, _) => egui::Color32::from_rgb(0x00, 0x83, 0x00),
+        (EventType::Sniffle, false) => egui::Color32::from_rgb(0xe8, 0x7b, 0xa4),
+        (EventType::Sniffle, true) => egui::Color32::from_rgb(0xd5, 0x51, 0x81),
+        (EventType::Sneeze, false) => egui::Color32::from_rgb(0xed, 0xa1, 0x00),
+        (EventType::Sneeze, true) => egui::Color32::from_rgb(0xc9, 0x85, 0x00),
+        (EventType::NoseBlow, false) => egui::Color32::from_rgb(0x1b, 0xaf, 0x7a),
+        (EventType::NoseBlow, true) => egui::Color32::from_rgb(0x19, 0x9e, 0x70),
+        (EventType::Hawk, false) => egui::Color32::from_rgb(0xeb, 0x68, 0x34),
+        (EventType::Hawk, true) => egui::Color32::from_rgb(0xd9, 0x59, 0x26),
+        (EventType::SnortSuck, false) => egui::Color32::from_rgb(0x4a, 0x3a, 0xa7),
+        (EventType::SnortSuck, true) => egui::Color32::from_rgb(0x90, 0x85, 0xe9),
     }
 }
 

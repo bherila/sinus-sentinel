@@ -38,6 +38,8 @@ pub struct DayCount {
 }
 
 impl DayCount {
+    // The chart now stacks per-class series, so only tests still sum a day.
+    #[cfg_attr(not(test), allow(dead_code))]
     pub fn total(&self) -> i64 {
         self.counts.values().sum()
     }
