@@ -71,6 +71,7 @@ struct BatchResponse {
 /// audio).
 #[derive(Debug, Clone, Serialize)]
 struct UploadEvent<'a> {
+    #[serde(rename = "client_event_uuid")]
     uuid: &'a str,
     event_type: &'a str,
     occurred_at: String,
@@ -78,6 +79,9 @@ struct UploadEvent<'a> {
     duration_ms: i64,
     confidence: f32,
     burst_count: i64,
+    source: &'a str,
+    device_id: &'a str,
+    model_version: &'a str,
 }
 
 impl<'a> From<&'a Event> for UploadEvent<'a> {
@@ -90,15 +94,15 @@ impl<'a> From<&'a Event> for UploadEvent<'a> {
             duration_ms: e.duration_ms,
             confidence: e.confidence,
             burst_count: e.burst_count,
+            source: e.source.as_str(),
+            device_id: &e.device_id,
+            model_version: &e.model_version,
         }
     }
 }
 
 #[derive(Debug, Clone, Serialize)]
 struct BatchRequest<'a> {
-    device_id: &'a str,
-    source: &'a str,
-    model_version: &'a str,
     events: Vec<UploadEvent<'a>>,
 }
 
@@ -119,7 +123,7 @@ pub struct SyncOutcome {
 /// Sync engine configuration.
 #[derive(Debug, Clone)]
 pub struct SyncConfig {
-    /// Backend base URL, e.g. `https://example.test` (no trailing slash).
+    /// Backend base URL or complete respiratory-event batch endpoint.
     pub base_url: String,
     /// PHR patient id the events bind to.
     pub patient_id: i64,
@@ -132,11 +136,15 @@ pub struct SyncConfig {
 
 impl SyncConfig {
     fn batch_url(&self) -> String {
-        format!(
-            "{}/api/phr/patients/{}/respiratory-events/batch",
-            self.base_url.trim_end_matches('/'),
-            self.patient_id
-        )
+        let configured = self.base_url.trim_end_matches('/');
+        if configured.ends_with("/respiratory-events/batch") {
+            configured.to_string()
+        } else {
+            format!(
+                "{configured}/api/phr/patients/{}/respiratory-events/batch",
+                self.patient_id
+            )
+        }
     }
 }
 
@@ -226,14 +234,12 @@ impl<T: TokenStore> SyncEngine<T> {
     /// Upload one batch and return the server's per-event verdicts.
     fn upload_batch(&self, events: &[Event]) -> Result<Vec<PerEventResult>> {
         let body = BatchRequest {
-            device_id: &self.cfg.device_id,
-            source: self.cfg.source.as_str(),
-            model_version: &self.cfg.model_version,
             events: events.iter().map(UploadEvent::from).collect(),
         };
         let resp = self
             .client
             .post(self.cfg.batch_url())
+            .header(reqwest::header::ACCEPT, "application/json")
             .bearer_auth(self.bearer()?)
             .json(&body)
             .send()
@@ -250,6 +256,7 @@ impl<T: TokenStore> SyncEngine<T> {
         let resp = self
             .client
             .delete(self.cfg.batch_url())
+            .header(reqwest::header::ACCEPT, "application/json")
             .bearer_auth(self.bearer()?)
             .json(&DeleteRequest { uuids })
             .send()
@@ -429,8 +436,8 @@ mod tests {
 
         let (method, sent) = rx.recv().unwrap();
         assert_eq!(method, "POST");
-        assert!(sent.contains("\"device_id\":\"dev-1\""));
-        assert!(sent.contains("\"uuid\":\"a\""));
+        assert!(sent.contains("\"device_id\":\"dev\""));
+        assert!(sent.contains("\"client_event_uuid\":\"a\""));
         // Privacy: never any audio field.
         assert!(!sent.contains("audio"));
         handle.join().ok();
@@ -494,6 +501,13 @@ mod tests {
         )
         .unwrap();
         assert!(matches!(engine.flush(&store), Err(Error::Token(_))));
+    }
+
+    #[test]
+    fn complete_batch_endpoint_is_used_verbatim() {
+        let endpoint =
+            "https://example.test/api/phr/patients/1/respiratory-events/batch".to_string();
+        assert_eq!(config(endpoint.clone()).batch_url(), endpoint);
     }
 
     #[test]

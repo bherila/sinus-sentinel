@@ -5,6 +5,11 @@
 
 use std::sync::Mutex;
 
+#[cfg(feature = "keyring")]
+use std::collections::HashMap;
+#[cfg(feature = "keyring")]
+use std::sync::OnceLock;
+
 use crate::error::{Error, Result};
 
 /// Read/write access to the PHR bearer token.
@@ -83,6 +88,15 @@ pub struct KeyringTokenStore {
 }
 
 #[cfg(feature = "keyring")]
+type KeyringCache = HashMap<(String, String), std::result::Result<Option<String>, String>>;
+
+/// Process-wide cache shared by the UI and sync worker. Besides avoiding repeated
+/// Keychain IPC, caching failures prevents a denied credential from producing a
+/// new macOS permission dialog on every backoff retry.
+#[cfg(feature = "keyring")]
+static KEYRING_CACHE: OnceLock<Mutex<KeyringCache>> = OnceLock::new();
+
+#[cfg(feature = "keyring")]
 impl KeyringTokenStore {
     pub fn new(service: impl Into<String>, account: impl Into<String>) -> Self {
         KeyringTokenStore {
@@ -95,30 +109,60 @@ impl KeyringTokenStore {
         keyring::Entry::new(&self.service, &self.account)
             .map_err(|e| Error::Token(format!("keyring: {e}")))
     }
+
+    fn cache() -> &'static Mutex<KeyringCache> {
+        KEYRING_CACHE.get_or_init(|| Mutex::new(HashMap::new()))
+    }
+
+    fn cache_key(&self) -> (String, String) {
+        (self.service.clone(), self.account.clone())
+    }
 }
 
 #[cfg(feature = "keyring")]
 impl TokenStore for KeyringTokenStore {
     fn get_token(&self) -> Result<Option<String>> {
-        match self.entry()?.get_password() {
-            Ok(t) => Ok(Some(t)),
-            Err(keyring::Error::NoEntry) => Ok(None),
-            Err(e) => Err(Error::Token(format!("keyring get: {e}"))),
+        let mut cache = Self::cache()
+            .lock()
+            .map_err(|_| Error::Token("keyring cache poisoned".into()))?;
+        if let Some(cached) = cache.get(&self.cache_key()) {
+            return cached.clone().map_err(Error::Token);
         }
+
+        let result = match self.entry()?.get_password() {
+            Ok(token) => Ok(Some(token)),
+            Err(keyring::Error::NoEntry) => Ok(None),
+            Err(error) => Err(format!("keyring get: {error}")),
+        };
+        cache.insert(self.cache_key(), result.clone());
+        result.map_err(Error::Token)
     }
 
     fn set_token(&self, token: &str) -> Result<()> {
-        self.entry()?
+        let result = self
+            .entry()?
             .set_password(token)
-            .map_err(|e| Error::Token(format!("keyring set: {e}")))
+            .map_err(|error| format!("keyring set: {error}"));
+        let cached = result.clone().map(|()| Some(token.to_string()));
+        Self::cache()
+            .lock()
+            .map_err(|_| Error::Token("keyring cache poisoned".into()))?
+            .insert(self.cache_key(), cached);
+        result.map_err(Error::Token)
     }
 
     fn clear(&self) -> Result<()> {
-        match self.entry()?.delete_credential() {
+        let result = match self.entry()?.delete_credential() {
             Ok(()) => Ok(()),
             Err(keyring::Error::NoEntry) => Ok(()),
-            Err(e) => Err(Error::Token(format!("keyring clear: {e}"))),
-        }
+            Err(error) => Err(format!("keyring clear: {error}")),
+        };
+        let cached = result.clone().map(|()| None);
+        Self::cache()
+            .lock()
+            .map_err(|_| Error::Token("keyring cache poisoned".into()))?
+            .insert(self.cache_key(), cached);
+        result.map_err(Error::Token)
     }
 }
 

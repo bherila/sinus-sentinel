@@ -3,8 +3,10 @@
 //! so the UI thread never blocks on a worker (SPEC §9). Cloning a [`SharedStatus`]
 //! shares the same underlying cells.
 
-use std::sync::atomic::{AtomicBool, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
+
+use sinus_core::types::EventType;
 
 /// Which backbone the capture thread ended up running (SPEC §4 stage ③). Surfaced
 /// in the tray so a missing/failed ONNX model is visible rather than silent.
@@ -57,6 +59,49 @@ pub enum SyncStatus {
     Failed,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum TeachState {
+    Idle,
+    Armed,
+    Recording,
+    Saved,
+    Failed,
+}
+
+impl TeachState {
+    fn to_u8(self) -> u8 {
+        match self {
+            TeachState::Idle => 0,
+            TeachState::Armed => 1,
+            TeachState::Recording => 2,
+            TeachState::Saved => 3,
+            TeachState::Failed => 4,
+        }
+    }
+
+    fn from_u8(value: u8) -> Self {
+        match value {
+            1 => TeachState::Armed,
+            2 => TeachState::Recording,
+            3 => TeachState::Saved,
+            4 => TeachState::Failed,
+            _ => TeachState::Idle,
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy)]
+pub struct TeachFeedback {
+    pub state: TeachState,
+    pub class: Option<EventType>,
+    pub examples: usize,
+    /// Similarity to the closest prior same-class example. Negative means this
+    /// was the first example and no cross-sample validation was possible yet.
+    pub similarity: f32,
+    /// Same-class similarity minus the closest other-class similarity.
+    pub separation: f32,
+}
+
 impl SyncStatus {
     fn to_u8(self) -> u8 {
         match self {
@@ -92,6 +137,12 @@ pub struct SharedStatus {
     quiet: Arc<AtomicBool>,
     sync_now: Arc<AtomicBool>,
     quitting: Arc<AtomicBool>,
+    teach_request: Arc<AtomicU8>,
+    teach_state: Arc<AtomicU8>,
+    teach_class: Arc<AtomicU8>,
+    teach_examples: Arc<AtomicUsize>,
+    teach_similarity: Arc<AtomicU32>,
+    teach_separation: Arc<AtomicU32>,
 }
 
 impl Default for SharedStatus {
@@ -103,6 +154,12 @@ impl Default for SharedStatus {
             quiet: Arc::new(AtomicBool::new(false)),
             sync_now: Arc::new(AtomicBool::new(false)),
             quitting: Arc::new(AtomicBool::new(false)),
+            teach_request: Arc::new(AtomicU8::new(0)),
+            teach_state: Arc::new(AtomicU8::new(TeachState::Idle.to_u8())),
+            teach_class: Arc::new(AtomicU8::new(0)),
+            teach_examples: Arc::new(AtomicUsize::new(0)),
+            teach_similarity: Arc::new(AtomicU32::new((-1.0f32).to_bits())),
+            teach_separation: Arc::new(AtomicU32::new(0.0f32.to_bits())),
         }
     }
 }
@@ -164,4 +221,76 @@ impl SharedStatus {
     pub fn quitting(&self) -> bool {
         self.quitting.load(Ordering::Relaxed)
     }
+
+    pub fn request_teach(&self, class: EventType) {
+        let encoded = encode_event_type(class);
+        self.teach_class.store(encoded, Ordering::Relaxed);
+        self.teach_request.store(encoded, Ordering::Release);
+        self.teach_state
+            .store(TeachState::Armed.to_u8(), Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
+    pub fn take_teach_request(&self) -> Option<EventType> {
+        decode_event_type(self.teach_request.swap(0, Ordering::AcqRel))
+    }
+
+    #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
+    pub fn set_teach_recording(&self, class: EventType) {
+        self.teach_class
+            .store(encode_event_type(class), Ordering::Relaxed);
+        self.teach_state
+            .store(TeachState::Recording.to_u8(), Ordering::Relaxed);
+    }
+
+    #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
+    pub fn finish_teach(
+        &self,
+        class: EventType,
+        examples: usize,
+        similarity: f32,
+        separation: f32,
+    ) {
+        self.teach_class
+            .store(encode_event_type(class), Ordering::Relaxed);
+        self.teach_examples.store(examples, Ordering::Relaxed);
+        self.teach_similarity
+            .store(similarity.to_bits(), Ordering::Relaxed);
+        self.teach_separation
+            .store(separation.to_bits(), Ordering::Relaxed);
+        self.teach_state
+            .store(TeachState::Saved.to_u8(), Ordering::Release);
+    }
+
+    #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
+    pub fn fail_teach(&self, class: EventType) {
+        self.teach_class
+            .store(encode_event_type(class), Ordering::Relaxed);
+        self.teach_state
+            .store(TeachState::Failed.to_u8(), Ordering::Release);
+    }
+
+    pub fn teach_feedback(&self) -> TeachFeedback {
+        TeachFeedback {
+            state: TeachState::from_u8(self.teach_state.load(Ordering::Acquire)),
+            class: decode_event_type(self.teach_class.load(Ordering::Relaxed)),
+            examples: self.teach_examples.load(Ordering::Relaxed),
+            similarity: f32::from_bits(self.teach_similarity.load(Ordering::Relaxed)),
+            separation: f32::from_bits(self.teach_separation.load(Ordering::Relaxed)),
+        }
+    }
+}
+
+fn encode_event_type(class: EventType) -> u8 {
+    EventType::ALL
+        .iter()
+        .position(|candidate| *candidate == class)
+        .map(|index| index as u8 + 1)
+        .unwrap_or(0)
+}
+
+fn decode_event_type(value: u8) -> Option<EventType> {
+    value
+        .checked_sub(1)
+        .and_then(|index| EventType::ALL.get(index as usize).copied())
 }

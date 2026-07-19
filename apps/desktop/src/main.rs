@@ -59,7 +59,10 @@ fn main() -> eframe::Result<()> {
     let native_options = eframe::NativeOptions {
         viewport: eframe::egui::ViewportBuilder::default()
             .with_inner_size([760.0, 520.0])
-            .with_title("Sinus Sentinel"),
+            .with_title("Sinus Sentinel")
+            // Login startup is tray-first. The menu's Open/Settings actions make
+            // the window visible and focus it on demand.
+            .with_visible(false),
         ..Default::default()
     };
 

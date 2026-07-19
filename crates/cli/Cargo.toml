@@ -1,6 +1,6 @@
 [package]
 name = "sinus-cli"
-version = "0.1.0"
+version = "0.2.0-alpha"
 edition.workspace = true
 publish = false
 
@@ -8,6 +8,8 @@ publish = false
 default = []
 # Use the real ONNX YAMNet backbone instead of the deterministic fallback.
 onnx = ["sinus-core/onnx"]
+# Use the same OS credential backend as the desktop app for diagnostics/setup.
+keyring = ["sinus-core/keyring"]
 
 [dependencies]
 sinus-core = { path = "../core" }

@@ -12,7 +12,7 @@ use sinus_core::store::Store;
 use sinus_core::sync::Mode;
 use sinus_core::types::EventType;
 
-use crate::shared::{ModelStatus, SharedStatus};
+use crate::shared::{ModelStatus, SharedStatus, TeachState};
 use crate::state::{self, PauseState};
 
 /// Menu item ids.
@@ -41,6 +41,7 @@ enum Tab {
 struct SettingsForm {
     server_url: String,
     token: String,
+    token_message: String,
     sensitivity: f32,
 }
 
@@ -90,6 +91,7 @@ impl SinusApp {
             form: SettingsForm {
                 server_url,
                 token: String::new(),
+                token_message: String::new(),
                 sensitivity,
             },
             #[cfg(not(test))]
@@ -102,6 +104,11 @@ impl SinusApp {
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         let _ = self.store.setting_set("mode", mode.as_str());
+    }
+
+    fn show_window(ctx: &egui::Context) {
+        ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
+        ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
 
     fn handle_menu_events(&mut self, ctx: &egui::Context) {
@@ -121,8 +128,14 @@ impl SinusApp {
                 ids::MODE_OFFLINE_FIRST => self.set_mode(Mode::OfflineFirst),
                 ids::MODE_OFFLINE_STRICT => self.set_mode(Mode::OfflineStrict),
                 ids::SYNC_NOW => self.shared.request_sync_now(),
-                ids::OPEN_HISTORY => self.tab = Tab::History,
-                ids::OPEN_SETTINGS => self.tab = Tab::Settings,
+                ids::OPEN_HISTORY => {
+                    self.tab = Tab::History;
+                    Self::show_window(ctx);
+                }
+                ids::OPEN_SETTINGS => {
+                    self.tab = Tab::Settings;
+                    Self::show_window(ctx);
+                }
                 ids::QUIT => {
                     // Signal the sync thread to attempt a final flush (auto-batch
                     // flushes on quit, SPEC §4.3) before the window closes.
@@ -234,11 +247,16 @@ impl SinusApp {
             ui.label("API token");
             ui.add(egui::TextEdit::singleline(&mut self.form.token).password(true));
             if ui.button("Save token").clicked() {
-                // In production this writes to the OS keychain (KeyringTokenStore);
-                // never persisted to the DB or config files (SPEC §8).
+                self.form.token_message = match save_api_token(self.form.token.trim()) {
+                    Ok(()) => "Saved in the OS keychain.".to_string(),
+                    Err(error) => format!("Could not save token: {error}"),
+                };
                 self.form.token.clear();
             }
         });
+        if !self.form.token_message.is_empty() {
+            ui.label(&self.form.token_message);
+        }
 
         ui.separator();
         ui.heading("Detection");
@@ -267,8 +285,84 @@ impl SinusApp {
 
         ui.separator();
         ui.heading("Teach mode");
-        ui.label("Enroll your own hawk / nose-blow / snort examples (Phase B-lite).");
-        ui.label("(guided capture flow — placeholder)");
+        ui.label("Teach your own sounds locally. Raw audio is discarded; only an on-device embedding is saved.");
+        ui.label("Click a class, then make one clear sound within 3 seconds. Add 3–5 varied samples per class.");
+
+        let feedback = self.shared.teach_feedback();
+        let busy = matches!(feedback.state, TeachState::Armed | TeachState::Recording);
+        let model_ready = self.shared.model() == ModelStatus::Onnx;
+        let counts = self.store.enrollment_counts().unwrap_or_default();
+        egui::Grid::new("teach_classes")
+            .num_columns(3)
+            .spacing([12.0, 6.0])
+            .show(ui, |ui| {
+                for class in EventType::ALL {
+                    ui.label(class.as_str().replace('_', " "));
+                    ui.label(format!(
+                        "{} samples",
+                        counts.get(&class).copied().unwrap_or(0)
+                    ));
+                    if ui
+                        .add_enabled(model_ready && !busy, egui::Button::new("Record sample"))
+                        .clicked()
+                    {
+                        self.shared.request_teach(class);
+                    }
+                    ui.end_row();
+                }
+            });
+
+        if !model_ready {
+            ui.colored_label(
+                egui::Color32::YELLOW,
+                "Teach mode needs the YAMNet model; restart after fixing a ‘model missing’ status.",
+            );
+        }
+        match (feedback.state, feedback.class) {
+            (TeachState::Armed, Some(class)) => {
+                ui.label(format!("Get ready to record {}…", class.as_str()));
+            }
+            (TeachState::Recording, Some(class)) => {
+                ui.colored_label(
+                    egui::Color32::LIGHT_GREEN,
+                    format!("Recording {} now — make the sound once.", class.as_str()),
+                );
+            }
+            (TeachState::Saved, Some(class)) if feedback.similarity < 0.0 => {
+                ui.label(format!(
+                    "Saved the first {} sample. Add at least two more for validation.",
+                    class.as_str()
+                ));
+            }
+            (TeachState::Saved, Some(class)) => {
+                let good = feedback.examples >= 3
+                    && feedback.similarity >= 0.75
+                    && feedback.separation >= 0.05;
+                let verdict = if good {
+                    "good"
+                } else {
+                    "keep adding varied samples"
+                };
+                ui.label(format!(
+                    "Saved {} sample #{} — repeat similarity {:.2}, class separation {:+.2}: {}.",
+                    class.as_str(),
+                    feedback.examples,
+                    feedback.similarity,
+                    feedback.separation,
+                    verdict
+                ));
+            }
+            (TeachState::Failed, Some(class)) => {
+                ui.colored_label(
+                    egui::Color32::RED,
+                    format!(
+                        "Could not save the {} sample; try again in a quieter moment.",
+                        class.as_str()
+                    ),
+                );
+            }
+            _ => {}
+        }
 
         ui.separator();
         ui.label(format!("device id: {}", self.device_id));
@@ -276,9 +370,33 @@ impl SinusApp {
     }
 }
 
+#[cfg(feature = "keyring")]
+fn save_api_token(token: &str) -> Result<(), String> {
+    use sinus_core::token::{KeyringTokenStore, TokenStore};
+
+    if token.is_empty() {
+        return Err("token is empty".to_string());
+    }
+    KeyringTokenStore::new("SinusSentinel", "phr-api-token")
+        .set_token(token)
+        .map_err(|error| error.to_string())
+}
+
+#[cfg(not(feature = "keyring"))]
+fn save_api_token(_token: &str) -> Result<(), String> {
+    Err("this build has no OS keychain support".to_string())
+}
+
 impl eframe::App for SinusApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_menu_events(ctx);
+
+        // Closing the accessory window hides it but leaves monitoring and the
+        // menu-bar item alive. Only the explicit Quit menu action exits.
+        if ctx.input(|input| input.viewport().close_requested()) && !self.shared.quitting() {
+            ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
+            ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+        }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {

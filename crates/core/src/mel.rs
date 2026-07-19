@@ -229,10 +229,49 @@ impl MelFrontend {
     }
 }
 
+/// Select the loudest complete classifier window from a recording. Enrollment
+/// stores one embedding per recording, so long recordings do not accidentally
+/// count as several independent teaching examples.
+pub fn loudest_patch(samples: &[f32]) -> Option<MelPatch> {
+    let patch_samples = FRAME_LEN + (PATCH_FRAMES - 1) * HOP_LEN;
+    if samples.len() < patch_samples {
+        return None;
+    }
+    let stride = crate::types::SAMPLE_RATE as usize / 10;
+    let best_start =
+        (0..=samples.len() - patch_samples)
+            .step_by(stride)
+            .max_by(|&left, &right| {
+                rms_energy(&samples[left..left + patch_samples])
+                    .total_cmp(&rms_energy(&samples[right..right + patch_samples]))
+            })?;
+    MelFrontend::new(crate::types::SAMPLE_RATE)
+        .patches(&samples[best_start..best_start + patch_samples])
+        .into_iter()
+        .next()
+}
+
+fn rms_energy(samples: &[f32]) -> f32 {
+    if samples.is_empty() {
+        return 0.0;
+    }
+    (samples.iter().map(|sample| sample * sample).sum::<f32>() / samples.len() as f32).sqrt()
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
     use crate::synth;
+
+    #[test]
+    fn loudest_patch_selects_one_complete_window() {
+        let patch_samples = FRAME_LEN + (PATCH_FRAMES - 1) * HOP_LEN;
+        let mut samples = vec![0.01; patch_samples];
+        samples.extend(vec![0.8; patch_samples]);
+        let selected = loudest_patch(&samples).expect("complete patch");
+        assert_eq!(selected.frames, PATCH_FRAMES);
+        assert_eq!(selected.bands, N_MEL);
+    }
 
     #[test]
     fn hz_to_mel_reference_values() {

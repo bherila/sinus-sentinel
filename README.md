@@ -31,7 +31,8 @@ shell compiles and runs (mic permission + tray require a real desktop session).
   network I/O (no engine constructed); CSV/JSON export is still to wire into UI.
 - [~] **M0/M2 desktop shell** — tray + settings/history windows compile and run;
   live cpal capture behind `--features live-audio`.
-- [ ] **M5** — teach-mode enrollment UI + Phase B-lite live recognition.
+- [~] **M5** — local Teach-mode capture + Phase B-lite live recognition are wired;
+  broader real-world calibration and enrollment management remain.
 - [ ] **M6** — mobile companion (stretch).
 
 The ONNX YAMNet backbone is behind the `onnx` feature; everything builds and
@@ -60,4 +61,18 @@ cargo run -p sinus-cli -- gen-testdata testdata
 cargo run -p sinus-cli -- classify testdata/cough.wav
 cargo run -p sinus-cli -- soak --secs 10
 cargo run -p sinus-cli -- calibrate testdata
+
+# Real-model diagnostics and local enrollment (requires ONNX Runtime):
+ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
+  cargo run -p sinus-cli --features onnx -- \
+  classify sample.wav --model model/yamnet.onnx
+ORT_DYLIB_PATH=/opt/homebrew/lib/libonnxruntime.dylib \
+  cargo run -p sinus-cli --features onnx -- \
+  enroll "$HOME/Library/Application Support/SinusSentinel/events.db" \
+  sniffle sample.wav --model model/yamnet.onnx
 ```
+
+The desktop Settings screen also has a fully local **Teach mode**. Pick a class,
+make one clear sound during the three-second capture, and repeat until the UI shows
+good repeat similarity and class separation (usually 3–5 varied samples). Raw
+training audio is discarded; only 1024-value YAMNet embeddings are stored locally.

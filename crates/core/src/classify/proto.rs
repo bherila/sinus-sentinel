@@ -1,11 +1,15 @@
-//! Few-shot prototype matcher (SPEC §5 Phase B-lite). The user enrolls their own
+//! Few-shot personalized matcher (SPEC §5 Phase B-lite). The user enrolls their own
 //! `hawk` / `nose_blow` / `snort_suck` (and personalized native) examples; each is
-//! stored as its 1024-d YAMNet embedding. A class prototype is the mean of its
-//! enrolled embeddings. At runtime we classify by cosine similarity: the nearest
-//! prototype must exceed a similarity threshold *and* beat the nearest enrolled
-//! negative. No training loop — updates are instant.
+//! stored as its 1024-d YAMNet embedding. At runtime, nearest-example cosine
+//! similarity preserves multimodal sounds better than one averaged centroid; the
+//! winner must clear a threshold and beat competing classes/enrolled negatives.
+//! No training loop — updates are instant.
 
 use crate::types::EventType;
+
+/// A personalized class stays inactive until it has enough independent examples
+/// to avoid turning one unusual sound (or a bit of speech) into a broad template.
+pub const MIN_POSITIVE_EXAMPLES: usize = 3;
 
 /// L2-normalize a vector (returns zeros if the input is all-zero).
 fn normalize(v: &[f32]) -> Vec<f32> {
@@ -43,18 +47,24 @@ pub struct Enrollment {
 #[derive(Debug, Clone)]
 pub struct PrototypeMatcher {
     prototypes: Vec<Prototype>,
+    /// Normalized positives retained for nearest-example matching. A centroid can
+    /// blur a multimodal class, such as a short sniff and a longer inhale.
+    positives: Vec<(EventType, Vec<f32>)>,
     /// Normalized negative embeddings.
     negatives: Vec<Vec<f32>>,
     /// Minimum cosine similarity to accept a match.
     pub sim_threshold: f32,
     /// The best-class similarity must beat the nearest negative by this margin.
+    /// The same margin is required over the runner-up positive class so similar
+    /// nasal sounds do not get forced into an arbitrary enrolled label.
     pub negative_margin: f32,
 }
 
 impl PrototypeMatcher {
-    /// Build a matcher from enrolled examples. Positive examples are averaged
-    /// (per class, on the unit sphere) into prototypes; negatives are stored
-    /// individually for the must-beat-negative gate.
+    /// Build a matcher from enrolled examples. Positive examples are normalized
+    /// and retained for nearest-example matching; class centroids are also kept
+    /// for counts/inspection. Negatives are stored individually for the
+    /// must-beat-negative gate.
     pub fn from_enrollments(
         enrollments: &[Enrollment],
         sim_threshold: f32,
@@ -62,6 +72,7 @@ impl PrototypeMatcher {
     ) -> Self {
         use std::collections::BTreeMap;
         let mut sums: BTreeMap<&'static str, (EventType, Vec<f32>, usize)> = BTreeMap::new();
+        let mut positives = Vec::new();
         let mut negatives = Vec::new();
 
         for e in enrollments {
@@ -70,6 +81,7 @@ impl PrototypeMatcher {
                 continue;
             }
             let norm = normalize(&e.embedding);
+            positives.push((e.class, norm.clone()));
             let entry = sums
                 .entry(e.class.as_str())
                 .or_insert_with(|| (e.class, vec![0.0; norm.len()], 0));
@@ -94,6 +106,7 @@ impl PrototypeMatcher {
 
         PrototypeMatcher {
             prototypes,
+            positives,
             negatives,
             sim_threshold,
             negative_margin,
@@ -101,7 +114,10 @@ impl PrototypeMatcher {
     }
 
     pub fn is_empty(&self) -> bool {
-        self.prototypes.is_empty()
+        !self
+            .prototypes
+            .iter()
+            .any(|prototype| prototype.examples >= MIN_POSITIVE_EXAMPLES)
     }
 
     pub fn prototypes(&self) -> &[Prototype] {
@@ -112,7 +128,15 @@ impl PrototypeMatcher {
     pub fn similarities(&self, embedding: &[f32]) -> Vec<(EventType, f32)> {
         self.prototypes
             .iter()
-            .map(|p| (p.class, cosine(&p.centroid, embedding)))
+            .map(|prototype| {
+                let similarity = self
+                    .positives
+                    .iter()
+                    .filter(|(class, _)| *class == prototype.class)
+                    .map(|(_, example)| cosine(example, embedding))
+                    .fold(-1.0f32, f32::max);
+                (prototype.class, similarity)
+            })
             .collect()
     }
 
@@ -125,14 +149,23 @@ impl PrototypeMatcher {
     }
 
     /// Best matching class for an embedding, applying both gates: the similarity
-    /// must clear `sim_threshold` and beat the nearest negative by
-    /// `negative_margin`. Returns `None` if nothing qualifies.
+    /// must clear `sim_threshold` and beat both the nearest negative and runner-up
+    /// positive class by `negative_margin`. Returns `None` if nothing qualifies.
     pub fn best_match(&self, embedding: &[f32]) -> Option<(EventType, f32)> {
         let neg = self.nearest_negative(embedding);
-        self.similarities(embedding)
-            .into_iter()
-            .filter(|&(_, sim)| sim >= self.sim_threshold && sim >= neg + self.negative_margin)
-            .max_by(|a, b| a.1.partial_cmp(&b.1).unwrap())
+        let mut similarities = self.similarities(embedding);
+        similarities.retain(|(class, _)| {
+            self.prototypes.iter().any(|prototype| {
+                prototype.class == *class && prototype.examples >= MIN_POSITIVE_EXAMPLES
+            })
+        });
+        similarities.sort_by(|a, b| b.1.total_cmp(&a.1));
+        let &(class, best) = similarities.first()?;
+        let runner_up = similarities.get(1).map(|(_, sim)| *sim).unwrap_or(-1.0);
+        (best >= self.sim_threshold
+            && best >= neg + self.negative_margin
+            && best >= runner_up + self.negative_margin)
+            .then_some((class, best))
     }
 }
 
@@ -162,6 +195,11 @@ mod tests {
                 embedding: emb([0.9, 0.0, 0.1, 0.0]),
                 is_negative: false,
             },
+            Enrollment {
+                class: EventType::Hawk,
+                embedding: emb([1.0, 0.0, 0.1, 0.0]),
+                is_negative: false,
+            },
             // Nose-blow cluster ≈ direction [0,0,1,0].
             Enrollment {
                 class: EventType::NoseBlow,
@@ -171,6 +209,11 @@ mod tests {
             Enrollment {
                 class: EventType::NoseBlow,
                 embedding: emb([0.1, 0.0, 0.9, 0.0]),
+                is_negative: false,
+            },
+            Enrollment {
+                class: EventType::NoseBlow,
+                embedding: emb([0.0, 0.0, 1.0, 0.1]),
                 is_negative: false,
             },
             // Negative (keyboard-like) ≈ direction [0,0,0,1].
@@ -194,7 +237,7 @@ mod tests {
     fn prototype_is_mean_direction_and_counts_examples() {
         let m = matcher();
         let hawk = m.prototypes().iter().find(|p| p.class == EventType::Hawk);
-        assert_eq!(hawk.unwrap().examples, 2);
+        assert_eq!(hawk.unwrap().examples, 3);
     }
 
     #[test]
@@ -224,5 +267,88 @@ mod tests {
             m.best_match(&probe).is_none(),
             "should be blocked by the nearest negative"
         );
+    }
+
+    #[test]
+    fn rejects_ambiguous_positive_classes() {
+        let enrollments = [
+            (EventType::Hawk, [1.0, 0.0, 0.0, 0.0]),
+            (EventType::SnortSuck, [0.98, 0.2, 0.0, 0.0]),
+        ]
+        .into_iter()
+        .flat_map(|(class, pattern)| {
+            (0..MIN_POSITIVE_EXAMPLES).map(move |_| Enrollment {
+                class,
+                embedding: emb(pattern),
+                is_negative: false,
+            })
+        })
+        .collect::<Vec<_>>();
+        let matcher = PrototypeMatcher::from_enrollments(&enrollments, 0.6, 0.05);
+        assert!(matcher.best_match(&emb([1.0, 0.1, 0.0, 0.0])).is_none());
+    }
+
+    #[test]
+    fn nearest_example_preserves_a_multimodal_class() {
+        let enrollments = vec![
+            Enrollment {
+                class: EventType::Sniffle,
+                embedding: emb([1.0, 0.0, 0.0, 0.0]),
+                is_negative: false,
+            },
+            Enrollment {
+                class: EventType::Sniffle,
+                embedding: emb([0.0, 1.0, 0.0, 0.0]),
+                is_negative: false,
+            },
+            Enrollment {
+                class: EventType::Sniffle,
+                embedding: emb([0.05, 0.95, 0.0, 0.0]),
+                is_negative: false,
+            },
+            Enrollment {
+                class: EventType::Hawk,
+                embedding: emb([0.0, 0.0, 1.0, 0.0]),
+                is_negative: false,
+            },
+            Enrollment {
+                class: EventType::Hawk,
+                embedding: emb([0.0, 0.0, 1.0, 0.05]),
+                is_negative: false,
+            },
+            Enrollment {
+                class: EventType::Hawk,
+                embedding: emb([0.0, 0.05, 1.0, 0.0]),
+                is_negative: false,
+            },
+        ];
+        let matcher = PrototypeMatcher::from_enrollments(&enrollments, 0.8, 0.1);
+        assert_eq!(
+            matcher.best_match(&emb([0.0, 1.0, 0.0, 0.0])),
+            Some((EventType::Sniffle, 1.0))
+        );
+    }
+
+    #[test]
+    fn class_stays_inactive_until_three_positive_examples() {
+        let matcher = PrototypeMatcher::from_enrollments(
+            &[
+                Enrollment {
+                    class: EventType::Hawk,
+                    embedding: emb([1.0, 0.0, 0.0, 0.0]),
+                    is_negative: false,
+                },
+                Enrollment {
+                    class: EventType::Hawk,
+                    embedding: emb([0.9, 0.1, 0.0, 0.0]),
+                    is_negative: false,
+                },
+            ],
+            0.6,
+            0.05,
+        );
+
+        assert!(matcher.is_empty());
+        assert!(matcher.best_match(&emb([1.0, 0.0, 0.0, 0.0])).is_none());
     }
 }

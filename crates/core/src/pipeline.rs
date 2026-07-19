@@ -251,6 +251,19 @@ impl<E: Embedder> Pipeline<E> {
         self.embedder.model_version()
     }
 
+    /// Embed one already-framed patch with the production backbone. Used by the
+    /// desktop Teach mode so raw capture stays in memory and only the embedding is
+    /// persisted.
+    pub fn embed_patch(&self, patch: &MelPatch, energy_peak: bool) -> Result<Vec<f32>> {
+        Ok(self.embedder.embed(patch, energy_peak)?.embedding)
+    }
+
+    /// Replace personalized examples after a Teach-mode sample is saved, without
+    /// restarting the microphone stream or resetting gate/session state.
+    pub fn set_prototypes(&mut self, proto: Option<PrototypeMatcher>) {
+        self.proto = proto;
+    }
+
     /// Process a buffer of 16 kHz mono samples (batch): advance the engine over the
     /// whole buffer, then flush. Produces the same windows/events as feeding the
     /// same samples through a [`StreamingPipeline`] in arbitrary chunks.
@@ -343,14 +356,38 @@ impl<E: Embedder> Pipeline<E> {
                     Some(a) => self.audioset_map.native_scores(a),
                     None => Default::default(),
                 };
-                let proto_hit = self
-                    .proto
-                    .as_ref()
-                    .and_then(|m| m.best_match(&features.embedding));
+                // Personalized examples are deliberately ignored when YAMNet says
+                // speech dominates. This prevents a taught throat sound from
+                // becoming a general-purpose voice detector.
+                let proto_hit = (native.speech <= self.decision.config.speech_dominant)
+                    .then(|| {
+                        self.proto
+                            .as_ref()
+                            .and_then(|m| m.best_match(&features.embedding))
+                    })
+                    .flatten();
                 let proto_vec: Vec<(EventType, f32)> = proto_hit.into_iter().collect();
 
                 let scores = WindowScores::merge(&native, &proto_vec, energy_peak);
-                let hit = self.decision.decide(&scores);
+                let native_hit = self.decision.decide(&scores);
+                // A qualifying personalized match is a disambiguation signal, not
+                // another probability on YAMNet's scale. Let it override a generic
+                // native label (notably nose-blow-as-sneeze and sniff-as-cough),
+                // while still applying the normal threshold, energy, and speech
+                // guards to the personalized candidate.
+                let hit = proto_hit
+                    .and_then(|personalized| {
+                        let personalized_scores = WindowScores::merge(
+                            &crate::classify::native::NativeScores {
+                                speech: native.speech,
+                                ..Default::default()
+                            },
+                            &[personalized],
+                            energy_peak,
+                        );
+                        self.decision.decide(&personalized_scores)
+                    })
+                    .or(native_hit);
 
                 let mut sorted: Vec<(EventType, f32)> =
                     scores.scores.iter().map(|(&k, &v)| (k, v)).collect();
@@ -436,6 +473,14 @@ impl<E: Embedder> StreamingPipeline<E> {
         self.inner.model_version()
     }
 
+    pub fn embed_patch(&self, patch: &MelPatch, energy_peak: bool) -> Result<Vec<f32>> {
+        self.inner.embed_patch(patch, energy_peak)
+    }
+
+    pub fn set_prototypes(&mut self, proto: Option<PrototypeMatcher>) {
+        self.inner.set_prototypes(proto);
+    }
+
     /// Feed the next slice of 16 kHz mono samples; returns any events that closed as
     /// a result. Sample counting is monotonic across calls (SPEC §4.1 ⑤).
     pub fn push(&mut self, samples: &[f32]) -> Result<Vec<DetectedEvent>> {
@@ -463,7 +508,9 @@ impl<E: Embedder> StreamingPipeline<E> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::classify::embed::BandHeuristicEmbedder;
+    use crate::classify::embed::{BandHeuristicEmbedder, MockEmbedder, WindowFeatures};
+    use crate::classify::native::AudiosetMap;
+    use crate::classify::proto::{Enrollment, PrototypeMatcher};
     use crate::synth;
 
     /// Silence in → gate stays shut → no windows analyzed, no events.
@@ -487,6 +534,70 @@ mod tests {
         assert_eq!(result.events.len(), 1, "events: {:?}", result.events);
         assert_eq!(result.events[0].event_type, EventType::Cough);
         assert!(result.windows.iter().any(|w| w.active));
+    }
+
+    #[test]
+    fn personalized_match_overrides_a_conflicting_native_label() {
+        let mut native_scores = vec![0.0; crate::classify::embed::AUDIOSET_CLASSES];
+        native_scores[AudiosetMap::default().sneeze] = 0.99;
+        let embedding = vec![1.0, 0.0, 0.0, 0.0];
+        let embedder = MockEmbedder {
+            features: WindowFeatures {
+                audioset_scores: Some(native_scores),
+                embedding: embedding.clone(),
+                energy_peak: true,
+            },
+            version: "test".to_string(),
+        };
+        let matcher = PrototypeMatcher::from_enrollments(
+            &(0..3)
+                .map(|_| Enrollment {
+                    class: EventType::NoseBlow,
+                    embedding: embedding.clone(),
+                    is_negative: false,
+                })
+                .collect::<Vec<_>>(),
+            0.65,
+            0.05,
+        );
+        let pipeline = Pipeline::new(PipelineConfig::default(), embedder).with_prototypes(matcher);
+        let signal = synth::sine(16_000 * 2, 16_000, 500.0, 0.8);
+        let result = pipeline.process(&signal).unwrap();
+        assert!(!result.events.is_empty());
+        assert!(result
+            .events
+            .iter()
+            .all(|event| event.event_type == EventType::NoseBlow));
+    }
+
+    #[test]
+    fn personalized_match_does_not_override_speech_dominant_audio() {
+        let mut native_scores = vec![0.0; crate::classify::embed::AUDIOSET_CLASSES];
+        native_scores[AudiosetMap::default().speech] = 0.99;
+        let embedding = vec![1.0, 0.0, 0.0, 0.0];
+        let embedder = MockEmbedder {
+            features: WindowFeatures {
+                audioset_scores: Some(native_scores),
+                embedding: embedding.clone(),
+                energy_peak: true,
+            },
+            version: "test".to_string(),
+        };
+        let matcher = PrototypeMatcher::from_enrollments(
+            &(0..3)
+                .map(|_| Enrollment {
+                    class: EventType::Hawk,
+                    embedding: embedding.clone(),
+                    is_negative: false,
+                })
+                .collect::<Vec<_>>(),
+            0.65,
+            0.05,
+        );
+        let pipeline = Pipeline::new(PipelineConfig::default(), embedder).with_prototypes(matcher);
+        let signal = synth::sine(16_000 * 2, 16_000, 500.0, 0.8);
+        let result = pipeline.process(&signal).unwrap();
+        assert!(result.events.is_empty());
     }
 
     /// Build a rich signal: quiet-converge → cough-band burst → quiet → a second

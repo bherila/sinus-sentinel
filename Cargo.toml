@@ -30,7 +30,7 @@ reqwest = { version = "0.12", default-features = false, features = [
 cpal = "0.15"
 ringbuf = "0.4"
 rubato = "0.15"
-keyring = "3"
+keyring = { version = "3", features = ["apple-native", "windows-native"] }
 ort = { version = "=2.0.0-rc.12", default-features = false, features = [
     "load-dynamic",
     "api-24",

@@ -2,6 +2,7 @@
 //! pipeline on WAV files and synthetic signals:
 //!
 //! - `classify <file.wav>` — per-window scores + final sessionized events.
+//! - `enroll <db> <class> <file.wav>` — store local prototype embeddings.
 //! - `soak [--secs N]` — quiet-room CPU soak: gate over N s of silence must never
 //!   open (SPEC §9).
 //! - `calibrate <dir>` — derive per-class thresholds from a labeled corpus.
@@ -12,11 +13,45 @@ use std::path::{Path, PathBuf};
 use std::process::ExitCode;
 
 use sinus_core::audio::{write_wav_16k_mono, AudioSource, BufferedAudioSource};
-use sinus_core::classify::embed::BandHeuristicEmbedder;
+use sinus_core::classify::embed::{BandHeuristicEmbedder, Embedder, WindowFeatures};
+use sinus_core::classify::proto::PrototypeMatcher;
 use sinus_core::gate::{Gate, GateConfig};
+use sinus_core::mel::{loudest_patch, MelPatch};
 use sinus_core::pipeline::{Pipeline, PipelineConfig, PipelineResult};
+use sinus_core::store::Store;
 use sinus_core::synth;
 use sinus_core::types::EventType;
+
+const PROTOTYPE_SIM_THRESHOLD: f32 = 0.65;
+const PROTOTYPE_NEGATIVE_MARGIN: f32 = 0.05;
+
+enum CliEmbedder {
+    Heuristic(BandHeuristicEmbedder),
+    #[cfg(feature = "onnx")]
+    Yamnet(sinus_core::classify::yamnet::YamnetOnnx),
+}
+
+impl Embedder for CliEmbedder {
+    fn model_version(&self) -> String {
+        match self {
+            CliEmbedder::Heuristic(embedder) => embedder.model_version(),
+            #[cfg(feature = "onnx")]
+            CliEmbedder::Yamnet(embedder) => embedder.model_version(),
+        }
+    }
+
+    fn embed(
+        &self,
+        patch: &MelPatch,
+        energy_peak: bool,
+    ) -> sinus_core::error::Result<WindowFeatures> {
+        match self {
+            CliEmbedder::Heuristic(embedder) => embedder.embed(patch, energy_peak),
+            #[cfg(feature = "onnx")]
+            CliEmbedder::Yamnet(embedder) => embedder.embed(patch, energy_peak),
+        }
+    }
+}
 
 fn main() -> ExitCode {
     let args: Vec<String> = std::env::args().skip(1).collect();
@@ -25,6 +60,9 @@ fn main() -> ExitCode {
 
     let result = match cmd {
         Some("classify") => cmd_classify(rest),
+        Some("enroll") => cmd_enroll(rest),
+        Some("keyring-status") => cmd_keyring_status(rest),
+        Some("keyring-set") => cmd_keyring_set(rest),
         Some("soak") => cmd_soak(rest),
         Some("calibrate") => cmd_calibrate(rest),
         Some("gen-testdata") => cmd_gen_testdata(rest),
@@ -48,7 +86,10 @@ fn print_usage() {
     println!(
         "sinus-cli (core {})\n\n\
          USAGE:\n  \
-         sinus-cli classify <file.wav>\n  \
+         sinus-cli classify <file.wav> [--model <yamnet.onnx>] [--enrollments <events.db>]\n  \
+         sinus-cli enroll <events.db> <class> <file.wav> --model <yamnet.onnx>\n  \
+         sinus-cli keyring-status\n  \
+         sinus-cli keyring-set  # reads the token from stdin\n  \
          sinus-cli soak [--secs N]\n  \
          sinus-cli calibrate <dir>\n  \
          sinus-cli gen-testdata <dir>\n",
@@ -56,13 +97,25 @@ fn print_usage() {
     );
 }
 
-/// Build the offline pipeline with the deterministic, model-free backbone. (With
-/// the `onnx` feature and a model file, swap in `YamnetOnnx` — see model/README.)
-fn build_pipeline() -> Pipeline<BandHeuristicEmbedder> {
-    Pipeline::new(PipelineConfig::default(), BandHeuristicEmbedder)
+fn build_embedder(model_path: Option<&Path>) -> Result<CliEmbedder, String> {
+    let Some(model_path) = model_path else {
+        return Ok(CliEmbedder::Heuristic(BandHeuristicEmbedder));
+    };
+
+    #[cfg(feature = "onnx")]
+    {
+        let embedder = sinus_core::classify::yamnet::YamnetOnnx::load(model_path)
+            .map_err(|e| e.to_string())?;
+        Ok(CliEmbedder::Yamnet(embedder))
+    }
+    #[cfg(not(feature = "onnx"))]
+    {
+        let _ = model_path;
+        Err("--model requires building sinus-cli with --features onnx".to_string())
+    }
 }
 
-fn run_wav(path: &Path) -> Result<PipelineResult, String> {
+fn read_wav(path: &Path) -> Result<Vec<f32>, String> {
     let mut src = BufferedAudioSource::open_wav(path).map_err(|e| format!("open {path:?}: {e}"))?;
     let mut samples = Vec::new();
     let mut buf = vec![0.0f32; 16_000];
@@ -73,15 +126,67 @@ fn run_wav(path: &Path) -> Result<PipelineResult, String> {
         }
         samples.extend_from_slice(&buf[..n]);
     }
-    build_pipeline()
+    Ok(samples)
+}
+
+fn build_pipeline(
+    model_path: Option<&Path>,
+    enrollments_path: Option<&Path>,
+) -> Result<Pipeline<CliEmbedder>, String> {
+    let mut pipeline = Pipeline::new(PipelineConfig::default(), build_embedder(model_path)?);
+    if let Some(path) = enrollments_path {
+        let store = Store::open(path).map_err(|e| format!("open enrollments {path:?}: {e}"))?;
+        let enrollments: Vec<_> = store
+            .enrollments()
+            .map_err(|e| e.to_string())?
+            .into_iter()
+            .map(|stored| stored.enrollment)
+            .collect();
+        if !enrollments.is_empty() {
+            pipeline = pipeline.with_prototypes(PrototypeMatcher::from_enrollments(
+                &enrollments,
+                PROTOTYPE_SIM_THRESHOLD,
+                PROTOTYPE_NEGATIVE_MARGIN,
+            ));
+        }
+    }
+    Ok(pipeline)
+}
+
+fn run_wav(
+    path: &Path,
+    model_path: Option<&Path>,
+    enrollments_path: Option<&Path>,
+) -> Result<PipelineResult, String> {
+    let samples = read_wav(path)?;
+    build_pipeline(model_path, enrollments_path)?
         .process(&samples)
         .map_err(|e| e.to_string())
 }
 
 fn cmd_classify(args: &[String]) -> Result<(), String> {
-    let path = args.first().ok_or("usage: classify <file.wav>")?;
-    let path = PathBuf::from(path);
-    let result = run_wav(&path)?;
+    let path = PathBuf::from(args.first().ok_or("usage: classify <file.wav>")?);
+    let mut model_path: Option<PathBuf> = None;
+    let mut enrollments_path: Option<PathBuf> = None;
+    let mut i = 1;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--model" => {
+                model_path = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--model needs a path")?,
+                ));
+                i += 2;
+            }
+            "--enrollments" => {
+                enrollments_path = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--enrollments needs a path")?,
+                ));
+                i += 2;
+            }
+            other => return Err(format!("unexpected arg: {other}")),
+        }
+    }
+    let result = run_wav(&path, model_path.as_deref(), enrollments_path.as_deref())?;
 
     println!("== per-window scores ({}) ==", path.display());
     for w in &result.windows {
@@ -123,6 +228,110 @@ fn cmd_classify(args: &[String]) -> Result<(), String> {
         );
     }
     Ok(())
+}
+
+fn cmd_enroll(args: &[String]) -> Result<(), String> {
+    if args.len() < 3 {
+        return Err(
+            "usage: enroll <events.db> <class> <file.wav> --model <yamnet.onnx>".to_string(),
+        );
+    }
+    let db_path = PathBuf::from(&args[0]);
+    let class = EventType::parse(&args[1]).ok_or_else(|| {
+        format!(
+            "unknown class `{}`; expected one of: {}",
+            args[1],
+            EventType::ALL
+                .iter()
+                .map(|event_type| event_type.as_str())
+                .collect::<Vec<_>>()
+                .join(", ")
+        )
+    })?;
+    let wav_path = PathBuf::from(&args[2]);
+    let mut model_path: Option<PathBuf> = None;
+    let mut is_negative = false;
+    let mut i = 3;
+    while i < args.len() {
+        match args[i].as_str() {
+            "--model" => {
+                model_path = Some(PathBuf::from(
+                    args.get(i + 1).ok_or("--model needs a path")?,
+                ));
+                i += 2;
+            }
+            "--negative" => {
+                is_negative = true;
+                i += 1;
+            }
+            other => return Err(format!("unexpected arg: {other}")),
+        }
+    }
+    let model_path = model_path.ok_or("enroll requires --model <yamnet.onnx>")?;
+    let embedder = build_embedder(Some(&model_path))?;
+    let samples = read_wav(&wav_path)?;
+    let patch = loudest_patch(&samples)
+        .ok_or("recording is shorter than one 0.96-second analysis window")?;
+
+    let store = Store::open(&db_path).map_err(|e| format!("open {db_path:?}: {e}"))?;
+    let features = embedder.embed(&patch, true).map_err(|e| e.to_string())?;
+    store
+        .add_enrollment(class, &features.embedding, is_negative)
+        .map_err(|e| e.to_string())?;
+    println!(
+        "enrolled 1 {} embedding for {} from {}",
+        if is_negative { "negative" } else { "positive" },
+        class.as_str(),
+        wav_path.display()
+    );
+    Ok(())
+}
+
+fn cmd_keyring_status(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: keyring-status".to_string());
+    }
+    #[cfg(feature = "keyring")]
+    {
+        use sinus_core::token::{KeyringTokenStore, TokenStore};
+        let store = KeyringTokenStore::new("SinusSentinel", "phr-api-token");
+        let present = store.get_token().map_err(|e| e.to_string())?.is_some();
+        println!("{}", if present { "present" } else { "missing" });
+        Ok(())
+    }
+    #[cfg(not(feature = "keyring"))]
+    {
+        Err("keyring-status requires building sinus-cli with --features keyring".to_string())
+    }
+}
+
+fn cmd_keyring_set(args: &[String]) -> Result<(), String> {
+    if !args.is_empty() {
+        return Err("usage: keyring-set (token is read from stdin)".to_string());
+    }
+    #[cfg(feature = "keyring")]
+    {
+        use std::io::Read;
+
+        use sinus_core::token::{KeyringTokenStore, TokenStore};
+        let mut token = String::new();
+        std::io::stdin()
+            .read_to_string(&mut token)
+            .map_err(|e| e.to_string())?;
+        let token = token.trim();
+        if token.is_empty() {
+            return Err("stdin contained an empty token".to_string());
+        }
+        KeyringTokenStore::new("SinusSentinel", "phr-api-token")
+            .set_token(token)
+            .map_err(|e| e.to_string())?;
+        println!("saved");
+        Ok(())
+    }
+    #[cfg(not(feature = "keyring"))]
+    {
+        Err("keyring-set requires building sinus-cli with --features keyring".to_string())
+    }
 }
 
 fn cmd_soak(args: &[String]) -> Result<(), String> {
@@ -198,7 +407,7 @@ fn cmd_calibrate(args: &[String]) -> Result<(), String> {
         let Some(label) = label_from_filename(&path) else {
             continue;
         };
-        let result = run_wav(&path)?;
+        let result = run_wav(&path, None, None)?;
         // Highest confidence among events of the labeled class in this file.
         let conf = result
             .events
