@@ -27,10 +27,44 @@ use crate::shared::{ModelStatus, SharedStatus};
 const PROTOTYPE_SIM_THRESHOLD: f32 = 0.65;
 const PROTOTYPE_NEGATIVE_MARGIN: f32 = 0.05;
 const TEACH_CAPTURE_SAMPLES: usize = sinus_core::types::SAMPLE_RATE as usize * 3;
+const TEACH_COUNTDOWN_SAMPLES: usize = sinus_core::types::SAMPLE_RATE as usize;
 
 struct TeachCapture {
     class: sinus_core::types::EventType,
     samples: Vec<f32>,
+    countdown_remaining: usize,
+}
+
+impl TeachCapture {
+    fn new(class: sinus_core::types::EventType) -> Self {
+        TeachCapture {
+            class,
+            samples: Vec::with_capacity(TEACH_CAPTURE_SAMPLES),
+            countdown_remaining: TEACH_COUNTDOWN_SAMPLES,
+        }
+    }
+
+    /// Consume microphone samples, returning true exactly when the countdown
+    /// crosses into recording. Samples before that edge are discarded.
+    fn push(&mut self, input: &[f32]) -> bool {
+        let was_counting_down = self.countdown_remaining > 0;
+        let countdown_samples = self.countdown_remaining.min(input.len());
+        self.countdown_remaining -= countdown_samples;
+        let started_recording = was_counting_down && self.countdown_remaining == 0;
+
+        if self.countdown_remaining == 0 {
+            let remaining = TEACH_CAPTURE_SAMPLES.saturating_sub(self.samples.len());
+            let available = input.len().saturating_sub(countdown_samples).min(remaining);
+            self.samples.extend_from_slice(
+                &input[countdown_samples..countdown_samples.saturating_add(available)],
+            );
+        }
+        started_recording
+    }
+
+    fn is_complete(&self) -> bool {
+        self.samples.len() >= TEACH_CAPTURE_SAMPLES
+    }
 }
 
 /// The backbone the capture thread runs. An enum (not `dyn`) so the generic
@@ -175,13 +209,13 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     let mut buf = vec![0.0f32; 4096];
     let mut teach_capture: Option<TeachCapture> = None;
     loop {
+        if shared.take_enrollment_reload() {
+            pipeline.set_prototypes(prototypes_from_store(&store)?);
+        }
+
         if teach_capture.is_none() {
             if let Some(class) = shared.take_teach_request() {
-                shared.set_teach_recording(class);
-                teach_capture = Some(TeachCapture {
-                    class,
-                    samples: Vec::with_capacity(TEACH_CAPTURE_SAMPLES),
-                });
+                teach_capture = Some(TeachCapture::new(class));
             }
         }
 
@@ -192,8 +226,9 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
         }
         let teaching = teach_capture.is_some();
         if let Some(capture) = teach_capture.as_mut() {
-            let remaining = TEACH_CAPTURE_SAMPLES.saturating_sub(capture.samples.len());
-            capture.samples.extend_from_slice(&buf[..n.min(remaining)]);
+            if capture.push(&buf[..n]) {
+                shared.set_teach_recording(capture.class);
+            }
         }
 
         if let Ok(events) = pipeline.push(&buf[..n]) {
@@ -211,7 +246,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
 
         if teach_capture
             .as_ref()
-            .is_some_and(|capture| capture.samples.len() >= TEACH_CAPTURE_SAMPLES)
+            .is_some_and(TeachCapture::is_complete)
         {
             let capture = teach_capture.take().expect("checked above");
             match save_teach_sample(&store, &mut pipeline, capture.class, &capture.samples) {
@@ -283,8 +318,16 @@ fn save_teach_sample(
         (same, same - other)
     };
 
+    let quality_similarity = (similarity >= 0.0).then_some(similarity);
+    let quality_separation = (similarity >= 0.0).then_some(separation);
     store
-        .add_enrollment(class, &embedding, false)
+        .add_enrollment_with_quality(
+            class,
+            &embedding,
+            false,
+            quality_similarity,
+            quality_separation,
+        )
         .map_err(|e| e.to_string())?;
     pipeline.set_prototypes(prototypes_from_store(store)?);
     let examples = store
@@ -299,4 +342,22 @@ fn save_teach_sample(
 /// Local UTC offset in minutes.
 fn local_offset_minutes() -> i32 {
     chrono::Local::now().offset().local_minus_utc() / 60
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn teach_capture_discards_countdown_and_keeps_exactly_three_seconds() {
+        let mut capture = TeachCapture::new(sinus_core::types::EventType::Sniffle);
+        assert!(!capture.push(&vec![0.1; TEACH_COUNTDOWN_SAMPLES - 1]));
+        assert!(capture.samples.is_empty());
+        assert!(capture.push(&[0.2, 0.3]));
+        assert_eq!(capture.samples, vec![0.3]);
+
+        assert!(!capture.push(&vec![0.4; TEACH_CAPTURE_SAMPLES + 100]));
+        assert!(capture.is_complete());
+        assert_eq!(capture.samples.len(), TEACH_CAPTURE_SAMPLES);
+    }
 }

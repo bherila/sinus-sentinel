@@ -8,10 +8,11 @@
 use chrono::Utc;
 use eframe::egui;
 use egui_plot::{Bar, BarChart, Legend, Plot};
-use sinus_core::store::Store;
+use sinus_core::store::{Store, StoredEnrollment};
 use sinus_core::sync::Mode;
 use sinus_core::types::EventType;
 
+use crate::instance::InstanceGuard;
 use crate::shared::{ModelStatus, SharedStatus, TeachState};
 use crate::state::{self, PauseState};
 
@@ -36,6 +37,52 @@ enum Tab {
     Settings,
 }
 
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum TrayState {
+    Listening,
+    Paused,
+    Warning,
+    Offline,
+}
+
+impl TrayState {
+    fn glyph(self) -> &'static str {
+        match self {
+            TrayState::Listening => "🟢",
+            TrayState::Paused => "⏸",
+            TrayState::Warning => "⚠",
+            TrayState::Offline => "📴",
+        }
+    }
+
+    #[cfg(not(test))]
+    fn color(self) -> [u8; 3] {
+        match self {
+            TrayState::Listening => [0x2e, 0xa0, 0x43],
+            TrayState::Paused => [0xf0, 0xad, 0x4e],
+            TrayState::Warning => [0xd9, 0x53, 0x4f],
+            TrayState::Offline => [0x77, 0x77, 0x77],
+        }
+    }
+
+    #[cfg(not(test))]
+    fn tooltip(self) -> &'static str {
+        match self {
+            TrayState::Listening => "Sinus Sentinel — listening",
+            TrayState::Paused => "Sinus Sentinel — paused",
+            TrayState::Warning => "Sinus Sentinel — model unavailable",
+            TrayState::Offline => "Sinus Sentinel — offline-strict",
+        }
+    }
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+enum EnrollmentAction {
+    One { id: i64, class: EventType },
+    Class(EventType),
+    All,
+}
+
 /// Editable settings mirrored into the store.
 #[derive(Debug, Clone, Default)]
 struct SettingsForm {
@@ -43,6 +90,8 @@ struct SettingsForm {
     token: String,
     token_message: String,
     sensitivity: f32,
+    token_status: String,
+    enrollment_message: String,
 }
 
 pub struct SinusApp {
@@ -53,13 +102,22 @@ pub struct SinusApp {
     form: SettingsForm,
     // The tray icon is held for its lifetime; menu events are polled globally.
     #[cfg(not(test))]
-    _tray: Option<tray_icon::TrayIcon>,
+    tray: Option<tray_icon::TrayIcon>,
+    #[cfg(not(test))]
+    tray_state: TrayState,
     device_id: String,
     shared: SharedStatus,
+    instance: InstanceGuard,
+    pending_enrollment_action: Option<EnrollmentAction>,
 }
 
 impl SinusApp {
-    pub fn new(_cc: &eframe::CreationContext<'_>, store: Store, shared: SharedStatus) -> Self {
+    pub fn new(
+        _cc: &eframe::CreationContext<'_>,
+        store: Store,
+        shared: SharedStatus,
+        instance: InstanceGuard,
+    ) -> Self {
         let sensitivity = store
             .setting_get("sensitivity")
             .ok()
@@ -93,11 +151,17 @@ impl SinusApp {
                 token: String::new(),
                 token_message: String::new(),
                 sensitivity,
+                token_status: "Token status not checked.".to_string(),
+                enrollment_message: String::new(),
             },
             #[cfg(not(test))]
-            _tray: build_tray().ok(),
+            tray: build_tray().ok(),
+            #[cfg(not(test))]
+            tray_state: TrayState::Listening,
             device_id,
             shared,
+            instance,
+            pending_enrollment_action: None,
         }
     }
 
@@ -109,6 +173,28 @@ impl SinusApp {
     fn show_window(ctx: &egui::Context) {
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
+    }
+
+    fn apply_enrollment_action(&mut self, action: EnrollmentAction) {
+        let result = match action {
+            EnrollmentAction::One { id, .. } => self.store.delete_enrollment(id).map(|()| 1usize),
+            EnrollmentAction::Class(class) => self.store.delete_enrollments_for_class(class),
+            EnrollmentAction::All => self.store.delete_all_enrollments(),
+        };
+
+        match result {
+            Ok(deleted) => {
+                self.form.enrollment_message = format!(
+                    "Removed {deleted} saved {}. Detection updated immediately.",
+                    if deleted == 1 { "take" } else { "takes" }
+                );
+                self.shared.reset_teach_feedback();
+                self.shared.request_enrollment_reload();
+            }
+            Err(error) => {
+                self.form.enrollment_message = format!("Could not update training: {error}");
+            }
+        }
     }
 
     fn handle_menu_events(&mut self, ctx: &egui::Context) {
@@ -147,18 +233,38 @@ impl SinusApp {
         }
     }
 
-    fn status_glyph(&mut self) -> &'static str {
+    fn current_tray_state(&mut self) -> TrayState {
         let now = Utc::now();
         self.pause = self.pause.normalized(now);
         // A missing model (fail-soft fallback in the capture thread) is a warning
         // state (SPEC §6 tray "⚠"), shown ahead of the plain listening glyph.
         match self.mode {
-            Mode::OfflineStrict => "📴",
-            _ if self.pause.is_paused(now) => "⏸",
-            _ if self.shared.model() == ModelStatus::Missing => "⚠",
-            _ => "🟢",
+            Mode::OfflineStrict => TrayState::Offline,
+            _ if self.pause.is_paused(now) => TrayState::Paused,
+            _ if self.shared.model() == ModelStatus::Missing => TrayState::Warning,
+            _ => TrayState::Listening,
         }
     }
+
+    fn status_glyph(&mut self) -> &'static str {
+        self.current_tray_state().glyph()
+    }
+
+    #[cfg(not(test))]
+    fn update_tray_status(&mut self) {
+        let state = self.current_tray_state();
+        if state == self.tray_state {
+            return;
+        }
+        if let Some(tray) = &self.tray {
+            let _ = tray.set_icon(Some(status_icon(state.color())));
+            let _ = tray.set_tooltip(Some(state.tooltip()));
+        }
+        self.tray_state = state;
+    }
+
+    #[cfg(test)]
+    fn update_tray_status(&mut self) {}
 
     fn draw_history(&mut self, ui: &mut egui::Ui) {
         let now = Utc::now();
@@ -248,12 +354,27 @@ impl SinusApp {
             ui.add(egui::TextEdit::singleline(&mut self.form.token).password(true));
             if ui.button("Save token").clicked() {
                 self.form.token_message = match save_api_token(self.form.token.trim()) {
-                    Ok(()) => "Saved in the OS keychain.".to_string(),
+                    Ok(()) => {
+                        self.form.token_status = "Token stored in the OS keychain.".to_string();
+                        "Saved in the OS keychain.".to_string()
+                    }
                     Err(error) => format!("Could not save token: {error}"),
                 };
                 self.form.token.clear();
             }
+            if ui
+                .button("Check token")
+                .on_hover_text("Checks only whether a token exists; never displays it")
+                .clicked()
+            {
+                self.form.token_status = match api_token_status() {
+                    Ok(true) => "Token stored in the OS keychain.".to_string(),
+                    Ok(false) => "No API token is stored.".to_string(),
+                    Err(error) => format!("Could not check token: {error}"),
+                };
+            }
         });
+        ui.label(&self.form.token_status);
         if !self.form.token_message.is_empty() {
             ui.label(&self.form.token_message);
         }
@@ -286,31 +407,107 @@ impl SinusApp {
         ui.separator();
         ui.heading("Teach mode");
         ui.label("Teach your own sounds locally. Raw audio is discarded; only an on-device embedding is saved.");
-        ui.label("Click a class, then make one clear sound within 3 seconds. Add 3–5 varied samples per class.");
+        ui.label("Record one clear sound after the short get-ready countdown. Add 3–5 varied takes per class.");
 
         let feedback = self.shared.teach_feedback();
         let busy = matches!(feedback.state, TeachState::Armed | TeachState::Recording);
         let model_ready = self.shared.model() == ModelStatus::Onnx;
-        let counts = self.store.enrollment_counts().unwrap_or_default();
-        egui::Grid::new("teach_classes")
-            .num_columns(3)
-            .spacing([12.0, 6.0])
+        let enrollments = self.store.enrollments().unwrap_or_default();
+
+        egui::ScrollArea::vertical()
+            .id_salt("teach_classes")
+            .max_height(360.0)
             .show(ui, |ui| {
                 for class in EventType::ALL {
-                    ui.label(class.as_str().replace('_', " "));
-                    ui.label(format!(
-                        "{} samples",
-                        counts.get(&class).copied().unwrap_or(0)
-                    ));
-                    if ui
-                        .add_enabled(model_ready && !busy, egui::Button::new("Record sample"))
-                        .clicked()
-                    {
-                        self.shared.request_teach(class);
-                    }
-                    ui.end_row();
+                    let class_examples: Vec<_> = enrollments
+                        .iter()
+                        .filter(|stored| {
+                            stored.enrollment.class == class && !stored.enrollment.is_negative
+                        })
+                        .collect();
+                    ui.group(|ui| {
+                        ui.horizontal(|ui| {
+                            ui.strong(class.as_str().replace('_', " "));
+                            ui.label(enrollment_status(&class_examples));
+                            if ui
+                                .add_enabled(model_ready && !busy, egui::Button::new("Record take"))
+                                .clicked()
+                            {
+                                self.shared.request_teach(class);
+                            }
+                            if ui
+                                .add_enabled(
+                                    !busy && !class_examples.is_empty(),
+                                    egui::Button::new("Reset class"),
+                                )
+                                .clicked()
+                            {
+                                self.pending_enrollment_action =
+                                    Some(EnrollmentAction::Class(class));
+                            }
+                        });
+
+                        for (index, stored) in class_examples.iter().enumerate() {
+                            ui.horizontal(|ui| {
+                                ui.label(format!(
+                                    "Take {} • {}",
+                                    index + 1,
+                                    format_enrollment_time(&stored.created_at)
+                                ));
+                                match (stored.similarity, stored.separation) {
+                                    (Some(similarity), Some(separation)) => {
+                                        ui.label(format!(
+                                            "repeat {similarity:.2} • separation {separation:+.2}"
+                                        ));
+                                    }
+                                    _ => {
+                                        ui.label("baseline take");
+                                    }
+                                }
+                                if ui.add_enabled(!busy, egui::Button::new("Remove")).clicked() {
+                                    self.pending_enrollment_action = Some(EnrollmentAction::One {
+                                        id: stored.id,
+                                        class,
+                                    });
+                                }
+                            });
+                        }
+                    });
                 }
             });
+
+        if ui
+            .add_enabled(
+                !busy && !enrollments.is_empty(),
+                egui::Button::new("Reset all training"),
+            )
+            .clicked()
+        {
+            self.pending_enrollment_action = Some(EnrollmentAction::All);
+        }
+
+        if let Some(action) = self.pending_enrollment_action {
+            let mut confirm = false;
+            let mut cancel = false;
+            ui.group(|ui| {
+                ui.colored_label(egui::Color32::YELLOW, enrollment_confirmation(action));
+                ui.label("Only local embeddings and their metadata will be removed; event history is unchanged.");
+                ui.horizontal(|ui| {
+                    confirm = ui.button("Confirm removal").clicked();
+                    cancel = ui.button("Cancel").clicked();
+                });
+            });
+            if confirm {
+                self.apply_enrollment_action(action);
+                self.pending_enrollment_action = None;
+            } else if cancel {
+                self.pending_enrollment_action = None;
+            }
+        }
+
+        if !self.form.enrollment_message.is_empty() {
+            ui.label(&self.form.enrollment_message);
+        }
 
         if !model_ready {
             ui.colored_label(
@@ -320,7 +517,10 @@ impl SinusApp {
         }
         match (feedback.state, feedback.class) {
             (TeachState::Armed, Some(class)) => {
-                ui.label(format!("Get ready to record {}…", class.as_str()));
+                ui.label(format!(
+                    "Get ready — {} recording starts in about one second…",
+                    class.as_str()
+                ));
             }
             (TeachState::Recording, Some(class)) => {
                 ui.colored_label(
@@ -365,8 +565,53 @@ impl SinusApp {
         }
 
         ui.separator();
+        ui.label(
+            "Menu-bar status: 🟢 listening • ⏸ paused • ⚠ model unavailable • 📴 offline-strict.",
+        );
+        ui.label("macOS: Sinus Sentinel stays in the menu bar without a Dock icon. Closing this window hides it; use the menu-bar icon to reopen or quit.");
         ui.label(format!("device id: {}", self.device_id));
         ui.label("Privacy: only event metadata is stored/sent — never audio.");
+    }
+}
+
+fn enrollment_status(examples: &[&StoredEnrollment]) -> String {
+    let count = examples.len();
+    match count {
+        0 => "not trained".to_string(),
+        1 | 2 => format!("inactive • needs {} more", 3 - count),
+        _ => {
+            let quality_is_good = examples.last().is_some_and(|latest| {
+                latest.similarity.is_some_and(|value| value >= 0.75)
+                    && latest.separation.is_some_and(|value| value >= 0.05)
+            });
+            if quality_is_good {
+                format!("ready • {count} takes")
+            } else {
+                format!("active • {count} takes • add varied takes")
+            }
+        }
+    }
+}
+
+fn format_enrollment_time(created_at: &str) -> String {
+    chrono::DateTime::parse_from_rfc3339(created_at)
+        .map(|time| {
+            time.with_timezone(&chrono::Local)
+                .format("%b %-d, %-I:%M %p")
+                .to_string()
+        })
+        .unwrap_or_else(|_| "saved previously".to_string())
+}
+
+fn enrollment_confirmation(action: EnrollmentAction) -> String {
+    match action {
+        EnrollmentAction::One { class, .. } => {
+            format!("Remove this {} take?", class.as_str().replace('_', " "))
+        }
+        EnrollmentAction::Class(class) => {
+            format!("Reset every {} take?", class.as_str().replace('_', " "))
+        }
+        EnrollmentAction::All => "Reset every saved Teach-mode take?".to_string(),
     }
 }
 
@@ -382,14 +627,35 @@ fn save_api_token(token: &str) -> Result<(), String> {
         .map_err(|error| error.to_string())
 }
 
+#[cfg(feature = "keyring")]
+fn api_token_status() -> Result<bool, String> {
+    use sinus_core::token::{KeyringTokenStore, TokenStore};
+
+    KeyringTokenStore::new("SinusSentinel", "phr-api-token")
+        .get_token()
+        .map(|token| token.is_some())
+        .map_err(|error| error.to_string())
+}
+
 #[cfg(not(feature = "keyring"))]
 fn save_api_token(_token: &str) -> Result<(), String> {
+    Err("this build has no OS keychain support".to_string())
+}
+
+#[cfg(not(feature = "keyring"))]
+fn api_token_status() -> Result<bool, String> {
     Err("this build has no OS keychain support".to_string())
 }
 
 impl eframe::App for SinusApp {
     fn update(&mut self, ctx: &egui::Context, _frame: &mut eframe::Frame) {
         self.handle_menu_events(ctx);
+
+        if self.instance.take_activation_request() {
+            self.tab = Tab::History;
+            Self::show_window(ctx);
+        }
+        self.update_tray_status();
 
         // Closing the accessory window hides it but leaves monitoring and the
         // menu-bar item alive. Only the explicit Quit menu action exits.
@@ -433,7 +699,11 @@ impl eframe::App for SinusApp {
 
         egui::CentralPanel::default().show(ctx, |ui| match self.tab {
             Tab::History => self.draw_history(ui),
-            Tab::Settings => self.draw_settings(ui),
+            Tab::Settings => {
+                egui::ScrollArea::vertical()
+                    .id_salt("settings_page")
+                    .show(ui, |ui| self.draw_settings(ui));
+            }
         });
 
         // Event-driven repaint only (SPEC §9): request a slow tick so counts and

@@ -7,6 +7,7 @@
 mod app;
 #[cfg(feature = "live-audio")]
 mod capture;
+mod instance;
 mod shared;
 mod state;
 mod sync;
@@ -37,6 +38,17 @@ fn main() -> eframe::Result<()> {
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("warning: could not create data dir {dir:?}: {e}");
     }
+    let instance = match instance::InstanceGuard::acquire(&dir) {
+        Ok(instance::AcquireOutcome::Primary(instance)) => instance,
+        Ok(instance::AcquireOutcome::ActivatedExisting) => {
+            eprintln!("single-instance: activated the running instance");
+            return Ok(());
+        }
+        Err(error) => {
+            eprintln!("fatal: could not establish single-instance ownership: {error}");
+            std::process::exit(1);
+        }
+    };
     let store = Store::open(dir.join("events.db")).unwrap_or_else(|e| {
         eprintln!("fatal: could not open event store: {e}");
         std::process::exit(1);
@@ -69,6 +81,6 @@ fn main() -> eframe::Result<()> {
     eframe::run_native(
         "Sinus Sentinel",
         native_options,
-        Box::new(move |cc| Ok(Box::new(app::SinusApp::new(cc, store, shared)))),
+        Box::new(move |cc| Ok(Box::new(app::SinusApp::new(cc, store, shared, instance)))),
     )
 }

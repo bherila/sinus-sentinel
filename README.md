@@ -76,3 +76,9 @@ The desktop Settings screen also has a fully local **Teach mode**. Pick a class,
 make one clear sound during the three-second capture, and repeat until the UI shows
 good repeat similarity and class separation (usually 3–5 varied samples). Raw
 training audio is discarded; only 1024-value YAMNet embeddings are stored locally.
+Saved takes can be removed individually, reset by class, or reset together.
+
+The desktop app enforces one process per user. Launching it again activates the
+existing History window instead of starting duplicate microphone, sync, tray, or
+Keychain workers. Closing the window hides it; the menu-bar/tray item keeps running
+until **Quit** is selected.

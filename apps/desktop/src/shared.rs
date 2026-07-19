@@ -143,6 +143,7 @@ pub struct SharedStatus {
     teach_examples: Arc<AtomicUsize>,
     teach_similarity: Arc<AtomicU32>,
     teach_separation: Arc<AtomicU32>,
+    enrollment_reload: Arc<AtomicBool>,
 }
 
 impl Default for SharedStatus {
@@ -160,6 +161,7 @@ impl Default for SharedStatus {
             teach_examples: Arc::new(AtomicUsize::new(0)),
             teach_similarity: Arc::new(AtomicU32::new((-1.0f32).to_bits())),
             teach_separation: Arc::new(AtomicU32::new(0.0f32.to_bits())),
+            enrollment_reload: Arc::new(AtomicBool::new(false)),
         }
     }
 }
@@ -278,6 +280,28 @@ impl SharedStatus {
             similarity: f32::from_bits(self.teach_similarity.load(Ordering::Relaxed)),
             separation: f32::from_bits(self.teach_separation.load(Ordering::Relaxed)),
         }
+    }
+
+    /// Tell the capture worker that enrollment rows changed outside its thread.
+    pub fn request_enrollment_reload(&self) {
+        self.enrollment_reload.store(true, Ordering::Release);
+    }
+
+    #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
+    pub fn take_enrollment_reload(&self) -> bool {
+        self.enrollment_reload.swap(false, Ordering::AcqRel)
+    }
+
+    pub fn reset_teach_feedback(&self) {
+        self.teach_request.store(0, Ordering::Relaxed);
+        self.teach_state
+            .store(TeachState::Idle.to_u8(), Ordering::Release);
+        self.teach_class.store(0, Ordering::Relaxed);
+        self.teach_examples.store(0, Ordering::Relaxed);
+        self.teach_similarity
+            .store((-1.0f32).to_bits(), Ordering::Relaxed);
+        self.teach_separation
+            .store(0.0f32.to_bits(), Ordering::Relaxed);
     }
 }
 

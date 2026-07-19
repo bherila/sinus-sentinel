@@ -31,6 +31,12 @@ fn blob_to_f32(b: &[u8]) -> Vec<f32> {
 pub struct StoredEnrollment {
     pub id: i64,
     pub enrollment: Enrollment,
+    pub created_at: String,
+    /// Similarity to a previous take of the same class when this example was
+    /// recorded. `None` for the first take and pre-quality-metadata rows.
+    pub similarity: Option<f32>,
+    /// Same-class similarity minus the closest other enrolled class.
+    pub separation: Option<f32>,
 }
 
 /// After this many server rejections an event stops being re-sent and is left for
@@ -115,6 +121,11 @@ impl Store {
                 4,
                 "ALTER TABLE events ADD COLUMN reject_count INTEGER NOT NULL DEFAULT 0;
                  ALTER TABLE events ADD COLUMN rejected_at TEXT NULL;",
+            ),
+            (
+                5,
+                "ALTER TABLE enrollment_examples ADD COLUMN similarity REAL NULL;
+                 ALTER TABLE enrollment_examples ADD COLUMN separation REAL NULL;",
             ),
         ];
 
@@ -374,14 +385,29 @@ impl Store {
         embedding: &[f32],
         is_negative: bool,
     ) -> Result<i64> {
+        self.add_enrollment_with_quality(class, embedding, is_negative, None, None)
+    }
+
+    /// Add an enrollment and retain the quality observed against earlier takes.
+    pub fn add_enrollment_with_quality(
+        &self,
+        class: EventType,
+        embedding: &[f32],
+        is_negative: bool,
+        similarity: Option<f32>,
+        separation: Option<f32>,
+    ) -> Result<i64> {
         self.conn.execute(
-            "INSERT INTO enrollment_examples (class, embedding, is_negative, created_at)
-             VALUES (?1, ?2, ?3, ?4)",
+            "INSERT INTO enrollment_examples
+                (class, embedding, is_negative, created_at, similarity, separation)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6)",
             params![
                 class.as_str(),
                 f32_to_blob(embedding),
                 is_negative as i64,
-                Utc::now().to_rfc3339()
+                Utc::now().to_rfc3339(),
+                similarity,
+                separation,
             ],
         )?;
         Ok(self.conn.last_insert_rowid())
@@ -390,7 +416,8 @@ impl Store {
     /// All enrollments (for rebuilding the prototype matcher).
     pub fn enrollments(&self) -> Result<Vec<StoredEnrollment>> {
         let mut stmt = self.conn.prepare(
-            "SELECT id, class, embedding, is_negative FROM enrollment_examples ORDER BY id",
+            "SELECT id, class, embedding, is_negative, created_at, similarity, separation
+             FROM enrollment_examples ORDER BY id",
         )?;
         let rows = stmt.query_map([], |row| {
             let class: String = row.get("class")?;
@@ -402,6 +429,9 @@ impl Store {
                     embedding: blob_to_f32(&blob),
                     is_negative: row.get::<_, i64>("is_negative")? != 0,
                 },
+                created_at: row.get("created_at")?,
+                similarity: row.get("similarity")?,
+                separation: row.get("separation")?,
             })
         })?;
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
@@ -412,6 +442,19 @@ impl Store {
         self.conn
             .execute("DELETE FROM enrollment_examples WHERE id = ?1", params![id])?;
         Ok(())
+    }
+
+    /// Delete all positive and negative enrollment examples for one class.
+    pub fn delete_enrollments_for_class(&self, class: EventType) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM enrollment_examples WHERE class = ?1",
+            params![class.as_str()],
+        )?)
+    }
+
+    /// Delete every local enrollment example. Event history is untouched.
+    pub fn delete_all_enrollments(&self) -> Result<usize> {
+        Ok(self.conn.execute("DELETE FROM enrollment_examples", [])?)
     }
 
     /// Count of positive (non-negative) examples per class.
@@ -470,11 +513,11 @@ mod tests {
     #[test]
     fn migrations_apply_and_are_idempotent() {
         let store = Store::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
         // Re-running migrate on the same connection is a no-op.
         let mut store = store;
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 4);
+        assert_eq!(store.schema_version().unwrap(), 5);
     }
 
     #[test]
@@ -608,10 +651,30 @@ mod tests {
         let all = store.enrollments().unwrap();
         assert_eq!(all.len(), 3);
         assert_eq!(all[0].enrollment.embedding, vec![0.1, 0.2, 0.3]);
+        assert!(!all[0].created_at.is_empty());
+        assert_eq!(all[0].similarity, None);
         let counts = store.enrollment_counts().unwrap();
         assert_eq!(counts[&EventType::Hawk], 2); // negatives excluded
         store.delete_enrollment(id).unwrap();
         assert_eq!(store.enrollments().unwrap().len(), 2);
+        assert_eq!(
+            store.delete_enrollments_for_class(EventType::Hawk).unwrap(),
+            2
+        );
+        assert!(store.enrollments().unwrap().is_empty());
+        store
+            .add_enrollment_with_quality(
+                EventType::Sniffle,
+                &[0.2, 0.3],
+                false,
+                Some(0.88),
+                Some(0.12),
+            )
+            .unwrap();
+        let quality = store.enrollments().unwrap();
+        assert_eq!(quality[0].similarity, Some(0.88));
+        assert_eq!(quality[0].separation, Some(0.12));
+        assert_eq!(store.delete_all_enrollments().unwrap(), 1);
     }
 
     #[test]
