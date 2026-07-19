@@ -168,8 +168,15 @@ pub fn spawn_capture(db_path: PathBuf, shared: SharedStatus) -> JoinHandle<()> {
     })
 }
 
+/// Event embeddings only exist to let the user report a recent false positive;
+/// past this age the event is no longer surfaced for reporting.
+const EVENT_EMBEDDING_RETENTION_DAYS: i64 = 30;
+
 fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     let store = Store::open(&db_path).map_err(|e| e.to_string())?;
+    let _ = store.prune_event_embeddings(
+        Utc::now() - chrono::Duration::days(EVENT_EMBEDDING_RETENTION_DAYS),
+    );
     let device_id = store
         .setting_get("device_id")
         .ok()
@@ -240,6 +247,9 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
                 for detected in &events {
                     let event = pipeline.to_event(detected, &ctx);
                     let _ = store.insert_event(&event);
+                    // Kept locally only (never uploaded) so a false-positive
+                    // report can enroll this exact sound as a negative example.
+                    let _ = store.put_event_embedding(&event.uuid, &detected.embedding);
                 }
             }
         }

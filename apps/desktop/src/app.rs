@@ -10,7 +10,7 @@ use eframe::egui;
 use egui_plot::{Bar, BarChart, Legend, Plot};
 use sinus_core::store::{Store, StoredEnrollment};
 use sinus_core::sync::Mode;
-use sinus_core::types::EventType;
+use sinus_core::types::{Event, EventType};
 
 use crate::instance::InstanceGuard;
 use crate::shared::{ModelStatus, SharedStatus, TeachState};
@@ -80,6 +80,8 @@ impl TrayState {
 enum EnrollmentAction {
     One { id: i64, class: EventType },
     Class(EventType),
+    /// Forget learned false-positive suppressions, keeping taught takes.
+    Negatives,
     All,
 }
 
@@ -109,6 +111,7 @@ pub struct SinusApp {
     shared: SharedStatus,
     instance: InstanceGuard,
     pending_enrollment_action: Option<EnrollmentAction>,
+    history_message: String,
 }
 
 impl SinusApp {
@@ -162,6 +165,7 @@ impl SinusApp {
             shared,
             instance,
             pending_enrollment_action: None,
+            history_message: String::new(),
         }
     }
 
@@ -179,14 +183,19 @@ impl SinusApp {
         let result = match action {
             EnrollmentAction::One { id, .. } => self.store.delete_enrollment(id).map(|()| 1usize),
             EnrollmentAction::Class(class) => self.store.delete_enrollments_for_class(class),
+            EnrollmentAction::Negatives => self.store.delete_negative_enrollments(),
             EnrollmentAction::All => self.store.delete_all_enrollments(),
         };
 
         match result {
             Ok(deleted) => {
+                let noun = match action {
+                    EnrollmentAction::Negatives => "false-positive report",
+                    _ => "saved take",
+                };
                 self.form.enrollment_message = format!(
-                    "Removed {deleted} saved {}. Detection updated immediately.",
-                    if deleted == 1 { "take" } else { "takes" }
+                    "Removed {deleted} {noun}{}. Detection updated immediately.",
+                    if deleted == 1 { "" } else { "s" }
                 );
                 self.shared.reset_teach_feedback();
                 self.shared.request_enrollment_reload();
@@ -195,6 +204,43 @@ impl SinusApp {
                 self.form.enrollment_message = format!("Could not update training: {error}");
             }
         }
+    }
+
+    /// Handle a false-positive report: enroll the event's stored embedding as a
+    /// negative example (so the detector suppresses similar sounds), then
+    /// tombstone the event — sync sends the PHR DELETE once a network mode is
+    /// active. Events without a stored embedding still get removed.
+    fn report_false_positive(&mut self, event: &Event) {
+        let trained = match self.store.get_event_embedding(&event.uuid) {
+            Ok(Some(embedding)) => self
+                .store
+                .add_enrollment(event.event_type, &embedding, true)
+                .is_ok(),
+            _ => false,
+        };
+
+        if let Err(error) = self.store.mark_deleted(&event.uuid) {
+            self.history_message = format!("Could not remove the event: {error}");
+            return;
+        }
+        let _ = self.store.delete_event_embedding(&event.uuid);
+        if trained {
+            self.shared.request_enrollment_reload();
+        }
+        self.shared.request_sync_now();
+
+        let class = event.event_type.as_str().replace('_', " ");
+        self.history_message = if trained {
+            format!(
+                "Reported the {class} event: removed here and from the PHR on next sync, \
+                 and the detector will now ignore similar sounds."
+            )
+        } else {
+            format!(
+                "Removed the {class} event (here and from the PHR on next sync). \
+                 No embedding was stored for it, so the detector was not adjusted."
+            )
+        };
     }
 
     fn handle_menu_events(&mut self, ctx: &egui::Context) {
@@ -310,7 +356,7 @@ impl SinusApp {
         ui.heading("Recent events");
         let start = now - chrono::Duration::days(7);
         let events = self.store.events_in_range(start, now).unwrap_or_default();
-        let mut to_delete: Option<String> = None;
+        let mut to_report: Option<Event> = None;
         egui::ScrollArea::vertical()
             .max_height(180.0)
             .show(ui, |ui| {
@@ -318,10 +364,13 @@ impl SinusApp {
                     ui.horizontal(|ui| {
                         if ui
                             .button("✕")
-                            .on_hover_text("mark false positive (tombstone)")
+                            .on_hover_text(
+                                "Report false positive: removes this event (and from the \
+                                 PHR) and teaches the detector to ignore similar sounds",
+                            )
                             .clicked()
                         {
-                            to_delete = Some(e.uuid.clone());
+                            to_report = Some(e.clone());
                         }
                         ui.label(format!(
                             "{}  {}  conf {:.2}  x{}",
@@ -333,8 +382,11 @@ impl SinusApp {
                     });
                 }
             });
-        if let Some(uuid) = to_delete {
-            let _ = self.store.mark_deleted(&uuid);
+        if let Some(event) = to_report {
+            self.report_false_positive(&event);
+        }
+        if !self.history_message.is_empty() {
+            ui.label(&self.history_message);
         }
     }
 
@@ -476,6 +528,25 @@ impl SinusApp {
                 }
             });
 
+        let negative_count = enrollments
+            .iter()
+            .filter(|stored| stored.enrollment.is_negative)
+            .count();
+        if negative_count > 0 {
+            ui.horizontal(|ui| {
+                ui.label(format!(
+                    "{negative_count} reported false positive{} teaching the detector what to ignore.",
+                    if negative_count == 1 { " is" } else { "s are" }
+                ));
+                if ui
+                    .add_enabled(!busy, egui::Button::new("Forget reports"))
+                    .clicked()
+                {
+                    self.pending_enrollment_action = Some(EnrollmentAction::Negatives);
+                }
+            });
+        }
+
         if ui
             .add_enabled(
                 !busy && !enrollments.is_empty(),
@@ -610,6 +681,11 @@ fn enrollment_confirmation(action: EnrollmentAction) -> String {
         }
         EnrollmentAction::Class(class) => {
             format!("Reset every {} take?", class.as_str().replace('_', " "))
+        }
+        EnrollmentAction::Negatives => {
+            "Forget every reported false positive? Previously suppressed sounds may be \
+             detected again."
+                .to_string()
         }
         EnrollmentAction::All => "Reset every saved Teach-mode take?".to_string(),
     }

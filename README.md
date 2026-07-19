@@ -78,6 +78,13 @@ good repeat similarity and class separation (usually 3–5 varied samples). Raw
 training audio is discarded; only 1024-value YAMNet embeddings are stored locally.
 Saved takes can be removed individually, reset by class, or reset together.
 
+Each **Recent events** row has a ✕ **report false positive** action. Reporting
+removes the event from local history, deletes it from the PHR on the next sync,
+and enrolls the sound's embedding as a negative example so the detector suppresses
+near-identical sounds from then on — for both built-in and taught classes. Event
+embeddings are kept locally only (never uploaded) for 30 days to support this;
+learned suppressions are listed in Teach mode and can be forgotten there.
+
 The desktop app enforces one process per user. Launching it again activates the
 existing History window instead of starting duplicate microphone, sync, tray, or
 Keychain workers. Closing the window hides it; the menu-bar/tray item keeps running

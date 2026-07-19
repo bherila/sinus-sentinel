@@ -388,6 +388,15 @@ impl<E: Embedder> Pipeline<E> {
                         self.decision.decide(&personalized_scores)
                     })
                     .or(native_hit);
+                // Reported false positives veto every path, native included — a
+                // negative enrolled from a bad detection must suppress the same
+                // sound even when YAMNet (not a prototype) produced the label.
+                let hit = hit.filter(|_| {
+                    !self
+                        .proto
+                        .as_ref()
+                        .is_some_and(|m| m.vetoes(&features.embedding))
+                });
 
                 let mut sorted: Vec<(EventType, f32)> =
                     scores.scores.iter().map(|(&k, &v)| (k, v)).collect();
@@ -401,6 +410,7 @@ impl<E: Embedder> Pipeline<E> {
                         confidence: h.confidence,
                         timestamp_ms: time_ms,
                         energy_peak,
+                        embedding: features.embedding.clone(),
                     }) {
                         out.events.push(ev);
                     }
@@ -598,6 +608,48 @@ mod tests {
         let signal = synth::sine(16_000 * 2, 16_000, 500.0, 0.8);
         let result = pipeline.process(&signal).unwrap();
         assert!(result.events.is_empty());
+    }
+
+    /// A negative enrolled from a reported false positive suppresses a *native*
+    /// YAMNet detection of the same sound — not just personalized prototypes.
+    #[test]
+    fn reported_false_positive_vetoes_native_detection() {
+        let mut native_scores = vec![0.0; crate::classify::embed::AUDIOSET_CLASSES];
+        native_scores[AudiosetMap::default().cough] = 0.99;
+        let embedding = vec![0.2, 0.9, 0.1, 0.0];
+        let embedder = || MockEmbedder {
+            features: WindowFeatures {
+                audioset_scores: Some(native_scores.clone()),
+                embedding: embedding.clone(),
+                energy_peak: true,
+            },
+            version: "test".to_string(),
+        };
+        let signal = synth::sine(16_000 * 2, 16_000, 500.0, 0.8);
+
+        // Without the negative the native path fires…
+        let baseline = Pipeline::new(PipelineConfig::default(), embedder())
+            .process(&signal)
+            .unwrap();
+        assert!(!baseline.events.is_empty());
+        // …and the closed event carries the window embedding for later reporting.
+        assert_eq!(baseline.events[0].embedding, embedding);
+
+        // With the event's own embedding enrolled as a negative, it is vetoed.
+        let matcher = PrototypeMatcher::from_enrollments(
+            &[Enrollment {
+                class: EventType::Cough,
+                embedding: embedding.clone(),
+                is_negative: true,
+            }],
+            0.65,
+            0.05,
+        );
+        let vetoed = Pipeline::new(PipelineConfig::default(), embedder())
+            .with_prototypes(matcher)
+            .process(&signal)
+            .unwrap();
+        assert!(vetoed.events.is_empty(), "events: {:?}", vetoed.events);
     }
 
     /// Build a rich signal: quiet-converge → cough-band burst → quiet → a second

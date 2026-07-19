@@ -11,6 +11,13 @@ use crate::types::EventType;
 /// to avoid turning one unusual sound (or a bit of speech) into a broad template.
 pub const MIN_POSITIVE_EXAMPLES: usize = 3;
 
+/// A window this cosine-similar to an enrolled negative (a reported false
+/// positive) is vetoed outright — for *every* class, including the native
+/// YAMNet path, not just personalized prototypes. Deliberately tighter than the
+/// personalized accept threshold so one report suppresses near-repeats of the
+/// same sound without swallowing genuinely different events.
+pub const NEGATIVE_VETO_THRESHOLD: f32 = 0.80;
+
 /// L2-normalize a vector (returns zeros if the input is all-zero).
 fn normalize(v: &[f32]) -> Vec<f32> {
     let norm = v.iter().map(|&x| x * x).sum::<f32>().sqrt();
@@ -148,6 +155,12 @@ impl PrototypeMatcher {
             .fold(-1.0f32, f32::max)
     }
 
+    /// Whether a window is close enough to a reported false positive that no
+    /// class — native or personalized — may fire on it.
+    pub fn vetoes(&self, embedding: &[f32]) -> bool {
+        self.nearest_negative(embedding) >= NEGATIVE_VETO_THRESHOLD
+    }
+
     /// Best matching class for an embedding, applying both gates: the similarity
     /// must clear `sim_threshold` and beat both the nearest negative and runner-up
     /// positive class by `negative_margin`. Returns `None` if nothing qualifies.
@@ -267,6 +280,18 @@ mod tests {
             m.best_match(&probe).is_none(),
             "should be blocked by the nearest negative"
         );
+    }
+
+    #[test]
+    fn veto_fires_only_near_a_negative() {
+        let m = matcher();
+        // Nearly identical to the enrolled negative [0,0,0,1] → vetoed.
+        assert!(m.vetoes(&emb([0.0, 0.0, 0.05, 1.0])));
+        // Similar-ish but below the veto threshold → not vetoed.
+        assert!(!m.vetoes(&emb([1.0, 0.0, 0.0, 0.6])));
+        // No negatives enrolled → never vetoes.
+        let no_neg = PrototypeMatcher::from_enrollments(&[], 0.6, 0.1);
+        assert!(!no_neg.vetoes(&emb([0.0, 0.0, 0.0, 1.0])));
     }
 
     #[test]

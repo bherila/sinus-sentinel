@@ -127,6 +127,16 @@ impl Store {
                 "ALTER TABLE enrollment_examples ADD COLUMN similarity REAL NULL;
                  ALTER TABLE enrollment_examples ADD COLUMN separation REAL NULL;",
             ),
+            (
+                // Local-only backbone embeddings of detected events, so a false
+                // positive can be enrolled as a negative example after the fact.
+                // Never uploaded; pruned once the event ages out of the UI.
+                6,
+                "CREATE TABLE event_embeddings (
+                    uuid      TEXT PRIMARY KEY,
+                    embedding BLOB NOT NULL
+                );",
+            ),
         ];
 
         let current: i64 = self.conn.query_row(
@@ -354,6 +364,55 @@ impl Store {
         )?)
     }
 
+    // ----- event embeddings ---------------------------------------------------
+
+    /// Retain the backbone embedding that produced an event (local-only; enables
+    /// enrolling a reported false positive as a negative example). Skips empty
+    /// embeddings — the heuristic backbone can produce none worth keeping.
+    pub fn put_event_embedding(&self, uuid: &str, embedding: &[f32]) -> Result<()> {
+        if embedding.is_empty() {
+            return Ok(());
+        }
+        self.conn.execute(
+            "INSERT OR REPLACE INTO event_embeddings (uuid, embedding) VALUES (?1, ?2)",
+            params![uuid, f32_to_blob(embedding)],
+        )?;
+        Ok(())
+    }
+
+    /// The stored embedding for an event, if one was retained.
+    pub fn get_event_embedding(&self, uuid: &str) -> Result<Option<Vec<f32>>> {
+        Ok(self
+            .conn
+            .query_row(
+                "SELECT embedding FROM event_embeddings WHERE uuid = ?1",
+                params![uuid],
+                |r| r.get::<_, Vec<u8>>(0),
+            )
+            .optional()?
+            .map(|blob| blob_to_f32(&blob)))
+    }
+
+    /// Drop one event's stored embedding (after it is consumed by a report).
+    pub fn delete_event_embedding(&self, uuid: &str) -> Result<()> {
+        self.conn.execute(
+            "DELETE FROM event_embeddings WHERE uuid = ?1",
+            params![uuid],
+        )?;
+        Ok(())
+    }
+
+    /// Drop embeddings whose event is gone or occurred before `cutoff` — the
+    /// event is no longer reportable in the UI, so its embedding is dead weight.
+    pub fn prune_event_embeddings(&self, cutoff: DateTime<Utc>) -> Result<usize> {
+        Ok(self.conn.execute(
+            "DELETE FROM event_embeddings WHERE uuid NOT IN (
+                SELECT uuid FROM events WHERE occurred_at >= ?1 AND deleted = 0
+             )",
+            params![cutoff.to_rfc3339()],
+        )?)
+    }
+
     // ----- settings -----------------------------------------------------------
 
     pub fn setting_get(&self, key: &str) -> Result<Option<String>> {
@@ -457,6 +516,22 @@ impl Store {
         Ok(self.conn.execute("DELETE FROM enrollment_examples", [])?)
     }
 
+    /// Count of negative examples (learned false-positive suppressions).
+    pub fn negative_enrollment_count(&self) -> Result<i64> {
+        Ok(self.conn.query_row(
+            "SELECT COUNT(*) FROM enrollment_examples WHERE is_negative = 1",
+            [],
+            |r| r.get(0),
+        )?)
+    }
+
+    /// Forget every learned false-positive suppression, keeping taught takes.
+    pub fn delete_negative_enrollments(&self) -> Result<usize> {
+        Ok(self
+            .conn
+            .execute("DELETE FROM enrollment_examples WHERE is_negative = 1", [])?)
+    }
+
     /// Count of positive (non-negative) examples per class.
     pub fn enrollment_counts(&self) -> Result<std::collections::HashMap<EventType, i64>> {
         let mut stmt = self.conn.prepare(
@@ -513,11 +588,11 @@ mod tests {
     #[test]
     fn migrations_apply_and_are_idempotent() {
         let store = Store::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
         // Re-running migrate on the same connection is a no-op.
         let mut store = store;
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 5);
+        assert_eq!(store.schema_version().unwrap(), 6);
     }
 
     #[test]
@@ -675,6 +750,60 @@ mod tests {
         assert_eq!(quality[0].similarity, Some(0.88));
         assert_eq!(quality[0].separation, Some(0.12));
         assert_eq!(store.delete_all_enrollments().unwrap(), 1);
+    }
+
+    #[test]
+    fn event_embeddings_roundtrip_and_prune() {
+        let store = Store::open_in_memory().unwrap();
+        let mut recent = sample_event("recent");
+        recent.occurred_at = Utc::now();
+        let mut old = sample_event("old");
+        old.occurred_at = Utc::now() - chrono::Duration::days(60);
+        store.insert_event(&recent).unwrap();
+        store.insert_event(&old).unwrap();
+
+        store.put_event_embedding("recent", &[0.1, 0.2]).unwrap();
+        store.put_event_embedding("old", &[0.3, 0.4]).unwrap();
+        // Empty embeddings are not stored.
+        store.put_event_embedding("recent2", &[]).unwrap();
+        assert_eq!(store.get_event_embedding("recent2").unwrap(), None);
+        assert_eq!(
+            store.get_event_embedding("recent").unwrap().unwrap(),
+            vec![0.1, 0.2]
+        );
+
+        // Prune drops the aged-out event's embedding, keeps the recent one.
+        let cutoff = Utc::now() - chrono::Duration::days(30);
+        assert_eq!(store.prune_event_embeddings(cutoff).unwrap(), 1);
+        assert!(store.get_event_embedding("old").unwrap().is_none());
+        assert!(store.get_event_embedding("recent").unwrap().is_some());
+
+        // A tombstoned event's embedding is also prunable.
+        store.mark_deleted("recent").unwrap();
+        assert_eq!(store.prune_event_embeddings(cutoff).unwrap(), 1);
+
+        store.put_event_embedding("recent", &[0.5]).unwrap();
+        store.delete_event_embedding("recent").unwrap();
+        assert!(store.get_event_embedding("recent").unwrap().is_none());
+    }
+
+    #[test]
+    fn negative_enrollments_count_and_reset_independently() {
+        let store = Store::open_in_memory().unwrap();
+        store
+            .add_enrollment(EventType::Hawk, &[0.1, 0.2], false)
+            .unwrap();
+        store
+            .add_enrollment(EventType::Cough, &[0.3, 0.4], true)
+            .unwrap();
+        store
+            .add_enrollment(EventType::Sniffle, &[0.5, 0.6], true)
+            .unwrap();
+        assert_eq!(store.negative_enrollment_count().unwrap(), 2);
+        assert_eq!(store.delete_negative_enrollments().unwrap(), 2);
+        assert_eq!(store.negative_enrollment_count().unwrap(), 0);
+        // The positive take survives.
+        assert_eq!(store.enrollments().unwrap().len(), 1);
     }
 
     #[test]

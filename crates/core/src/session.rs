@@ -49,18 +49,22 @@ impl SessionConfig {
 }
 
 /// A per-window firing observation fed to the sessionizer.
-#[derive(Debug, Clone, Copy)]
+#[derive(Debug, Clone)]
 pub struct WindowObservation {
     pub event_type: EventType,
     pub confidence: f32,
     /// Window start time, ms (monotonic within a stream).
     pub timestamp_ms: i64,
     pub energy_peak: bool,
+    /// Backbone embedding of the window (empty when unavailable). The closed
+    /// event carries the embedding of its highest-confidence window so a false
+    /// positive can later be enrolled as a negative example.
+    pub embedding: Vec<f32>,
 }
 
 /// A merged, sessionized detection (pre-persistence; the pipeline stamps uuid /
 /// occurred_at / model_version onto it).
-#[derive(Debug, Clone, Copy, PartialEq)]
+#[derive(Debug, Clone, PartialEq)]
 pub struct DetectedEvent {
     pub event_type: EventType,
     pub start_ms: i64,
@@ -68,6 +72,9 @@ pub struct DetectedEvent {
     pub duration_ms: i64,
     pub confidence: f32,
     pub burst_count: i64,
+    /// Embedding of the highest-confidence window in the session (empty when the
+    /// backbone produced none). Kept locally only — never uploaded.
+    pub embedding: Vec<f32>,
 }
 
 #[derive(Debug, Clone)]
@@ -77,6 +84,7 @@ struct OpenSession {
     max_conf: f32,
     bursts: i64,
     last_peak_ms: Option<i64>,
+    best_embedding: Vec<f32>,
 }
 
 /// The sessionizer. Feed it window observations in non-decreasing time order;
@@ -111,6 +119,7 @@ impl Sessionizer {
             duration_ms: (s.last_ms - s.start_ms) + self.cfg.window_ms,
             confidence: s.max_conf,
             burst_count: s.bursts.max(1),
+            embedding: s.best_embedding,
         };
         self.cooldown_until
             .insert(et, event.end_ms + self.cfg.cooldown(et));
@@ -165,7 +174,10 @@ impl Sessionizer {
         match self.open.get_mut(&et) {
             Some(session) => {
                 session.last_ms = obs.timestamp_ms;
-                session.max_conf = session.max_conf.max(obs.confidence);
+                if obs.confidence > session.max_conf {
+                    session.max_conf = obs.confidence;
+                    session.best_embedding = obs.embedding.clone();
+                }
                 Self::record_peak(session, &obs, self.cfg.peak_min_gap_ms);
             }
             None => {
@@ -175,6 +187,7 @@ impl Sessionizer {
                     max_conf: obs.confidence,
                     bursts: 0,
                     last_peak_ms: None,
+                    best_embedding: obs.embedding.clone(),
                 };
                 Self::record_peak(&mut session, &obs, self.cfg.peak_min_gap_ms);
                 self.open.insert(et, session);
@@ -200,6 +213,7 @@ mod tests {
             confidence: conf,
             timestamp_ms: t,
             energy_peak: peak,
+            embedding: Vec::new(),
         }
     }
 
@@ -213,7 +227,7 @@ mod tests {
             .is_empty());
         let events = s.flush();
         assert_eq!(events.len(), 1);
-        let e = events[0];
+        let e = &events[0];
         assert_eq!(e.event_type, EventType::Cough);
         assert_eq!(e.start_ms, 0);
         assert_eq!(e.end_ms, 1000);
@@ -269,6 +283,23 @@ mod tests {
         // After the cooldown, a new blow is accepted.
         s.observe(obs(EventType::NoseBlow, 11_000, 0.9, true));
         assert_eq!(s.flush().len(), 1);
+    }
+
+    #[test]
+    fn event_carries_embedding_of_highest_confidence_window() {
+        let mut s = Sessionizer::with_defaults();
+        let mut low = obs(EventType::Cough, 0, 0.4, false);
+        low.embedding = vec![1.0, 0.0];
+        let mut high = obs(EventType::Cough, 500, 0.9, false);
+        high.embedding = vec![0.0, 1.0];
+        let mut later_low = obs(EventType::Cough, 1000, 0.5, false);
+        later_low.embedding = vec![0.5, 0.5];
+        s.observe(low);
+        s.observe(high);
+        s.observe(later_low);
+        let events = s.flush();
+        assert_eq!(events.len(), 1);
+        assert_eq!(events[0].embedding, vec![0.0, 1.0]);
     }
 
     #[test]
