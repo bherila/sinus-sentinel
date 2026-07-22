@@ -19,7 +19,7 @@ use sinus_core::classify::proto::PrototypeMatcher;
 use sinus_core::error::Result as CoreResult;
 use sinus_core::mel::{loudest_patch, MelPatch};
 use sinus_core::pipeline::{EventContext, PipelineConfig, StreamingPipeline};
-use sinus_core::store::Store;
+use sinus_core::store::{EnrollmentInsert, Store};
 use sinus_core::types::Source;
 
 use crate::shared::{ModelStatus, SharedStatus};
@@ -194,12 +194,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     // events carry sample-counter timestamps relative to the stream start; map that
     // origin to wall-clock ONCE, here, rather than doing per-chunk `Utc::now()` math.
     let mut config = PipelineConfig::default();
-    config.decision.sensitivity = store
-        .setting_get("sensitivity")
-        .ok()
-        .flatten()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0.5);
+    config.decision.sensitivity = read_sensitivity(&store);
     let mut pipeline = StreamingPipeline::new(config, embedder);
     if let Some(prototypes) = prototypes {
         pipeline = pipeline.with_prototypes(prototypes);
@@ -215,9 +210,17 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
 
     let mut buf = vec![0.0f32; 4096];
     let mut teach_capture: Option<TeachCapture> = None;
+    let mut gate_was_open = false;
     loop {
         if shared.take_enrollment_reload() {
             pipeline.set_prototypes(prototypes_from_store(&store)?);
+        }
+
+        // Sensitivity can change from the slider here or from a value pulled off
+        // the PHR. Applying it in place avoids restarting the stream, which
+        // would reset the gate, the noise floor, and every cooldown.
+        if shared.take_settings_reload() {
+            pipeline.set_sensitivity(read_sensitivity(&store));
         }
 
         if teach_capture.is_none() {
@@ -237,6 +240,15 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
                 shared.set_teach_recording(capture.class);
             }
         }
+
+        // Publish "we can hear something" so the UI isn't silent during the
+        // second or two between a sound arriving and its classification.
+        let gate_open = pipeline.gate_open();
+        if gate_open && !gate_was_open {
+            shared.note_heard(Utc::now());
+        }
+        gate_was_open = gate_open;
+        shared.set_analyzing(gate_open && !teaching);
 
         if let Ok(events) = pipeline.push(&buf[..n]) {
             // Quiet hours suppress detection *logging* (SPEC §6): keep running the
@@ -262,6 +274,9 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             match save_teach_sample(&store, &mut pipeline, capture.class, &capture.samples) {
                 Ok((examples, similarity, separation)) => {
                     shared.finish_teach(capture.class, examples, similarity, separation);
+                    // Push the new take so another machine inherits it without
+                    // waiting for an unrelated event flush.
+                    shared.request_sync_now();
                 }
                 Err(error) => {
                     eprintln!("teach: {error}");
@@ -330,14 +345,18 @@ fn save_teach_sample(
 
     let quality_similarity = (similarity >= 0.0).then_some(similarity);
     let quality_separation = (similarity >= 0.0).then_some(separation);
+    let model_version = pipeline.model_version();
     store
-        .add_enrollment_with_quality(
+        .add_enrollment_full(EnrollmentInsert {
             class,
-            &embedding,
-            false,
-            quality_similarity,
-            quality_separation,
-        )
+            embedding: &embedding,
+            is_negative: false,
+            similarity: quality_similarity,
+            separation: quality_separation,
+            peak_dbfs: peak_dbfs(samples),
+            model_version: Some(&model_version),
+            source_event_uuid: None,
+        })
         .map_err(|e| e.to_string())?;
     pipeline.set_prototypes(prototypes_from_store(store)?);
     let examples = store
@@ -347,6 +366,34 @@ fn save_teach_sample(
         .copied()
         .unwrap_or(0) as usize;
     Ok((examples, similarity, separation))
+}
+
+/// Loudest 50 ms hop in a buffer, dBFS — the same measure events record, so a
+/// take that matches poorly can be checked against how loud it actually was.
+/// `None` for a buffer shorter than one hop.
+fn peak_dbfs(samples: &[f32]) -> Option<f32> {
+    const HOP: usize = sinus_core::types::SAMPLE_RATE as usize / 20;
+
+    samples
+        .chunks_exact(HOP)
+        .map(|hop| {
+            let sum_sq: f64 = hop.iter().map(|&x| (x as f64) * (x as f64)).sum();
+            let rms = (sum_sq / hop.len() as f64).sqrt();
+            20.0 * (rms + 1e-9).log10() as f32
+        })
+        .fold(None, |best: Option<f32>, db| {
+            Some(best.map_or(db, |b| b.max(db)))
+        })
+}
+
+/// Detection sensitivity from settings, neutral (0.5) when unset.
+fn read_sensitivity(store: &Store) -> f32 {
+    store
+        .setting_get("sensitivity")
+        .ok()
+        .flatten()
+        .and_then(|value| value.parse().ok())
+        .unwrap_or(0.5)
 }
 
 /// Local UTC offset in minutes.

@@ -15,9 +15,12 @@ pub fn counts_in_range(
     to: DateTime<Utc>,
 ) -> HashMap<EventType, i64> {
     let mut counts: HashMap<EventType, i64> = HashMap::new();
+    // `events_in_range` already drops reported misdetections. Corrections do
+    // still count — under the class the user corrected them to, matching the
+    // PHR's `COALESCE(corrected_to_event_type, event_type)`.
     if let Ok(events) = store.events_in_range(from, to) {
         for e in events {
-            *counts.entry(e.event_type).or_insert(0) += 1;
+            *counts.entry(e.effective_type()).or_insert(0) += 1;
         }
     }
     counts
@@ -125,11 +128,17 @@ mod tests {
             duration_ms: 500,
             confidence: 0.7,
             burst_count: 1,
+            peak_dbfs: Some(-15.0),
+            mean_dbfs: Some(-28.0),
+            noise_floor_dbfs: Some(-55.0),
             model_version: "test@0".into(),
             source: Source::DesktopMac,
             device_id: "d".into(),
             uploaded_at: None,
             deleted: false,
+            false_positive_at: None,
+            corrected_to: None,
+            corrected_at: None,
             reject_count: 0,
             rejected_at: None,
         }

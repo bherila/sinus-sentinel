@@ -3,7 +3,7 @@
 //! so the UI thread never blocks on a worker (SPEC §9). Cloning a [`SharedStatus`]
 //! shares the same underlying cells.
 
-use std::sync::atomic::{AtomicBool, AtomicU32, AtomicU8, AtomicUsize, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, AtomicU8, AtomicUsize, Ordering};
 use std::sync::Arc;
 
 use sinus_core::types::EventType;
@@ -144,6 +144,9 @@ pub struct SharedStatus {
     teach_similarity: Arc<AtomicU32>,
     teach_separation: Arc<AtomicU32>,
     enrollment_reload: Arc<AtomicBool>,
+    settings_reload: Arc<AtomicBool>,
+    analyzing: Arc<AtomicBool>,
+    last_heard_ms: Arc<AtomicI64>,
 }
 
 impl Default for SharedStatus {
@@ -162,6 +165,9 @@ impl Default for SharedStatus {
             teach_similarity: Arc::new(AtomicU32::new((-1.0f32).to_bits())),
             teach_separation: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             enrollment_reload: Arc::new(AtomicBool::new(false)),
+            settings_reload: Arc::new(AtomicBool::new(false)),
+            analyzing: Arc::new(AtomicBool::new(false)),
+            last_heard_ms: Arc::new(AtomicI64::new(0)),
         }
     }
 }
@@ -290,6 +296,46 @@ impl SharedStatus {
     #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
     pub fn take_enrollment_reload(&self) -> bool {
         self.enrollment_reload.swap(false, Ordering::AcqRel)
+    }
+
+    /// Tell the capture worker its detection settings changed — from the
+    /// slider here, or from a value pulled off the PHR.
+    ///
+    /// Without this, sensitivity is only read when the pipeline is built, so a
+    /// change would not take effect until the app restarted.
+    pub fn request_settings_reload(&self) {
+        self.settings_reload.store(true, Ordering::Release);
+    }
+
+    #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
+    pub fn take_settings_reload(&self) -> bool {
+        self.settings_reload.swap(false, Ordering::AcqRel)
+    }
+
+    /// Published by the capture thread while the energy gate is open — the app
+    /// has heard something and is classifying it.
+    #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
+    pub fn set_analyzing(&self, on: bool) {
+        self.analyzing.store(on, Ordering::Relaxed);
+    }
+
+    pub fn analyzing(&self) -> bool {
+        self.analyzing.load(Ordering::Relaxed)
+    }
+
+    /// Stamp the moment a sound was first picked up (gate closed → open).
+    #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
+    pub fn note_heard(&self, at: chrono::DateTime<chrono::Utc>) {
+        self.last_heard_ms
+            .store(at.timestamp_millis(), Ordering::Relaxed);
+    }
+
+    /// When the app last started analyzing a sound, if ever.
+    pub fn last_heard(&self) -> Option<chrono::DateTime<chrono::Utc>> {
+        let millis = self.last_heard_ms.load(Ordering::Relaxed);
+        (millis > 0)
+            .then(|| chrono::DateTime::from_timestamp_millis(millis))
+            .flatten()
     }
 
     pub fn reset_teach_feedback(&self) {

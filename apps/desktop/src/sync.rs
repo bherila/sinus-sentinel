@@ -148,6 +148,15 @@ fn read_mode(store: &Store) -> Mode {
         .unwrap_or(Mode::AutoBatch)
 }
 
+/// The settings the engine is built from, so a change to either rebuilds it.
+/// Without this, filling in the server URL or patient id for the first time
+/// leaves sync dead until the app is relaunched or the mode toggled.
+fn sync_config_key(store: &Store) -> Option<(String, String)> {
+    let url = store.setting_get("server_url").ok().flatten()?;
+    let patient = store.setting_get("patient_id").ok().flatten()?;
+    Some((url, patient))
+}
+
 fn sync_config(store: &Store) -> Option<SyncConfig> {
     let base_url = store
         .setting_get("server_url")
@@ -217,11 +226,12 @@ fn eval_quiet(store: &Store) -> bool {
 }
 
 fn run_sync(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
-    let store = Store::open(&db_path).map_err(|e| e.to_string())?;
+    let mut store = Store::open(&db_path).map_err(|e| e.to_string())?;
     let policy = FlushPolicy::default();
     let mut backoff = Backoff::default();
     let mut engine: Option<SyncEngine<Box<dyn TokenStore>>> = None;
     let mut engine_mode: Option<Mode> = None;
+    let mut engine_config: Option<(String, String)> = None;
     let mut last_flush = Instant::now();
     // When a failure schedules a retry: no flush attempt is made before this.
     let mut retry_at: Option<Instant> = None;
@@ -230,19 +240,23 @@ fn run_sync(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
         shared.set_quiet(eval_quiet(&store));
 
         let pending_events = store.pending_count().unwrap_or(0) as usize;
-        let has_tombstones = store
-            .pending_tombstones(1)
-            .map(|v| !v.is_empty())
-            .unwrap_or(false);
-        let pending = pending_events + usize::from(has_tombstones);
+        // Everything awaiting the server, not just events: a flag or a teach
+        // take made while offline must be able to schedule its own retry. The
+        // badge still shows only the event count, which is what "pending"
+        // means to a user.
+        let pending = store.pending_work_count().unwrap_or(0) as usize;
         shared.set_pending(pending_events);
 
         let mode = read_mode(&store);
-        // Mode switch: tear down / recreate the engine (offline-strict drops it
-        // entirely, preserving the structural no-network property — SPEC §4.3).
-        if engine_mode != Some(mode) {
+        // Rebuild on a mode switch (offline-strict drops the engine entirely,
+        // preserving the structural no-network property — SPEC §4.3) *and* when
+        // the server URL / patient id changes, so filling those in for the first
+        // time starts syncing without a relaunch.
+        let config_key = sync_config_key(&store);
+        if engine_mode != Some(mode) || engine_config != config_key {
             engine = build_engine(mode, &store);
             engine_mode = Some(mode);
+            engine_config = config_key;
             backoff.reset();
             retry_at = None;
             shared.set_sync(SyncStatus::Idle);
@@ -265,8 +279,18 @@ fn run_sync(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             if ready {
                 if let Some(eng) = &engine {
                     shared.set_sync(SyncStatus::Syncing);
-                    match eng.flush(&store) {
-                        Ok(_) => {
+                    match eng.flush(&mut store) {
+                        Ok(outcome) => {
+                            // Anything pulled down has to reach the capture
+                            // thread, or a machine that just inherited the
+                            // user's settings and training keeps detecting as
+                            // though it had neither.
+                            if outcome.reload_settings {
+                                shared.request_settings_reload();
+                            }
+                            if outcome.reload_enrollments {
+                                shared.request_enrollment_reload();
+                            }
                             backoff.reset();
                             retry_at = None;
                             last_flush = Instant::now();

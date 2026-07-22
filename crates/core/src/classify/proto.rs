@@ -11,11 +11,14 @@ use crate::types::EventType;
 /// to avoid turning one unusual sound (or a bit of speech) into a broad template.
 pub const MIN_POSITIVE_EXAMPLES: usize = 3;
 
-/// A window this cosine-similar to an enrolled negative (a reported false
-/// positive) is vetoed outright — for *every* class, including the native
-/// YAMNet path, not just personalized prototypes. Deliberately tighter than the
-/// personalized accept threshold so one report suppresses near-repeats of the
-/// same sound without swallowing genuinely different events.
+/// A window this cosine-similar to an applicable enrolled negative is vetoed,
+/// along every path including the native YAMNet one, not just personalized
+/// prototypes. Deliberately tighter than the personalized accept threshold so
+/// one report suppresses near-repeats of the same sound without swallowing
+/// genuinely different events.
+///
+/// Which negatives apply depends on how they were enrolled — see
+/// [`Enrollment::negative_scoped`].
 pub const NEGATIVE_VETO_THRESHOLD: f32 = 0.80;
 
 /// L2-normalize a vector (returns zeros if the input is all-zero).
@@ -48,6 +51,20 @@ pub struct Enrollment {
     pub class: EventType,
     pub embedding: Vec<f32>,
     pub is_negative: bool,
+    /// How far a negative reaches.
+    ///
+    /// A plain false-positive report ("that wasn't a cough — it wasn't anything")
+    /// is **unscoped**: it suppresses the sound under every label, because a
+    /// borderline sound that YAMNet wobbles between cough/sneeze/throat-clearing
+    /// would otherwise just re-fire under a sibling label.
+    ///
+    /// A negative enrolled as half of a *correction* is **scoped** to `class`:
+    /// there is a positive for the corrected class carrying the same embedding,
+    /// and an unscoped veto would suppress that too — silencing the sound
+    /// entirely, which is worse than the original mistake.
+    ///
+    /// Ignored when `is_negative` is false.
+    pub negative_scoped: bool,
 }
 
 /// The prototype matcher.
@@ -57,8 +74,9 @@ pub struct PrototypeMatcher {
     /// Normalized positives retained for nearest-example matching. A centroid can
     /// blur a multimodal class, such as a short sniff and a longer inhale.
     positives: Vec<(EventType, Vec<f32>)>,
-    /// Normalized negative embeddings.
-    negatives: Vec<Vec<f32>>,
+    /// Normalized negative embeddings, each paired with the class it suppresses
+    /// — `None` meaning "every class" (see [`Enrollment::negative_scoped`]).
+    negatives: Vec<(Option<EventType>, Vec<f32>)>,
     /// Minimum cosine similarity to accept a match.
     pub sim_threshold: f32,
     /// The best-class similarity must beat the nearest negative by this margin.
@@ -84,7 +102,8 @@ impl PrototypeMatcher {
 
         for e in enrollments {
             if e.is_negative {
-                negatives.push(normalize(&e.embedding));
+                let scope = e.negative_scoped.then_some(e.class);
+                negatives.push((scope, normalize(&e.embedding)));
                 continue;
             }
             let norm = normalize(&e.embedding);
@@ -147,25 +166,28 @@ impl PrototypeMatcher {
             .collect()
     }
 
-    /// Cosine similarity to the nearest enrolled negative (−1 if none).
-    pub fn nearest_negative(&self, embedding: &[f32]) -> f32 {
+    /// Cosine similarity to the nearest negative that applies to `class` — an
+    /// unscoped one (a plain false-positive report) or one scoped to this class
+    /// (half of a correction). −1 if none applies.
+    pub fn nearest_negative(&self, embedding: &[f32], class: EventType) -> f32 {
         self.negatives
             .iter()
-            .map(|n| cosine(n, embedding))
+            .filter(|(scope, _)| scope.is_none_or(|scoped| scoped == class))
+            .map(|(_, n)| cosine(n, embedding))
             .fold(-1.0f32, f32::max)
     }
 
-    /// Whether a window is close enough to a reported false positive that no
-    /// class — native or personalized — may fire on it.
-    pub fn vetoes(&self, embedding: &[f32]) -> bool {
-        self.nearest_negative(embedding) >= NEGATIVE_VETO_THRESHOLD
+    /// Whether a window is close enough to a false positive reported *for this
+    /// class* that it may not fire — along any path, native or personalized.
+    pub fn vetoes(&self, embedding: &[f32], class: EventType) -> bool {
+        self.nearest_negative(embedding, class) >= NEGATIVE_VETO_THRESHOLD
     }
 
     /// Best matching class for an embedding, applying both gates: the similarity
-    /// must clear `sim_threshold` and beat both the nearest negative and runner-up
-    /// positive class by `negative_margin`. Returns `None` if nothing qualifies.
+    /// must clear `sim_threshold` and beat both the nearest same-class negative
+    /// and the runner-up positive class by `negative_margin`. Returns `None` if
+    /// nothing qualifies.
     pub fn best_match(&self, embedding: &[f32]) -> Option<(EventType, f32)> {
-        let neg = self.nearest_negative(embedding);
         let mut similarities = self.similarities(embedding);
         similarities.retain(|(class, _)| {
             self.prototypes.iter().any(|prototype| {
@@ -175,6 +197,10 @@ impl PrototypeMatcher {
         similarities.sort_by(|a, b| b.1.total_cmp(&a.1));
         let &(class, best) = similarities.first()?;
         let runner_up = similarities.get(1).map(|(_, sim)| *sim).unwrap_or(-1.0);
+        // Compared against negatives for *this* class only, so a correction's
+        // negative (recorded against the wrong class) cannot block the positive
+        // it was enrolled alongside.
+        let neg = self.nearest_negative(embedding, class);
         (best >= self.sim_threshold
             && best >= neg + self.negative_margin
             && best >= runner_up + self.negative_margin)
@@ -202,38 +228,45 @@ mod tests {
                 class: EventType::Hawk,
                 embedding: emb([1.0, 0.1, 0.0, 0.0]),
                 is_negative: false,
+                negative_scoped: false,
             },
             Enrollment {
                 class: EventType::Hawk,
                 embedding: emb([0.9, 0.0, 0.1, 0.0]),
                 is_negative: false,
+                negative_scoped: false,
             },
             Enrollment {
                 class: EventType::Hawk,
                 embedding: emb([1.0, 0.0, 0.1, 0.0]),
                 is_negative: false,
+                negative_scoped: false,
             },
             // Nose-blow cluster ≈ direction [0,0,1,0].
             Enrollment {
                 class: EventType::NoseBlow,
                 embedding: emb([0.0, 0.1, 1.0, 0.0]),
                 is_negative: false,
+                negative_scoped: false,
             },
             Enrollment {
                 class: EventType::NoseBlow,
                 embedding: emb([0.1, 0.0, 0.9, 0.0]),
                 is_negative: false,
+                negative_scoped: false,
             },
             Enrollment {
                 class: EventType::NoseBlow,
                 embedding: emb([0.0, 0.0, 1.0, 0.1]),
                 is_negative: false,
+                negative_scoped: false,
             },
             // Negative (keyboard-like) ≈ direction [0,0,0,1].
             Enrollment {
                 class: EventType::Hawk,
                 embedding: emb([0.0, 0.0, 0.0, 1.0]),
                 is_negative: true,
+                negative_scoped: false,
             },
         ];
         PrototypeMatcher::from_enrollments(&enrollments, 0.6, 0.1)
@@ -285,13 +318,91 @@ mod tests {
     #[test]
     fn veto_fires_only_near_a_negative() {
         let m = matcher();
-        // Nearly identical to the enrolled negative [0,0,0,1] → vetoed.
-        assert!(m.vetoes(&emb([0.0, 0.0, 0.05, 1.0])));
+        // Nearly identical to the negative enrolled against Hawk → vetoed.
+        assert!(m.vetoes(&emb([0.0, 0.0, 0.05, 1.0]), EventType::Hawk));
         // Similar-ish but below the veto threshold → not vetoed.
-        assert!(!m.vetoes(&emb([1.0, 0.0, 0.0, 0.6])));
+        assert!(!m.vetoes(&emb([1.0, 0.0, 0.0, 0.6]), EventType::Hawk));
         // No negatives enrolled → never vetoes.
         let no_neg = PrototypeMatcher::from_enrollments(&[], 0.6, 0.1);
-        assert!(!no_neg.vetoes(&emb([0.0, 0.0, 0.0, 1.0])));
+        assert!(!no_neg.vetoes(&emb([0.0, 0.0, 0.0, 1.0]), EventType::Hawk));
+    }
+
+    /// A plain false-positive report is unscoped: it suppresses the sound under
+    /// *every* label. Scoping it would just let a borderline sound re-fire as a
+    /// sibling class, which is the regime YAMNet actually wobbles in.
+    #[test]
+    fn a_plain_false_positive_report_suppresses_every_class() {
+        let m = matcher();
+        let probe = emb([0.0, 0.0, 0.05, 1.0]);
+
+        assert!(m.vetoes(&probe, EventType::Hawk));
+        assert!(
+            m.vetoes(&probe, EventType::NoseBlow),
+            "an unscoped report must not be dodged by re-firing under another label"
+        );
+        assert!(m.vetoes(&probe, EventType::Cough));
+    }
+
+    /// The negative half of a *correction* is scoped, because a positive for the
+    /// corrected class carries the same embedding. An unscoped veto there would
+    /// silence the sound entirely.
+    #[test]
+    fn a_scoped_negative_only_suppresses_its_own_class() {
+        let sound = emb([0.0, 0.0, 0.05, 1.0]);
+        let m = PrototypeMatcher::from_enrollments(
+            &[Enrollment {
+                class: EventType::Hawk,
+                embedding: sound.clone(),
+                is_negative: true,
+                negative_scoped: true,
+            }],
+            0.6,
+            0.1,
+        );
+
+        assert!(m.vetoes(&sound, EventType::Hawk));
+        assert!(
+            !m.vetoes(&sound, EventType::NoseBlow),
+            "the corrected class must remain free to fire"
+        );
+    }
+
+    /// End to end: recharacterizing a sound suppresses the wrong label without
+    /// suppressing the corrected one.
+    #[test]
+    fn a_correction_leaves_the_corrected_class_matchable() {
+        let sound = emb([0.3, 0.9, 0.1, 0.0]);
+
+        let mut enrollments = vec![
+            // The user said "that was not a cough" — scoped, because they also
+            // said what it *was*.
+            Enrollment {
+                class: EventType::Cough,
+                embedding: sound.clone(),
+                is_negative: true,
+                negative_scoped: true,
+            },
+        ];
+        // ...it was a nose blow. Three takes so the class becomes active.
+        enrollments.extend((0..MIN_POSITIVE_EXAMPLES).map(|_| Enrollment {
+            class: EventType::NoseBlow,
+            embedding: sound.clone(),
+            is_negative: false,
+            negative_scoped: false,
+        }));
+
+        let m = PrototypeMatcher::from_enrollments(&enrollments, 0.65, 0.05);
+
+        assert!(m.vetoes(&sound, EventType::Cough), "wrong label suppressed");
+        assert!(
+            !m.vetoes(&sound, EventType::NoseBlow),
+            "corrected label must survive"
+        );
+        assert_eq!(
+            m.best_match(&sound).map(|(class, _)| class),
+            Some(EventType::NoseBlow),
+            "the corrected class must still be matchable"
+        );
     }
 
     #[test]
@@ -306,6 +417,7 @@ mod tests {
                 class,
                 embedding: emb(pattern),
                 is_negative: false,
+                negative_scoped: false,
             })
         })
         .collect::<Vec<_>>();
@@ -320,31 +432,37 @@ mod tests {
                 class: EventType::Sniffle,
                 embedding: emb([1.0, 0.0, 0.0, 0.0]),
                 is_negative: false,
+                negative_scoped: false,
             },
             Enrollment {
                 class: EventType::Sniffle,
                 embedding: emb([0.0, 1.0, 0.0, 0.0]),
                 is_negative: false,
+                negative_scoped: false,
             },
             Enrollment {
                 class: EventType::Sniffle,
                 embedding: emb([0.05, 0.95, 0.0, 0.0]),
                 is_negative: false,
+                negative_scoped: false,
             },
             Enrollment {
                 class: EventType::Hawk,
                 embedding: emb([0.0, 0.0, 1.0, 0.0]),
                 is_negative: false,
+                negative_scoped: false,
             },
             Enrollment {
                 class: EventType::Hawk,
                 embedding: emb([0.0, 0.0, 1.0, 0.05]),
                 is_negative: false,
+                negative_scoped: false,
             },
             Enrollment {
                 class: EventType::Hawk,
                 embedding: emb([0.0, 0.05, 1.0, 0.0]),
                 is_negative: false,
+                negative_scoped: false,
             },
         ];
         let matcher = PrototypeMatcher::from_enrollments(&enrollments, 0.8, 0.1);
@@ -362,11 +480,13 @@ mod tests {
                     class: EventType::Hawk,
                     embedding: emb([1.0, 0.0, 0.0, 0.0]),
                     is_negative: false,
+                    negative_scoped: false,
                 },
                 Enrollment {
                     class: EventType::Hawk,
                     embedding: emb([0.9, 0.1, 0.0, 0.0]),
                     is_negative: false,
+                    negative_scoped: false,
                 },
             ],
             0.6,

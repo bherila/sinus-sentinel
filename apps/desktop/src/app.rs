@@ -8,7 +8,7 @@
 use chrono::Utc;
 use eframe::egui;
 use egui_plot::{Bar, BarChart, Legend, Plot};
-use sinus_core::store::{Store, StoredEnrollment};
+use sinus_core::store::{EnrollmentInsert, Store, StoredEnrollment};
 use sinus_core::sync::Mode;
 use sinus_core::types::{Event, EventType};
 
@@ -76,9 +76,25 @@ impl TrayState {
     }
 }
 
+/// A pending action from the recent-events list, applied after the row loop so
+/// the store is not mutated while it is being iterated.
+enum HistoryAction {
+    Report(Event),
+    Recharacterize(Event, EventType),
+    Restore(Event),
+}
+
+/// Human-readable class name.
+fn label(class: EventType) -> String {
+    class.as_str().replace('_', " ")
+}
+
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum EnrollmentAction {
-    One { id: i64, class: EventType },
+    One {
+        id: i64,
+        class: EventType,
+    },
     Class(EventType),
     /// Forget learned false-positive suppressions, keeping taught takes.
     Negatives,
@@ -89,6 +105,7 @@ enum EnrollmentAction {
 #[derive(Debug, Clone, Default)]
 struct SettingsForm {
     server_url: String,
+    patient_id: String,
     token: String,
     token_message: String,
     sensitivity: f32,
@@ -132,6 +149,11 @@ impl SinusApp {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let patient_id = store
+            .setting_get("patient_id")
+            .ok()
+            .flatten()
+            .unwrap_or_default();
         let mode = store
             .setting_get("mode")
             .ok()
@@ -151,6 +173,7 @@ impl SinusApp {
             tab: Tab::History,
             form: SettingsForm {
                 server_url,
+                patient_id,
                 token: String::new(),
                 token_message: String::new(),
                 sensitivity,
@@ -199,6 +222,9 @@ impl SinusApp {
                 );
                 self.shared.reset_teach_feedback();
                 self.shared.request_enrollment_reload();
+                // The removal has to reach the PHR too, or another machine
+                // re-teaches this device on its next pull.
+                self.shared.request_sync_now();
             }
             Err(error) => {
                 self.form.enrollment_message = format!("Could not update training: {error}");
@@ -206,41 +232,135 @@ impl SinusApp {
         }
     }
 
-    /// Handle a false-positive report: enroll the event's stored embedding as a
-    /// negative example (so the detector suppresses similar sounds), then
-    /// tombstone the event — sync sends the PHR DELETE once a network mode is
-    /// active. Events without a stored embedding still get removed.
+    /// Report a misdetection: enroll the event's stored embedding as a negative
+    /// for the class that fired (so the detector stops calling that sound *that*),
+    /// then flag the event.
+    ///
+    /// The event is flagged, not deleted: a health record should keep the fact
+    /// that the classifier got something wrong. It stops counting everywhere and
+    /// the flag syncs to the PHR, where it is likewise retained rather than
+    /// erased. The embedding is deliberately kept — the user may follow up by
+    /// saying what the sound actually was.
     fn report_false_positive(&mut self, event: &Event) {
-        let trained = match self.store.get_event_embedding(&event.uuid) {
-            Ok(Some(embedding)) => self
-                .store
-                .add_enrollment(event.event_type, &embedding, true)
-                .is_ok(),
-            _ => false,
-        };
+        let trained = self.enroll_negative(event, event.event_type, false);
 
-        if let Err(error) = self.store.mark_deleted(&event.uuid) {
-            self.history_message = format!("Could not remove the event: {error}");
+        if let Err(error) = self.store.mark_false_positive(&event.uuid) {
+            self.history_message = format!("Could not flag the event: {error}");
             return;
         }
-        let _ = self.store.delete_event_embedding(&event.uuid);
         if trained {
             self.shared.request_enrollment_reload();
         }
         self.shared.request_sync_now();
 
-        let class = event.event_type.as_str().replace('_', " ");
+        let class = label(event.event_type);
         self.history_message = if trained {
             format!(
-                "Reported the {class} event: removed here and from the PHR on next sync, \
-                 and the detector will now ignore similar sounds."
+                "Reported the {class}: it no longer counts here or in the PHR, and the \
+                 detector will stop labelling that sound {class}."
             )
         } else {
             format!(
-                "Removed the {class} event (here and from the PHR on next sync). \
-                 No embedding was stored for it, so the detector was not adjusted."
+                "Reported the {class}: it no longer counts here or in the PHR. No embedding \
+                 was stored for it, so the detector was not adjusted."
             )
         };
+    }
+
+    /// Record what a misdetected sound actually was.
+    ///
+    /// Enrolls the embedding twice: as a negative against the class that fired,
+    /// and as a positive for the corrected one. Negatives are class-scoped, so
+    /// the wrong label is suppressed while the corrected label stays free to
+    /// fire — a class-blind negative would silence the sound entirely, which is
+    /// worse than the original mistake.
+    fn recharacterize(&mut self, event: &Event, corrected: EventType) {
+        // Correcting back to what the classifier originally said is an undo, not
+        // a correction. Treating it as one would enroll a negative *and* a
+        // positive for that class from the same embedding, and the veto would
+        // then suppress the very label the user just confirmed.
+        if corrected == event.event_type {
+            self.clear_flag(event);
+            return;
+        }
+
+        let embedding = self.store.get_event_embedding(&event.uuid).ok().flatten();
+
+        let mut trained = false;
+        if let Some(embedding) = &embedding {
+            trained = self.enroll_negative(event, event.event_type, true);
+            let positive = self.store.add_enrollment_full(EnrollmentInsert {
+                class: corrected,
+                embedding,
+                is_negative: false,
+                similarity: None,
+                separation: None,
+                peak_dbfs: event.peak_dbfs,
+                model_version: Some(&event.model_version),
+                source_event_uuid: Some(&event.uuid),
+                negative_scoped: false,
+            });
+            trained |= positive.is_ok();
+        }
+
+        if let Err(error) = self.store.recharacterize(&event.uuid, corrected) {
+            self.history_message = format!("Could not update the event: {error}");
+            return;
+        }
+        if trained {
+            self.shared.request_enrollment_reload();
+        }
+        self.shared.request_sync_now();
+
+        let was = label(event.event_type);
+        let now = label(corrected);
+        // Be honest about what one correction can do: the negative takes effect
+        // immediately, but a personalized class needs three takes before it
+        // matches on its own.
+        self.history_message = format!(
+            "Recorded as {now} instead of {was} — it now counts as {now} here and in the \
+             PHR, and the detector will stop calling that sound {was}. Teach {now} a few \
+             more times for it to be recognised on its own."
+        );
+    }
+
+    /// Undo a false-positive report or a correction.
+    fn clear_flag(&mut self, event: &Event) {
+        if let Err(error) = self.store.clear_flag(&event.uuid) {
+            self.history_message = format!("Could not restore the event: {error}");
+            return;
+        }
+        self.shared.request_sync_now();
+        self.history_message =
+            "Restored the event here and in the PHR. Any training it produced is kept — \
+             use Settings › Teach mode to remove that too."
+                .to_string();
+    }
+
+    /// Enroll this event's sound as "not `class`", if its embedding was retained.
+    ///
+    /// `scoped` decides how far the veto reaches: a plain false-positive report
+    /// is unscoped (the sound is suppressed under every label, so a borderline
+    /// sound cannot simply re-fire as a sibling class), while the negative half
+    /// of a correction is scoped, because a positive for the corrected class
+    /// carries the same embedding.
+    fn enroll_negative(&mut self, event: &Event, class: EventType, scoped: bool) -> bool {
+        let Ok(Some(embedding)) = self.store.get_event_embedding(&event.uuid) else {
+            return false;
+        };
+        self.store
+            .add_enrollment_full(EnrollmentInsert {
+                class,
+                embedding: &embedding,
+                is_negative: true,
+                similarity: None,
+                separation: None,
+                peak_dbfs: event.peak_dbfs,
+                model_version: Some(&event.model_version),
+                source_event_uuid: Some(&event.uuid),
+                negative_scoped: scoped,
+            })
+            .is_ok()
     }
 
     fn handle_menu_events(&mut self, ctx: &egui::Context) {
@@ -381,15 +501,16 @@ impl SinusApp {
                 .iter()
                 .map(|day| day.date.format("%b %-d").to_string())
                 .collect();
-            let mut chart = BarChart::new(bars).name(&label).color(color).element_formatter(
-                Box::new(move |bar, _| {
+            let mut chart = BarChart::new(bars)
+                .name(&label)
+                .color(color)
+                .element_formatter(Box::new(move |bar, _| {
                     let date = dates
                         .get(bar.argument.round() as usize)
                         .cloned()
                         .unwrap_or_default();
                     format!("{label}: {} — {date}", bar.value.round() as i64)
-                }),
-            );
+                }));
             let stacked_below: Vec<&BarChart> = charts.iter().collect();
             chart = chart.stack_on(&stacked_below);
             charts.push(chart);
@@ -438,36 +559,114 @@ impl SinusApp {
 
         ui.separator();
         ui.heading("Recent events");
+
+        // The gate can be open for a second or two before a classification
+        // lands. Say so, rather than looking idle while the app is working.
+        if self.shared.analyzing() {
+            let heard = self
+                .shared
+                .last_heard()
+                .map(|t| {
+                    t.with_timezone(&chrono::Local)
+                        .format("%H:%M:%S")
+                        .to_string()
+                })
+                .unwrap_or_else(|| "now".to_string());
+            ui.colored_label(
+                egui::Color32::LIGHT_BLUE,
+                format!("🔊 heard something at {heard} — classifying…"),
+            );
+        }
+
         let start = now - chrono::Duration::days(7);
-        let events = self.store.events_in_range(start, now).unwrap_or_default();
-        let mut to_report: Option<Event> = None;
+        // Flagged events stay in this list (struck through, with an undo) even
+        // though they are excluded from every count above.
+        let events = self.store.recent_events(start, now).unwrap_or_default();
+        let mut action: Option<HistoryAction> = None;
         egui::ScrollArea::vertical()
-            .max_height(180.0)
+            .max_height(220.0)
             .show(ui, |ui| {
                 for e in events.iter().take(200) {
+                    let flagged = e.false_positive_at.is_some();
+                    let corrected = e.corrected_to.is_some();
                     ui.horizontal(|ui| {
-                        if ui
-                            .button("✕")
-                            .on_hover_text(
-                                "Report false positive: removes this event (and from the \
-                                 PHR) and teaches the detector to ignore similar sounds",
-                            )
-                            .clicked()
-                        {
-                            to_report = Some(e.clone());
+                        // Both a report and a correction are undoable — a
+                        // correction is just as much a user judgement that can
+                        // be wrong.
+                        if flagged || corrected {
+                            let hint = if flagged {
+                                "Undo: count this event again, here and in the PHR"
+                            } else {
+                                "Undo the correction, here and in the PHR"
+                            };
+                            if ui.button("↺").on_hover_text(hint).clicked() {
+                                action = Some(HistoryAction::Restore(e.clone()));
+                            }
                         }
-                        ui.label(format!(
-                            "{}  {}  conf {:.2}  x{}",
+                        if !flagged
+                            && ui
+                                .button("✕")
+                                .on_hover_text(
+                                    "Report false positive: stops this counting (here and in \
+                                 the PHR) and teaches the detector not to label that sound \
+                                 this way",
+                                )
+                                .clicked()
+                        {
+                            action = Some(HistoryAction::Report(e.clone()));
+                        }
+
+                        let shown = e.effective_type();
+                        let mut text = format!(
+                            "{}  {}",
                             e.occurred_at.format("%m-%d %H:%M:%S"),
-                            e.event_type.as_str(),
-                            e.confidence,
-                            e.burst_count
-                        ));
+                            label(shown),
+                        );
+                        if let Some(original) = e.corrected_to.map(|_| e.event_type) {
+                            text.push_str(&format!(" (was {})", label(original)));
+                        }
+                        text.push_str(&format!("  conf {:.2}  x{}", e.confidence, e.burst_count));
+                        if let Some(peak) = e.peak_dbfs {
+                            text.push_str(&format!("  {peak:.0} dBFS"));
+                        }
+
+                        let mut rich = egui::RichText::new(text);
+                        if flagged {
+                            rich = rich.strikethrough().weak();
+                        }
+                        ui.label(rich);
+
+                        // Recharacterize: say what the sound actually was.
+                        if !flagged {
+                            egui::ComboBox::from_id_salt(("recharacterize", &e.uuid))
+                                .selected_text("…")
+                                .width(30.0)
+                                .show_ui(ui, |ui| {
+                                    ui.label("Actually this was:");
+                                    for class in EventType::ALL {
+                                        if class == shown {
+                                            continue;
+                                        }
+                                        if ui.selectable_label(false, label(class)).clicked() {
+                                            action = Some(HistoryAction::Recharacterize(
+                                                e.clone(),
+                                                class,
+                                            ));
+                                        }
+                                    }
+                                })
+                                .response
+                                .on_hover_text("Recharacterize: record what this sound really was");
+                        }
                     });
                 }
             });
-        if let Some(event) = to_report {
-            self.report_false_positive(&event);
+
+        match action {
+            Some(HistoryAction::Report(event)) => self.report_false_positive(&event),
+            Some(HistoryAction::Recharacterize(event, class)) => self.recharacterize(&event, class),
+            Some(HistoryAction::Restore(event)) => self.clear_flag(&event),
+            None => {}
         }
         if !self.history_message.is_empty() {
             ui.label(&self.history_message);
@@ -483,6 +682,24 @@ impl SinusApp {
                 .lost_focus()
             {
                 let _ = self.store.setting_set("server_url", &self.form.server_url);
+            }
+        });
+        ui.horizontal(|ui| {
+            ui.label("Patient id");
+            if ui
+                .add(egui::TextEdit::singleline(&mut self.form.patient_id).desired_width(80.0))
+                .on_hover_text("The PHR patient these events belong to")
+                .lost_focus()
+            {
+                let trimmed = self.form.patient_id.trim().to_string();
+                if trimmed.is_empty() || trimmed.parse::<i64>().is_ok_and(|id| id > 0) {
+                    self.form.patient_id = trimmed;
+                    let _ = self.store.setting_set("patient_id", &self.form.patient_id);
+                    self.form.token_message.clear();
+                } else {
+                    self.form.token_message =
+                        "Patient id must be a number — nothing will sync until it is.".to_string();
+                }
             }
         });
         ui.horizontal(|ui| {
@@ -517,14 +734,26 @@ impl SinusApp {
 
         ui.separator();
         ui.heading("Detection");
-        if ui
+        let slider = ui
             .add(egui::Slider::new(&mut self.form.sensitivity, 0.0..=1.0).text("sensitivity"))
-            .changed()
-        {
+            .on_hover_text("Shared with your other machines through the PHR");
+        if slider.changed() {
             let _ = self
                 .store
                 .setting_set("sensitivity", &self.form.sensitivity.to_string());
+            // Apply it to the running detector: without this the slider would
+            // only take effect on the next launch.
+            self.shared.request_settings_reload();
         }
+        if slider.drag_stopped() || slider.lost_focus() {
+            // Only once the drag settles — syncing on every tick would push a
+            // document per frame.
+            self.shared.request_sync_now();
+        }
+        ui.label(
+            "Sensitivity and quiet hours sync with the PHR, so they follow you between \
+             machines. Server URL, patient id and sync mode stay on this device.",
+        );
 
         ui.separator();
         ui.heading("Mode");
@@ -542,7 +771,7 @@ impl SinusApp {
 
         ui.separator();
         ui.heading("Teach mode");
-        ui.label("Teach your own sounds locally. Raw audio is discarded; only an on-device embedding is saved.");
+        ui.label("Teach your own sounds. Raw audio is discarded; only an embedding is saved — and synced to the PHR, if connected, so other machines inherit your training.");
         ui.label("Record one clear sound after the short get-ready countdown. Add 3–5 varied takes per class.");
 
         let feedback = self.shared.teach_feedback();
@@ -725,7 +954,12 @@ impl SinusApp {
         );
         ui.label("macOS: Sinus Sentinel stays in the menu bar without a Dock icon. Closing this window hides it; use the menu-bar icon to reopen or quit.");
         ui.label(format!("device id: {}", self.device_id));
-        ui.label("Privacy: only event metadata is stored/sent — never audio.");
+        ui.label(
+            "Privacy: never audio. Event metadata is stored and synced; Teach-mode \
+             embeddings sync too when a PHR is connected, so your training follows you \
+             between machines. Embeddings are opaque vectors — audio cannot be \
+             reconstructed from them.",
+        );
     }
 }
 

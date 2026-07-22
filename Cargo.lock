@@ -4197,6 +4197,7 @@ dependencies = [
 name = "sinus-core"
 version = "0.2.0-alpha"
 dependencies = [
+ "base64",
  "chrono",
  "cpal",
  "hound",

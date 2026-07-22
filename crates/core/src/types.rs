@@ -125,6 +125,17 @@ pub struct Event {
     pub duration_ms: i64,
     pub confidence: f32,
     pub burst_count: i64,
+    /// Loudest 50 ms hop in the event, dBFS. `None` for events recorded before
+    /// loudness was captured.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub peak_dbfs: Option<f32>,
+    /// Power-domain mean level across the event, dBFS.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub mean_dbfs: Option<f32>,
+    /// Adaptive noise floor at onset, dBFS — `peak_dbfs - noise_floor_dbfs` is
+    /// the sound's loudness relative to the room.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub noise_floor_dbfs: Option<f32>,
     pub model_version: String,
     pub source: Source,
     /// Stable per-install UUID.
@@ -135,6 +146,17 @@ pub struct Event {
     /// User removed a local false positive.
     #[serde(default)]
     pub deleted: bool,
+    /// When the user reported this as a misdetection. The row is kept — a health
+    /// record should retain the fact that the classifier got it wrong — but it
+    /// is excluded from every count and chart.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub false_positive_at: Option<chrono::DateTime<chrono::Utc>>,
+    /// What the sound actually was, when the user recharacterized it. Unlike a
+    /// false positive this event still counts; it just counts as this class.
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrected_to: Option<EventType>,
+    #[serde(default, skip_serializing_if = "Option::is_none")]
+    pub corrected_at: Option<chrono::DateTime<chrono::Utc>>,
     /// Number of times the server has `rejected` this event on upload. After a
     /// small cap it stops being re-sent and is surfaced in history instead
     /// (SPEC §4.3 — a rejected event is a permanent no-op, not a retry loop).
@@ -143,6 +165,22 @@ pub struct Event {
     /// When the most recent rejection was recorded (`None` = never rejected).
     #[serde(default, skip_serializing_if = "Option::is_none")]
     pub rejected_at: Option<chrono::DateTime<chrono::Utc>>,
+}
+
+impl Event {
+    /// The class this event counts as: the correction when the user supplied
+    /// one, otherwise what the classifier decided. Mirrors the PHR's
+    /// `COALESCE(corrected_to_event_type, event_type)`.
+    pub fn effective_type(&self) -> EventType {
+        self.corrected_to.unwrap_or(self.event_type)
+    }
+
+    /// Whether this event should be counted. A reported misdetection is
+    /// retained but never contributes to counts, charts, or the congestion
+    /// score.
+    pub fn counts(&self) -> bool {
+        self.false_positive_at.is_none() && !self.deleted
+    }
 }
 
 #[cfg(test)]
