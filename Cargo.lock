@@ -4186,7 +4186,7 @@ checksum = "e3a9fe34e3e7a50316060351f37187a3f546bce95496156754b601a5fa71b76e"
 
 [[package]]
 name = "sinus-cli"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "chrono",
  "serde_json",
@@ -4195,7 +4195,7 @@ dependencies = [
 
 [[package]]
 name = "sinus-core"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "base64",
  "chrono",
@@ -4218,7 +4218,7 @@ dependencies = [
 
 [[package]]
 name = "sinus-desktop"
-version = "0.2.0-alpha"
+version = "0.3.0-alpha"
 dependencies = [
  "chrono",
  "eframe",
