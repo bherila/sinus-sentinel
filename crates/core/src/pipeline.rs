@@ -26,7 +26,7 @@ use crate::classify::proto::PrototypeMatcher;
 use crate::error::Result;
 use crate::gate::{Gate, GateEdge};
 use crate::mel::{MelFrontend, MelPatch, HOP_LEN, N_MEL, PATCH_FRAMES, PATCH_HOP_FRAMES};
-use crate::session::{DetectedEvent, SessionConfig, Sessionizer, WindowObservation};
+use crate::session::{DetectedEvent, SessionConfig, Sessionizer, WindowLevels, WindowObservation};
 use crate::types::{Event, EventType, Source};
 
 /// Pipeline tuning — the per-stage configs (SPEC §4.1).
@@ -89,6 +89,11 @@ struct StreamState {
     /// Rolling per-hop gate state, `hops_open[0]` at absolute index `hops_base`.
     hops_open: VecDeque<bool>,
     hops_peak: VecDeque<bool>,
+    /// Per-hop RMS level and adaptive noise floor (dBFS), same indexing as
+    /// `hops_open`. The gate already computes both; retaining them is what lets
+    /// an event record how loud it actually was.
+    hops_rms: VecDeque<f32>,
+    hops_floor: VecDeque<f32>,
     hops_base: usize,
     /// Absolute hop indices of gate opening edges (rolling; pruned with hops).
     open_edges: VecDeque<usize>,
@@ -115,6 +120,8 @@ impl StreamState {
             next_hop: 0,
             hops_open: VecDeque::new(),
             hops_peak: VecDeque::new(),
+            hops_rms: VecDeque::new(),
+            hops_floor: VecDeque::new(),
             hops_base: 0,
             open_edges: VecDeque::new(),
             mel_buf: Vec::new(),
@@ -138,6 +145,8 @@ impl StreamState {
                 .process_hop(&self.gate_buf[consumed..consumed + hop]);
             self.hops_open.push_back(report.open);
             self.hops_peak.push_back(report.energy_peak);
+            self.hops_rms.push_back(report.rms_db);
+            self.hops_floor.push_back(report.floor_db);
             if report.edge == Some(GateEdge::Opened) {
                 self.open_edges.push_back(self.next_hop);
             }
@@ -195,12 +204,68 @@ impl StreamState {
         (active, peak)
     }
 
+    /// Loudness of one patch, for the event record.
+    ///
+    /// Patches overlap — a ~19-hop span advancing on a 10-hop stride — so the
+    /// two statistics use deliberately different windows:
+    ///
+    /// - `peak_dbfs` covers the whole span `[hop_start, hop_end)`. `max` is
+    ///   idempotent, so counting a hop twice is harmless.
+    /// - the mean covers only `[hop_start, hop_start + stride)`. Consecutive
+    ///   patches tile that range exactly, with no overlap and no gap, so a
+    ///   session summing across its windows averages each hop precisely once.
+    ///   Averaging the full spans instead would double-count every interior hop.
+    ///
+    /// The mean is accumulated as linear power (`10^(dB/10)`); averaging dB
+    /// values directly is meaningless. Returns `None` when the span retains no
+    /// hops.
+    fn patch_levels(
+        &self,
+        hop_start: usize,
+        hop_end: usize,
+        stride: usize,
+    ) -> Option<WindowLevels> {
+        let mut peak_dbfs = f32::NEG_INFINITY;
+        let mut power_sum = 0.0f64;
+        let mut mean_hops = 0u32;
+        let mut floor_dbfs = None;
+        let mean_end = (hop_start + stride).min(hop_end);
+
+        for k in hop_start..hop_end {
+            let rel = k - self.hops_base;
+            let Some(&rms_db) = self.hops_rms.get(rel) else {
+                continue;
+            };
+            if floor_dbfs.is_none() {
+                floor_dbfs = self.hops_floor.get(rel).copied();
+            }
+            peak_dbfs = peak_dbfs.max(rms_db);
+            if k < mean_end {
+                power_sum += 10f64.powf(rms_db as f64 / 10.0);
+                mean_hops += 1;
+            }
+        }
+
+        if mean_hops == 0 {
+            return None;
+        }
+
+        Some(WindowLevels {
+            peak_dbfs,
+            power_sum,
+            mean_hops,
+            floor_dbfs: floor_dbfs.unwrap_or(peak_dbfs),
+        })
+    }
+
     /// Drop rolling state that no later patch can reference (bounded memory for a
     /// long-running stream).
     fn prune(&mut self, hop_keep_from: usize, frame_keep_from: usize) {
         while self.hops_base < hop_keep_from && !self.hops_open.is_empty() {
             self.hops_open.pop_front();
             self.hops_peak.pop_front();
+            self.hops_rms.pop_front();
+            self.hops_floor.pop_front();
             self.hops_base += 1;
         }
         while let Some(&e) = self.open_edges.front() {
@@ -262,6 +327,15 @@ impl<E: Embedder> Pipeline<E> {
     /// restarting the microphone stream or resetting gate/session state.
     pub fn set_prototypes(&mut self, proto: Option<PrototypeMatcher>) {
         self.proto = proto;
+    }
+
+    /// Retune detection sensitivity in place.
+    ///
+    /// Without this the setting is only read when the pipeline is constructed,
+    /// so moving the slider — or pulling a new value from the PHR — would not
+    /// take effect until the app restarted.
+    pub fn set_sensitivity(&mut self, sensitivity: f32) {
+        self.decision.config.sensitivity = sensitivity.clamp(0.0, 1.0);
     }
 
     /// Process a buffer of 16 kHz mono samples (batch): advance the engine over the
@@ -339,6 +413,7 @@ impl<E: Embedder> Pipeline<E> {
             let time_ms =
                 (p * PATCH_HOP_FRAMES * HOP_LEN * 1000 / crate::types::SAMPLE_RATE as usize) as i64;
             let (is_active, energy_peak) = st.patch_activity(hop_start, hop_end, preroll);
+            let levels = st.patch_levels(hop_start, hop_end, hops_per_patch_hop);
 
             if !is_active {
                 out.windows.push(WindowRecord {
@@ -388,14 +463,17 @@ impl<E: Embedder> Pipeline<E> {
                         self.decision.decide(&personalized_scores)
                     })
                     .or(native_hit);
-                // Reported false positives veto every path, native included — a
-                // negative enrolled from a bad detection must suppress the same
-                // sound even when YAMNet (not a prototype) produced the label.
-                let hit = hit.filter(|_| {
+                // A reported false positive vetoes every path, native included —
+                // a negative enrolled from a bad detection must suppress the
+                // same sound even when YAMNet (not a prototype) produced the
+                // label. The veto is scoped to the class it was reported
+                // against, so recharacterizing a sound suppresses only the wrong
+                // label and leaves the corrected one free to fire.
+                let hit = hit.filter(|candidate| {
                     !self
                         .proto
                         .as_ref()
-                        .is_some_and(|m| m.vetoes(&features.embedding))
+                        .is_some_and(|m| m.vetoes(&features.embedding, candidate.event_type))
                 });
 
                 let mut sorted: Vec<(EventType, f32)> =
@@ -410,6 +488,7 @@ impl<E: Embedder> Pipeline<E> {
                         confidence: h.confidence,
                         timestamp_ms: time_ms,
                         energy_peak,
+                        levels,
                         embedding: features.embedding.clone(),
                     }) {
                         out.events.push(ev);
@@ -442,11 +521,17 @@ impl<E: Embedder> Pipeline<E> {
             duration_ms: d.duration_ms,
             confidence: d.confidence,
             burst_count: d.burst_count,
+            peak_dbfs: d.peak_dbfs,
+            mean_dbfs: d.mean_dbfs,
+            noise_floor_dbfs: d.noise_floor_dbfs,
             model_version: ctx.model_version.clone(),
             source: ctx.source,
             device_id: ctx.device_id.clone(),
             uploaded_at: None,
             deleted: false,
+            false_positive_at: None,
+            corrected_to: None,
+            corrected_at: None,
             reject_count: 0,
             rejected_at: None,
         }
@@ -491,6 +576,17 @@ impl<E: Embedder> StreamingPipeline<E> {
         self.inner.set_prototypes(proto);
     }
 
+    /// Retune detection sensitivity without restarting the microphone stream.
+    pub fn set_sensitivity(&mut self, sensitivity: f32) {
+        self.inner.set_sensitivity(sensitivity);
+    }
+
+    /// Whether the energy gate is currently open — i.e. the app is analyzing a
+    /// sound right now. Drives the "heard something" indicator.
+    pub fn gate_open(&self) -> bool {
+        self.state.gate.is_open()
+    }
+
     /// Feed the next slice of 16 kHz mono samples; returns any events that closed as
     /// a result. Sample counting is monotonic across calls (SPEC §4.1 ⑤).
     pub fn push(&mut self, samples: &[f32]) -> Result<Vec<DetectedEvent>> {
@@ -533,6 +629,39 @@ mod tests {
         assert!(result.windows.iter().all(|w| !w.active));
     }
 
+    /// Loudness is recorded, and a loud event is measurably louder than a quiet
+    /// one of the same class — the whole point of logging intensity.
+    #[test]
+    fn events_record_how_loud_they_were() {
+        let burst = |amplitude: f32| {
+            let mut sig = synth::white_noise(16_000, 0.003, 1);
+            sig.extend(synth::sine(16_000 * 2, 16_000, 300.0, amplitude));
+            sig.extend(synth::white_noise(16_000, 0.003, 2));
+            Pipeline::new(PipelineConfig::default(), BandHeuristicEmbedder)
+                .process(&sig)
+                .unwrap()
+                .events
+        };
+
+        let loud = burst(0.6);
+        let quiet = burst(0.06);
+        assert!(!loud.is_empty() && !quiet.is_empty());
+
+        let loud_peak = loud[0].peak_dbfs.expect("loudness recorded");
+        let quiet_peak = quiet[0].peak_dbfs.expect("loudness recorded");
+        assert!(
+            loud_peak > quiet_peak + 10.0,
+            "a 10x amplitude difference should be ~20 dB: {loud_peak} vs {quiet_peak}"
+        );
+
+        // dBFS for real signal sits at or below 0, and the mean cannot exceed
+        // the peak.
+        assert!(loud_peak <= 0.0, "peak {loud_peak} should be <= 0 dBFS");
+        assert!(loud[0].mean_dbfs.unwrap() <= loud_peak);
+        // The floor is captured from the quiet lead-in, so it is well below.
+        assert!(loud[0].noise_floor_dbfs.unwrap() < loud_peak);
+    }
+
     /// A loud cough-frequency burst surrounded by quiet → exactly one cough event.
     #[test]
     fn cough_tone_burst_yields_one_cough_event() {
@@ -565,6 +694,7 @@ mod tests {
                     class: EventType::NoseBlow,
                     embedding: embedding.clone(),
                     is_negative: false,
+                    negative_scoped: false,
                 })
                 .collect::<Vec<_>>(),
             0.65,
@@ -599,6 +729,7 @@ mod tests {
                     class: EventType::Hawk,
                     embedding: embedding.clone(),
                     is_negative: false,
+                    negative_scoped: false,
                 })
                 .collect::<Vec<_>>(),
             0.65,
@@ -641,6 +772,7 @@ mod tests {
                 class: EventType::Cough,
                 embedding: embedding.clone(),
                 is_negative: true,
+                negative_scoped: false,
             }],
             0.65,
             0.05,

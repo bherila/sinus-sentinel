@@ -6,9 +6,13 @@ microphone, classifies them **entirely on-device**, and logs structured events t
 a personal health record (PHR) backend.
 
 **No raw audio is ever persisted or transmitted.** Classification runs locally
-(YAMNet ONNX + few-shot prototype matching); only event metadata (type,
-timestamp, duration, confidence, burst count) is stored or synced. Offline-first,
-with a strict mode that is structurally incapable of network I/O.
+(YAMNet ONNX + few-shot prototype matching); what leaves the device is event
+metadata (type, timestamp, duration, confidence, burst count, loudness) and —
+only once you connect a PHR — the derived embeddings behind Teach mode, so your
+personalized detector follows you between machines. Embeddings are opaque float
+vectors from which audio cannot be reconstructed, and they never leave the device
+in offline modes. Offline-first, with a strict mode that is structurally
+incapable of network I/O.
 
 📄 **[docs/SPEC.md](docs/SPEC.md)** is the source of truth for architecture,
 event taxonomy, sync modes, and milestones.
@@ -58,12 +62,22 @@ cargo build --release -p sinus-desktop --features live-audio,onnx,keyring
 
 ## Connecting to a PHR backend
 
-In **Settings** set the server URL and paste an API token (stored in the OS
-keychain — requires the `keyring` feature; never written to disk or displayed).
-Events upload in idempotent batches of ≤500 to
-`{server}/api/phr/patients/{patient_id}/respiratory-events/batch`; deletions sync
-as tombstone DELETE batches; failures back off exponentially (30 s → 30 min,
-jittered).
+In **Settings** set the server URL and patient id, and paste an API token (stored
+in the OS keychain — requires the `keyring` feature; never written to disk or
+displayed). Failures back off exponentially (30 s → 30 min, jittered).
+
+A flush syncs, in order:
+
+| What | Endpoint (under `{server}/api/phr/patients/{patient_id}/`) |
+|---|---|
+| Events, idempotent batches of ≤500 | `respiratory-events/batch` |
+| Tombstones | `respiratory-events/batch` (DELETE) |
+| False-positive / correction flags | `respiratory-events/flag-batch` |
+| Sensitivity + quiet hours, last-write-wins | `sinus-settings` |
+| Teach-mode enrollments, batches of ≤100 | `sinus-enrollments/batch` |
+
+A PHR that predates the settings/enrollment endpoints answers 404; those steps
+are skipped rather than failing the flush, so events keep uploading.
 
 Three sync modes (tray menu): **auto-batch** (flushes on a pending-count
 threshold, a timer, or quit), **offline-first** (metered-friendly: a longer
@@ -75,19 +89,30 @@ I/O path exists at all.
 
 - **History** shows today's per-class counts, a congestion score, a stacked
   7-day trend chart (per-class colors, hover for exact counts), and recent
-  events.
-- **✕ Report false positive** on any recent event removes it locally, deletes it
-  from the PHR on the next sync, and enrolls the sound's embedding as a negative
-  example so the detector suppresses near-identical sounds from then on — for
-  built-in and taught classes alike. Learned suppressions are listed in Teach
-  mode and can be forgotten there.
-- **Teach mode** (Settings) trains personalized classes fully locally: pick a
-  class, make one clear sound after the countdown, repeat with 3–5 varied takes
-  until the UI shows good repeat similarity and separation. Raw audio is
-  discarded; only 1024-value YAMNet embeddings are stored, locally. Takes can be
-  removed individually, per class, or all at once.
+  events with their peak loudness in dBFS. While a sound is being analyzed a
+  **🔊 heard something** line appears, so the app is not silent during the
+  second or two before a classification lands.
+- **✕ Report false positive** on any recent event stops it counting — here and
+  in the PHR — and enrolls the sound's embedding as a negative for the class
+  that fired, so the detector stops applying that label to near-identical
+  sounds. The event is flagged rather than deleted: the record that the
+  classifier got something wrong is worth keeping, and **↺** undoes it. Learned
+  suppressions are listed in Teach mode and can be forgotten there.
+- **Recharacterize** an event (the **…** picker beside it) if you know what the
+  sound really was. It enrolls the embedding as a negative for the wrong class
+  *and* a positive for the right one, and relabels the event so it keeps
+  counting — as the corrected class — locally and in the PHR. The wrong label
+  stops firing immediately; teach the correct class a few more times for it to
+  be recognized on its own.
+- **Teach mode** (Settings) trains personalized classes: pick a class, make one
+  clear sound after the countdown, repeat with 3–5 varied takes until the UI
+  shows good repeat similarity and separation. Raw audio is discarded; only
+  1024-value YAMNet embeddings are stored. With a PHR connected these sync, so a
+  second machine inherits your trained detector.
 - **Pause** (15 min / 1 h / until resumed) from the tray; a sensitivity slider
-  in Settings scales all detection thresholds.
+  in Settings scales all detection thresholds, takes effect immediately, and —
+  along with quiet hours — syncs across your machines via the PHR. Server URL,
+  patient id and sync mode stay device-local.
 
 ### Data locations
 
@@ -96,8 +121,10 @@ I/O path exists at all.
 | macOS | `~/Library/Application Support/SinusSentinel/events.db` |
 | Windows | `%APPDATA%\SinusSentinel\events.db` |
 
-SQLite in WAL mode; events survive kill/relaunch. Detection embeddings kept for
-false-positive reporting are local-only and pruned after 30 days.
+SQLite in WAL mode; events survive kill/relaunch. Detection embeddings kept so a
+recent event can be reported or recharacterized are local-only and pruned after
+30 days — distinct from Teach-mode enrollments, which do sync when a PHR is
+connected.
 
 ## CLI
 

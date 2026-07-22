@@ -148,15 +148,38 @@ CREATE TABLE events (
   duration_ms   INTEGER NOT NULL,
   confidence    REAL NOT NULL,
   burst_count   INTEGER NOT NULL DEFAULT 1,
+  peak_dbfs        REAL NULL,           -- loudest 50 ms hop in the event
+  mean_dbfs        REAL NULL,           -- power-domain mean across the event
+  noise_floor_dbfs REAL NULL,           -- adaptive floor at onset; peak - floor = loudness vs the room
   model_version TEXT NOT NULL,
   source        TEXT NOT NULL,          -- desktop-mac | desktop-win | mobile-ios | mobile-android
   device_id     TEXT NOT NULL,          -- stable per-install UUID
   uploaded_at   TEXT NULL,              -- NULL = pending; never uploaded in offline-strict
-  deleted       INTEGER NOT NULL DEFAULT 0  -- user removed a false positive locally
+  deleted       INTEGER NOT NULL DEFAULT 0, -- hard local removal (tombstone syncs as DELETE)
+  false_positive_at TEXT NULL,          -- reported misdetection: retained, but never counted
+  corrected_to      TEXT NULL,          -- recharacterized: still counts, as this class
+  corrected_at      TEXT NULL,
+  flag_updated_at   TEXT NULL,          -- last flag mutation, incl. clearing one
+  flag_synced_at    TEXT NULL           -- pending when < flag_updated_at
 );
 CREATE INDEX idx_events_pending ON events (uploaded_at) WHERE uploaded_at IS NULL;
 CREATE INDEX idx_events_day ON events (occurred_at);
+CREATE INDEX idx_events_flag_pending ON events (flag_updated_at) WHERE flag_updated_at IS NOT NULL;
 ```
+
+**Loudness.** The gate (stage ①) already computes per-hop RMS and an adaptive
+noise floor; these three columns retain them so a quiet throat-clear and a
+violent one are distinguishable. `mean_dbfs` is averaged in the **linear power**
+domain over hops that tile the event without overlap — averaging dB values, or
+averaging per-window means across overlapping patches, would both be wrong.
+
+**False positive vs. correction.** A false positive is a misdetection: retained
+(a health record should keep the fact that the classifier erred) but excluded
+from every count, chart and score. A correction is a real event under the wrong
+label: it keeps counting, as `corrected_to`. `flag_updated_at` is stamped by
+every flag mutation *including clearing one*, which is what makes an undo
+syncable — a queue keyed on "is currently flagged" cannot represent a cleared
+flag and would leave the PHR marked forever.
 
 ### 4.3 Sync engine — three modes
 | Mode | Behavior |
@@ -227,16 +250,45 @@ The user **records their own examples** and the app recognizes those sounds late
 ```
 POST   /api/phr/patients/{patient}/respiratory-events/batch
        { device_id, source, model_version, events: [ {uuid, event_type,
-         occurred_at, tz_offset_min, duration_ms, confidence, burst_count}, ≤500 ] }
+         occurred_at, tz_offset_min, duration_ms, confidence, burst_count,
+         peak_dbfs?, mean_dbfs?, noise_floor_dbfs?}, ≤500 ] }
   →    { results: [ {uuid, status: accepted|duplicate|rejected, reason?} ] }
 
 DELETE /api/phr/patients/{patient}/respiratory-events/batch   { uuids: [...] }
-GET    /api/phr/patients/{patient}/respiratory-events?from=&to=&type=
+POST   /api/phr/patients/{patient}/respiratory-events/flag-batch
+       { items: [ {uuid, false_positive, corrected_to}, ≤500 ] }
+  →    { flagged, results: [ {uuid, status: flagged|not_found} ] }
+GET    /api/phr/patients/{patient}/respiratory-events?from=&to=&type=&include_false_positives=
 GET    /api/phr/patients/{patient}/respiratory-events/summary?from=&to=&bucket=day
+
+GET    /api/phr/patients/{patient}/sinus-settings
+PUT    /api/phr/patients/{patient}/sinus-settings
+       { settings: {...}, updated_at, device_id }
+  →    { applied, sinus_settings: { settings, updated_at, ... } }
+
+GET    /api/phr/patients/{patient}/sinus-enrollments
+POST   /api/phr/patients/{patient}/sinus-enrollments/batch    { enrollments: [ ..., ≤100 ] }
+DELETE /api/phr/patients/{patient}/sinus-enrollments/batch    { uuids: [...] }
 ```
 
+`flag-batch` is declarative — the current state, not a delta — so clearing a
+flag is `false_positive: false` with a null `corrected_to`. `not_found` is
+terminal client-side, so a flag on an event the server never accepted cannot
+retry forever. Reads exclude false positives by default and bucket by
+`COALESCE(corrected_to_event_type, event_type)`.
+
+A server predating the settings/enrollment endpoints answers 404; the client
+skips those steps rather than failing the flush.
+
 ### Table `phr_respiratory_events`
-Mirrors the client store: `id`, `phr_patient_id` FK, `client_event_uuid` (unique per patient — the idempotency key), `event_type` (string, validated against the taxonomy), `occurred_at` datetime + `tz_offset_min`, `duration_ms`, `confidence`, `burst_count`, `source`, `device_id`, `model_version`, timestamps. Model uses `SerializesDatesAsLocal`, `BelongsTo` PhrPatient, follows existing `Phr*` conventions; patient authorization mirrors the other PHR controllers (owner/access grants).
+Mirrors the client store: `id`, `phr_patient_id` FK, `client_event_uuid` (unique per patient — the idempotency key), `event_type` (string, validated against the taxonomy), `occurred_at` datetime + `tz_offset_min`, `duration_ms`, `confidence`, `burst_count`, `peak_dbfs`/`mean_dbfs`/`noise_floor_dbfs`, `source`, `device_id`, `model_version`, `false_positive_at`, `corrected_to_event_type`, `corrected_at`, timestamps. Model uses `SerializesDatesAsLocal`, `BelongsTo` PhrPatient, follows existing `Phr*` conventions; patient authorization mirrors the other PHR controllers (owner/access grants).
+
+### Tables `phr_sinus_settings`, `phr_sinus_enrollments`
+`phr_sinus_settings`: one row per patient — a JSON `settings` document plus the client's `settings_updated_at` (the last-write-wins comparand, rejected if more than 5 minutes in the future) and the server's own `received_at`. Only detection-shaping keys sync (`sensitivity`, `quiet_start`, `quiet_end`); `server_url`, `patient_id`, `device_id`, `model_path` and `mode` are device-local — sync mode is per-machine network policy, and pulling `offline-strict` onto a second machine would silently disable its sync.
+
+`phr_sinus_enrollments`: Teach-mode examples keyed on `client_enrollment_uuid`. Both `client_enrollment_uuid` (`BINARY(16)`) and `embedding` (`VARBINARY(16384)`) are raw binary — byte-identical to the device's SQLite BLOBs, so no float is reformatted in the round trip — carried over the wire as base64. A negative may set `source_event_uuid`, linking it to the event whose misdetection produced it.
+
+See `docs/phr/sinus-sentinel.md` in the PHR repo for the full contract.
 
 ### Web UI (later, separate PR)
 A "Respiratory" card on the PHR patient page: trend chart (reuse the vitals-trend chart pattern), correlation with medication start/stop dates. Not required for the desktop app to ship.
@@ -245,7 +297,8 @@ A "Respiratory" card on the PHR patient page: trend chart (reuse the vitals-tren
 
 ## 8. Privacy & security posture
 
-1. **No raw audio persistence, no raw audio egress** — the network layer can only serialize the event schema; there is no code path that uploads audio. Opt-in labeling clips are local-only files, wiped by "wipe local data".
+1. **No raw audio persistence, no raw audio egress** — the network layer can only serialize the event and enrollment schemas; there is no code path that uploads audio. Opt-in labeling clips are local-only files, wiped by "wipe local data".
+1a. **Derived embeddings do egress, and only to a PHR the user connected.** Teach-mode enrollments sync so a personalized detector follows the user between machines. These are opaque 1024-value YAMNet vectors from which audio cannot be reconstructed; they never leave the device in offline-first-without-sync or offline-strict. The per-event embeddings retained for false-positive reporting are a separate, strictly local set, pruned after 30 days. The mic-permission string and the Settings footer must both describe this accurately — "only event metadata is ever sent" is no longer a true statement of the system.
 2. On-device inference only. No cloud ASR/classification of any kind.
 3. macOS mic-permission usage string states plainly: "detects coughs/sniffles locally; no audio is recorded or sent." The OS mic indicator (orange dot) will be visibly always-on while listening — this is honest and unavoidable; the pause control is one click away.
 4. Event payloads contain no free text and no identifiers beyond `device_id` (random UUID) and the patient id.

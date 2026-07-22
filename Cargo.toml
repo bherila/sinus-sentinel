@@ -17,6 +17,7 @@ thiserror = "2"
 uuid = { version = "1", features = ["v4", "serde"] }
 chrono = { version = "0.4", features = ["serde", "clock"], default-features = false }
 rand = "0.8"
+base64 = "0.22"
 hound = "3"
 realfft = "3"
 rusqlite = { version = "0.32", features = ["bundled"] }

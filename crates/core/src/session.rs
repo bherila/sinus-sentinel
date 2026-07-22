@@ -48,6 +48,26 @@ impl SessionConfig {
     }
 }
 
+/// Loudness measured over one analysis window (SPEC §4.1 ①). Built by the
+/// pipeline from the gate's per-hop RMS and adaptive noise floor.
+///
+/// `power_sum` / `mean_hops` are carried in the linear power domain rather than
+/// pre-averaged in dB so a session can combine several windows into one honest
+/// mean: averaging dB values, or averaging per-window means, would both be
+/// wrong. The pipeline guarantees the hops behind these two fields tile the
+/// timeline without overlap, so summing across a session's windows counts each
+/// hop exactly once.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct WindowLevels {
+    /// Loudest hop in the window, dBFS.
+    pub peak_dbfs: f32,
+    /// Sum of linear power over `mean_hops` non-overlapping hops.
+    pub power_sum: f64,
+    pub mean_hops: u32,
+    /// Adaptive noise floor at the window's start, dBFS.
+    pub floor_dbfs: f32,
+}
+
 /// A per-window firing observation fed to the sessionizer.
 #[derive(Debug, Clone)]
 pub struct WindowObservation {
@@ -56,6 +76,8 @@ pub struct WindowObservation {
     /// Window start time, ms (monotonic within a stream).
     pub timestamp_ms: i64,
     pub energy_peak: bool,
+    /// Loudness of this window, when the gate retained the hops behind it.
+    pub levels: Option<WindowLevels>,
     /// Backbone embedding of the window (empty when unavailable). The closed
     /// event carries the embedding of its highest-confidence window so a false
     /// positive can later be enrolled as a negative example.
@@ -72,6 +94,14 @@ pub struct DetectedEvent {
     pub duration_ms: i64,
     pub confidence: f32,
     pub burst_count: i64,
+    /// Loudest hop anywhere in the event, dBFS. `None` when no window carried
+    /// levels.
+    pub peak_dbfs: Option<f32>,
+    /// Power-domain mean level across the event, dBFS.
+    pub mean_dbfs: Option<f32>,
+    /// The adaptive noise floor when the event started, dBFS. `peak - floor` is
+    /// how loud the sound was relative to the room.
+    pub noise_floor_dbfs: Option<f32>,
     /// Embedding of the highest-confidence window in the session (empty when the
     /// backbone produced none). Kept locally only — never uploaded.
     pub embedding: Vec<f32>,
@@ -85,6 +115,35 @@ struct OpenSession {
     bursts: i64,
     last_peak_ms: Option<i64>,
     best_embedding: Vec<f32>,
+    /// Running loudness. Peak is a max; the mean accumulates linear power over
+    /// non-overlapping hops; the floor is captured once, at onset.
+    peak_dbfs: Option<f32>,
+    power_sum: f64,
+    mean_hops: u32,
+    noise_floor_dbfs: Option<f32>,
+}
+
+impl OpenSession {
+    fn absorb_levels(&mut self, levels: Option<WindowLevels>) {
+        let Some(levels) = levels else {
+            return;
+        };
+        self.peak_dbfs = Some(match self.peak_dbfs {
+            Some(current) => current.max(levels.peak_dbfs),
+            None => levels.peak_dbfs,
+        });
+        self.power_sum += levels.power_sum;
+        self.mean_hops += levels.mean_hops;
+        self.noise_floor_dbfs.get_or_insert(levels.floor_dbfs);
+    }
+
+    /// Power-domain mean converted back to dBFS.
+    fn mean_dbfs(&self) -> Option<f32> {
+        (self.mean_hops > 0).then(|| {
+            let mean_power = self.power_sum / self.mean_hops as f64;
+            (10.0 * mean_power.max(1e-30).log10()) as f32
+        })
+    }
 }
 
 /// The sessionizer. Feed it window observations in non-decreasing time order;
@@ -119,6 +178,9 @@ impl Sessionizer {
             duration_ms: (s.last_ms - s.start_ms) + self.cfg.window_ms,
             confidence: s.max_conf,
             burst_count: s.bursts.max(1),
+            peak_dbfs: s.peak_dbfs,
+            mean_dbfs: s.mean_dbfs(),
+            noise_floor_dbfs: s.noise_floor_dbfs,
             embedding: s.best_embedding,
         };
         self.cooldown_until
@@ -179,6 +241,7 @@ impl Sessionizer {
                     session.best_embedding = obs.embedding.clone();
                 }
                 Self::record_peak(session, &obs, self.cfg.peak_min_gap_ms);
+                session.absorb_levels(obs.levels);
             }
             None => {
                 let mut session = OpenSession {
@@ -188,8 +251,13 @@ impl Sessionizer {
                     bursts: 0,
                     last_peak_ms: None,
                     best_embedding: obs.embedding.clone(),
+                    peak_dbfs: None,
+                    power_sum: 0.0,
+                    mean_hops: 0,
+                    noise_floor_dbfs: None,
                 };
                 Self::record_peak(&mut session, &obs, self.cfg.peak_min_gap_ms);
+                session.absorb_levels(obs.levels);
                 self.open.insert(et, session);
             }
         }
@@ -209,6 +277,7 @@ mod tests {
 
     fn obs(et: EventType, t: i64, conf: f32, peak: bool) -> WindowObservation {
         WindowObservation {
+            levels: None,
             event_type: et,
             confidence: conf,
             timestamp_ms: t,
