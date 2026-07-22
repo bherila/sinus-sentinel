@@ -356,6 +356,9 @@ fn save_teach_sample(
             peak_dbfs: peak_dbfs(samples),
             model_version: Some(&model_version),
             source_event_uuid: None,
+            // Irrelevant for a positive take; scoping only governs how far a
+            // negative's veto reaches.
+            negative_scoped: false,
         })
         .map_err(|e| e.to_string())?;
     pipeline.set_prototypes(prototypes_from_store(store)?);
