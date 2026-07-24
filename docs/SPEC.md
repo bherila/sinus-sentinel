@@ -300,7 +300,7 @@ A "Respiratory" card on the PHR patient page: trend chart (reuse the vitals-tren
 1. **No raw audio persistence, no raw audio egress** — the network layer can only serialize the event and enrollment schemas; there is no code path that uploads audio. Opt-in labeling clips are local-only files, wiped by "wipe local data".
 1a. **Derived embeddings do egress, and only to a PHR the user connected.** Teach-mode enrollments sync so a personalized detector follows the user between machines. These are opaque 1024-value YAMNet vectors from which audio cannot be reconstructed; they never leave the device in offline-first-without-sync or offline-strict. The per-event embeddings retained for false-positive reporting are a separate, strictly local set, pruned after 30 days. The mic-permission string and the Settings footer must both describe this accurately — "only event metadata is ever sent" is no longer a true statement of the system.
 2. On-device inference only. No cloud ASR/classification of any kind.
-3. macOS mic-permission usage string states plainly: "detects coughs/sniffles locally; no audio is recorded or sent." The OS mic indicator (orange dot) will be visibly always-on while listening — this is honest and unavoidable; the pause control is one click away.
+3. macOS mic-permission usage string states plainly: "detects coughs/sniffles locally; no audio is recorded or sent." The OS mic indicator (orange dot) is on while listening. Pause, quiet hours, and the default OS low-power-mode policy release the microphone completely and open a fresh capture session on resume.
 4. Event payloads contain no free text and no identifiers beyond `device_id` (random UUID) and the patient id.
 5. Token in OS keychain, never in config files. TLS only (rustls); server URL pinned in settings.
 6. SQLite DB in the platform app-data dir with user-only permissions. (SQLCipher considered; deferred — the threat model is a personal machine.)
@@ -313,7 +313,13 @@ A "Respiratory" card on the PHR patient page: trend chart (reuse the vitals-tren
 | Quiet room (gate closed) | <0.5 % of one core | <50 MB |
 | Active classification burst | <8 % of one core | <70 MB |
 | Settings/history window open | event-driven repaint only | +~30 MB, released on close |
-Battery-relevant: no timers faster than the 50 ms audio callback; no busy polling; no continuous render loop (egui repaints on input/data change); sync wakeups coalesced. CI asserts the quiet-room CPU budget with a 10-minute silence soak on the CLI harness.
+Battery-relevant: the callback coalesces worker wakes into 50 ms gate hops; quiet
+audio retains bounded raw pre-roll but performs no FFT or inference. There is no
+busy polling or continuous render loop: worker status changes request egui
+repaints, hidden history performs no database/chart work, and sync sleeps until a
+queue signal or exact flush/quiet-hours deadline. ONNX CPU fallback is
+single-threaded; macOS prefers CoreML on CPU + Neural Engine. CI drives the
+complete streaming pipeline through a 10-minute quiet-room soak.
 
 ---
 

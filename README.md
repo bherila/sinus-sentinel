@@ -109,7 +109,11 @@ I/O path exists at all.
   shows good repeat similarity and separation. Raw audio is discarded; only
   1024-value YAMNet embeddings are stored. With a PHR connected these sync, so a
   second machine inherits your trained detector.
-- **Pause** (15 min / 1 h / until resumed) from the tray; a sensitivity slider
+- **Pause** (15 min / 1 h / until resumed) from the tray releases the microphone
+  and stops analysis entirely, then opens a fresh capture session on resume.
+  Quiet hours do the same, and the default battery policy automatically pauses
+  while macOS/Windows low-power mode is active (toggleable in Settings).
+  A sensitivity slider
   in Settings scales all detection thresholds, takes effect immediately, and —
   along with quiet hours — syncs across your machines via the PHR. Server URL,
   patient id and sync mode stay device-local.
@@ -175,6 +179,11 @@ or model file:
 A key invariant, enforced by test: feeding a signal to the streaming pipeline in
 arbitrary chunks yields **exactly** the same events as one batch call — the CLI,
 tests, and live capture share one engine.
+
+The quiet path is gate-only: raw audio is retained just long enough to supply
+pre-roll if the gate opens, while log-mel FFTs and model inference are skipped.
+Audio callbacks wake the worker in 50 ms batches; the hidden UI and sync worker
+sleep until an event or real deadline rather than polling.
 
 ## Status
 
