@@ -8,6 +8,7 @@ mod app;
 #[cfg(feature = "live-audio")]
 mod capture;
 mod instance;
+#[cfg(feature = "live-audio")]
 mod power;
 mod shared;
 mod state;
