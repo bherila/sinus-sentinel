@@ -1,6 +1,7 @@
 # Sinus Sentinel
 
-Menu-bar/tray app (macOS + Windows) that passively detects sinus-related sounds —
+On-device respiratory-event detector with a desktop tray client and an in-progress
+native SwiftUI client for macOS + iPhone. It detects sinus-related sounds —
 cough, throat clearing, sniffle, sneeze, nose blow, hawk, snort/suck — via the
 microphone, classifies them **entirely on-device**, and logs structured events to
 a personal health record (PHR) backend.
@@ -32,6 +33,30 @@ closing the window hides it, monitoring keeps running, and only the tray **Quit*
 exits. Launching a second copy just focuses the running one.
 
 Tray states: 🟢 listening · ⏸ paused · ⚠ model unavailable · 📴 offline-strict.
+
+### Apple SwiftUI prototype
+
+On a Mac with Xcode, an installed iOS 17+ Simulator, and Rustup:
+
+```bash
+make apple-ios-run
+```
+
+That one command compiles the Rust static library for the current Simulator
+architecture, regenerates its UniFFI Swift/C bindings, links the SwiftUI app,
+boots or selects a simulator, installs the app, and launches it with `xcrun
+simctl`. For the native Mac shell:
+
+```bash
+make apple-macos-run
+```
+
+The prototype uses an explicit monitoring-session model. On iPhone, the active
+recording session declares the audio background mode so it can continue through
+screen lock; this still needs real-device and App Review validation. Until a
+compiled `apps/apple/Resources/yamnet.mlmodelc` is supplied, the UI uses a
+neutral preview model and deliberately emits no detections. See
+[the Apple architecture handoff](docs/APPLE_ARCHITECTURE.md).
 
 ### The model file
 
@@ -170,8 +195,11 @@ or model file:
 
 - `crates/core` — audio pipeline (gate → log-mel → embed → decision →
   sessionizer), store, sync engine; no UI deps
+- `crates/app` — UI-independent monitoring-session and history application layer
+- `crates/apple` — UniFFI boundary consumed by native Swift
 - `crates/cli` — headless harness: classify, soak, calibrate, enroll
 - `apps/desktop` — tray + egui app, live capture, Teach mode, sync scheduler
+- `apps/apple` — shared macOS/iPhone SwiftUI prototype and generated bindings
 - `model/` — ONNX model artifacts (fetched, not committed)
 - `testdata/` — synthetic golden-corpus WAVs
 - `docs/SPEC.md` — the spec
