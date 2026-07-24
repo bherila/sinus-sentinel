@@ -37,6 +37,32 @@ jobs:
       - name: onnx feature compile-check
         run: cargo build -p sinus-core --features onnx
 
+  # The Apple UI itself needs Xcode, but its Rust engine, UniFFI contract, and
+  # generated Swift/header surface are deterministic and verifiable on Linux.
+  apple-contract:
+    runs-on: ubuntu-24.04-arm
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+        with:
+          components: clippy
+      - uses: Swatinem/rust-cache@v2
+      - run: cargo clippy -p sinus-app -p sinus-apple --all-targets -- -D warnings
+      - run: cargo test -p sinus-app -p sinus-apple
+      - run: make apple-bindings-check
+      - run: git diff --exit-code -- apps/apple/Generated
+
+  # Compile and link both native Swift destinations against Rust. This is the
+  # Mac-side check that cannot run in the Linux development environment.
+  apple-native:
+    runs-on: macos-latest
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - uses: Swatinem/rust-cache@v2
+      - run: make apple-ios-build
+      - run: make apple-macos-build
+
   # cpal live capture + the egui/tray desktop shell need a display/audio stack
   # that the Linux runner lacks, so build them only on macOS and Windows.
   live-and-desktop:
