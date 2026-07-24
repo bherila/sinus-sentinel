@@ -173,6 +173,7 @@ pub fn spawn_capture(db_path: PathBuf, shared: SharedStatus) -> JoinHandle<()> {
 const EVENT_EMBEDDING_RETENTION_DAYS: i64 = 30;
 
 fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
+    shared.register_capture_thread();
     let store = Store::open(&db_path).map_err(|e| e.to_string())?;
     let _ = store.prune_event_embeddings(
         Utc::now() - chrono::Duration::days(EVENT_EMBEDDING_RETENTION_DAYS),
@@ -183,7 +184,6 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
         .flatten()
         .unwrap_or_else(|| "unknown".to_string());
 
-    let mut source = CpalAudioSource::open_default().map_err(|e| e.to_string())?;
     let embedder = build_embedder(&store, &shared);
 
     let prototypes = prototypes_from_store(&store)?;
@@ -199,9 +199,8 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     if let Some(prototypes) = prototypes {
         pipeline = pipeline.with_prototypes(prototypes);
     }
-    let stream_start = Utc::now();
-    let ctx = EventContext {
-        base_time: stream_start,
+    let mut ctx = EventContext {
+        base_time: Utc::now(),
         tz_offset_min: local_offset_minutes(),
         device_id,
         source: Source::current_desktop(),
@@ -209,18 +208,55 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     };
 
     let mut buf = vec![0.0f32; 4096];
+    let mut source: Option<CpalAudioSource> = None;
     let mut teach_capture: Option<TeachCapture> = None;
     let mut gate_was_open = false;
+    let mut pause_on_low_power = read_pause_on_low_power(&store);
+    let mut last_power_check: Option<std::time::Instant> = None;
     loop {
+        if shared.quitting() {
+            return Ok(());
+        }
+
         if shared.take_enrollment_reload() {
             pipeline.set_prototypes(prototypes_from_store(&store)?);
         }
 
-        // Sensitivity can change from the slider here or from a value pulled off
-        // the PHR. Applying it in place avoids restarting the stream, which
-        // would reset the gate, the noise floor, and every cooldown.
+        // Sensitivity and power policy can change locally or arrive from sync.
         if shared.take_settings_reload() {
             pipeline.set_sensitivity(read_sensitivity(&store));
+            pause_on_low_power = read_pause_on_low_power(&store);
+            last_power_check = None;
+        }
+        if last_power_check
+            .is_none_or(|checked| checked.elapsed() >= std::time::Duration::from_secs(60))
+        {
+            shared.set_low_power(pause_on_low_power && crate::power::low_power_mode_enabled());
+            last_power_check = Some(std::time::Instant::now());
+        }
+
+        let now = Utc::now();
+        if shared.capture_suspended(now) {
+            // Dropping the stream releases the microphone device and lets the
+            // hardware/driver power down. Reset the streaming state because a
+            // paused gap must not merge sessions or skew sample-clock timestamps.
+            source = None;
+            pipeline.reset_stream();
+            if let Some(capture) = teach_capture.take() {
+                shared.fail_teach(capture.class);
+            }
+            gate_was_open = false;
+            shared.set_analyzing(false);
+            std::thread::park_timeout(shared.suspension_wait(now));
+            continue;
+        }
+
+        if source.is_none() {
+            source = Some(CpalAudioSource::open_default().map_err(|e| e.to_string())?);
+            pipeline.reset_stream();
+            ctx.base_time = Utc::now();
+            ctx.tz_offset_min = local_offset_minutes();
+            gate_was_open = false;
         }
 
         if teach_capture.is_none() {
@@ -229,9 +265,12 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             }
         }
 
-        let n = source.read(&mut buf).map_err(|e| e.to_string())?;
+        let n = source
+            .as_mut()
+            .expect("source opened above")
+            .read(&mut buf)
+            .map_err(|e| e.to_string())?;
         if n == 0 {
-            std::thread::sleep(std::time::Duration::from_millis(20));
             continue;
         }
         let teaching = teach_capture.is_some();
@@ -258,7 +297,9 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             if !shared.quiet() && !teaching {
                 for detected in &events {
                     let event = pipeline.to_event(detected, &ctx);
-                    let _ = store.insert_event(&event);
+                    if store.insert_event(&event).is_ok() {
+                        shared.notify_event_persisted();
+                    }
                     // Kept locally only (never uploaded) so a false-positive
                     // report can enroll this exact sound as a negative example.
                     let _ = store.put_event_embedding(&event.uuid, &detected.embedding);
@@ -397,6 +438,14 @@ fn read_sensitivity(store: &Store) -> f32 {
         .flatten()
         .and_then(|value| value.parse().ok())
         .unwrap_or(0.5)
+}
+
+fn read_pause_on_low_power(store: &Store) -> bool {
+    store
+        .setting_get("pause_low_power")
+        .ok()
+        .flatten()
+        .is_none_or(|value| value != "false")
 }
 
 /// Local UTC offset in minutes.

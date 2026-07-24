@@ -131,10 +131,6 @@ pub fn spawn_sync(db_path: PathBuf, shared: SharedStatus) -> JoinHandle<()> {
     })
 }
 
-/// How often the driver wakes to re-check the queue and publish status. Coarse to
-/// keep wakeups coalesced (SPEC §9).
-const TICK: Duration = Duration::from_secs(3);
-
 fn read_mode(store: &Store) -> Mode {
     store
         .setting_get("mode")
@@ -225,6 +221,36 @@ fn eval_quiet(store: &Store) -> bool {
     }
 }
 
+fn until_next_local_hour() -> Duration {
+    let now = chrono::Local::now();
+    let elapsed = now.minute() as u64 * 60 + now.second() as u64;
+    Duration::from_secs((60 * 60 - elapsed).max(1))
+}
+
+fn next_driver_wait(
+    mode: Mode,
+    pending: usize,
+    last_flush: Instant,
+    retry_at: Option<Instant>,
+    policy: &FlushPolicy,
+) -> Duration {
+    let now = Instant::now();
+    let mut wait = until_next_local_hour();
+    if let Some(retry_at) = retry_at {
+        wait = wait.min(retry_at.saturating_duration_since(now));
+    } else if pending > 0 {
+        let interval = match mode {
+            Mode::AutoBatch => Some(policy.auto_interval),
+            Mode::OfflineFirst => Some(policy.offline_first_interval),
+            Mode::OfflineStrict => None,
+        };
+        if let Some(interval) = interval {
+            wait = wait.min(interval.saturating_sub(last_flush.elapsed()));
+        }
+    }
+    wait.max(Duration::from_millis(1))
+}
+
 fn run_sync(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     let mut store = Store::open(&db_path).map_err(|e| e.to_string())?;
     let policy = FlushPolicy::default();
@@ -233,6 +259,7 @@ fn run_sync(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     let mut engine_mode: Option<Mode> = None;
     let mut engine_config: Option<(String, String)> = None;
     let mut last_flush = Instant::now();
+    let mut observed_signal = shared.sync_generation();
     // When a failure schedules a retry: no flush attempt is made before this.
     let mut retry_at: Option<Instant> = None;
 
@@ -265,7 +292,7 @@ fn run_sync(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
         let manual = shared.take_sync_now();
         let quitting = shared.quitting();
 
-        if should_flush(
+        let scheduled = should_flush(
             mode,
             pending,
             last_flush.elapsed(),
@@ -273,8 +300,10 @@ fn run_sync(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             quitting,
             &policy,
         )
-        .is_some()
-        {
+        .is_some();
+        let retry_due = retry_at.is_some_and(|deadline| Instant::now() >= deadline);
+        let mut flushed = false;
+        if scheduled || retry_due {
             let ready = retry_at.is_none_or(|t| Instant::now() >= t);
             if ready {
                 if let Some(eng) = &engine {
@@ -296,6 +325,7 @@ fn run_sync(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
                             last_flush = Instant::now();
                             shared.set_pending(store.pending_count().unwrap_or(0) as usize);
                             shared.set_sync(SyncStatus::Idle);
+                            flushed = true;
                         }
                         Err(e) => {
                             eprintln!("sync: flush failed: {e}");
@@ -312,7 +342,11 @@ fn run_sync(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
         if quitting {
             break;
         }
-        std::thread::sleep(TICK);
+        if flushed {
+            continue;
+        }
+        let wait = next_driver_wait(mode, pending, last_flush, retry_at, &policy);
+        observed_signal = shared.wait_for_sync_signal(observed_signal, wait);
     }
     Ok(())
 }

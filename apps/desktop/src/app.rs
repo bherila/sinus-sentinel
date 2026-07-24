@@ -17,6 +17,7 @@ use crate::shared::{ModelStatus, SharedStatus, TeachState};
 use crate::state::{self, PauseState};
 
 /// Menu item ids.
+#[cfg_attr(test, allow(dead_code))]
 mod ids {
     pub const PAUSE_15: &str = "pause_15";
     pub const PAUSE_60: &str = "pause_60";
@@ -109,8 +110,19 @@ struct SettingsForm {
     token: String,
     token_message: String,
     sensitivity: f32,
+    pause_on_low_power: bool,
     token_status: String,
     enrollment_message: String,
+}
+
+#[derive(Default)]
+struct HistorySnapshot {
+    generation: usize,
+    day: Option<chrono::NaiveDate>,
+    refreshed_at: Option<std::time::Instant>,
+    today: std::collections::HashMap<EventType, i64>,
+    histogram: Vec<state::DayCount>,
+    recent: Vec<Event>,
 }
 
 pub struct SinusApp {
@@ -129,15 +141,30 @@ pub struct SinusApp {
     instance: InstanceGuard,
     pending_enrollment_action: Option<EnrollmentAction>,
     history_message: String,
+    history: HistorySnapshot,
+    window_visible: bool,
+    #[cfg(not(test))]
+    menu_events: std::sync::mpsc::Receiver<tray_icon::menu::MenuEvent>,
 }
 
 impl SinusApp {
     pub fn new(
-        _cc: &eframe::CreationContext<'_>,
+        cc: &eframe::CreationContext<'_>,
         store: Store,
         shared: SharedStatus,
         instance: InstanceGuard,
     ) -> Self {
+        shared.attach_repaint_context(cc.egui_ctx.clone());
+        #[cfg(not(test))]
+        let menu_events = {
+            let (sender, receiver) = std::sync::mpsc::channel();
+            let context = cc.egui_ctx.clone();
+            tray_icon::menu::MenuEvent::set_event_handler(Some(move |event| {
+                let _ = sender.send(event);
+                context.request_repaint();
+            }));
+            receiver
+        };
         let sensitivity = store
             .setting_get("sensitivity")
             .ok()
@@ -149,6 +176,11 @@ impl SinusApp {
             .ok()
             .flatten()
             .unwrap_or_default();
+        let pause_on_low_power = store
+            .setting_get("pause_low_power")
+            .ok()
+            .flatten()
+            .is_none_or(|value| value != "false");
         let patient_id = store
             .setting_get("patient_id")
             .ok()
@@ -177,6 +209,7 @@ impl SinusApp {
                 token: String::new(),
                 token_message: String::new(),
                 sensitivity,
+                pause_on_low_power,
                 token_status: "Token status not checked.".to_string(),
                 enrollment_message: String::new(),
             },
@@ -189,15 +222,21 @@ impl SinusApp {
             instance,
             pending_enrollment_action: None,
             history_message: String::new(),
+            history: HistorySnapshot::default(),
+            window_visible: false,
+            #[cfg(not(test))]
+            menu_events,
         }
     }
 
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
         let _ = self.store.setting_set("mode", mode.as_str());
+        self.shared.notify_sync();
     }
 
-    fn show_window(ctx: &egui::Context) {
+    fn show_window(&mut self, ctx: &egui::Context) {
+        self.window_visible = true;
         ctx.send_viewport_cmd(egui::ViewportCommand::Visible(true));
         ctx.send_viewport_cmd(egui::ViewportCommand::Focus);
     }
@@ -251,6 +290,7 @@ impl SinusApp {
         if trained {
             self.shared.request_enrollment_reload();
         }
+        self.shared.notify_history_changed();
         self.shared.request_sync_now();
 
         let class = label(event.event_type);
@@ -310,6 +350,7 @@ impl SinusApp {
         if trained {
             self.shared.request_enrollment_reload();
         }
+        self.shared.notify_history_changed();
         self.shared.request_sync_now();
 
         let was = label(event.event_type);
@@ -330,6 +371,7 @@ impl SinusApp {
             self.history_message = format!("Could not restore the event: {error}");
             return;
         }
+        self.shared.notify_history_changed();
         self.shared.request_sync_now();
         self.history_message =
             "Restored the event here and in the PHR. Any training it produced is kept — \
@@ -363,30 +405,41 @@ impl SinusApp {
             .is_ok()
     }
 
+    #[cfg(not(test))]
     fn handle_menu_events(&mut self, ctx: &egui::Context) {
-        while let Ok(event) = tray_icon::menu::MenuEvent::receiver().try_recv() {
+        while let Ok(event) = self.menu_events.try_recv() {
             let id = event.id.as_ref();
             let now = Utc::now();
             match id {
                 ids::PAUSE_15 => {
-                    self.pause = PauseState::PausedUntil(now + chrono::Duration::minutes(15))
+                    let until = now + chrono::Duration::minutes(15);
+                    self.pause = PauseState::PausedUntil(until);
+                    self.shared.pause_until(until);
                 }
                 ids::PAUSE_60 => {
-                    self.pause = PauseState::PausedUntil(now + chrono::Duration::minutes(60))
+                    let until = now + chrono::Duration::minutes(60);
+                    self.pause = PauseState::PausedUntil(until);
+                    self.shared.pause_until(until);
                 }
-                ids::PAUSE_INDEF => self.pause = PauseState::PausedIndefinite,
-                ids::RESUME => self.pause = PauseState::Running,
+                ids::PAUSE_INDEF => {
+                    self.pause = PauseState::PausedIndefinite;
+                    self.shared.pause_indefinitely();
+                }
+                ids::RESUME => {
+                    self.pause = PauseState::Running;
+                    self.shared.resume_capture();
+                }
                 ids::MODE_AUTO => self.set_mode(Mode::AutoBatch),
                 ids::MODE_OFFLINE_FIRST => self.set_mode(Mode::OfflineFirst),
                 ids::MODE_OFFLINE_STRICT => self.set_mode(Mode::OfflineStrict),
                 ids::SYNC_NOW => self.shared.request_sync_now(),
                 ids::OPEN_HISTORY => {
                     self.tab = Tab::History;
-                    Self::show_window(ctx);
+                    self.show_window(ctx);
                 }
                 ids::OPEN_SETTINGS => {
                     self.tab = Tab::Settings;
-                    Self::show_window(ctx);
+                    self.show_window(ctx);
                 }
                 ids::QUIT => {
                     // Signal the sync thread to attempt a final flush (auto-batch
@@ -399,6 +452,9 @@ impl SinusApp {
         }
     }
 
+    #[cfg(test)]
+    fn handle_menu_events(&mut self, _ctx: &egui::Context) {}
+
     fn current_tray_state(&mut self) -> TrayState {
         let now = Utc::now();
         self.pause = self.pause.normalized(now);
@@ -406,7 +462,9 @@ impl SinusApp {
         // state (SPEC §6 tray "⚠"), shown ahead of the plain listening glyph.
         match self.mode {
             Mode::OfflineStrict => TrayState::Offline,
-            _ if self.pause.is_paused(now) => TrayState::Paused,
+            _ if self.pause.is_paused(now) || self.shared.low_power() || self.shared.quiet() => {
+                TrayState::Paused
+            }
             _ if self.shared.model() == ModelStatus::Missing => TrayState::Warning,
             _ => TrayState::Listening,
         }
@@ -432,9 +490,32 @@ impl SinusApp {
     #[cfg(test)]
     fn update_tray_status(&mut self) {}
 
+    fn refresh_history_if_needed(&mut self, now: chrono::DateTime<Utc>) {
+        let generation = self.shared.history_generation();
+        let day = now.date_naive();
+        let stale = self
+            .history
+            .refreshed_at
+            .is_none_or(|at| at.elapsed() >= std::time::Duration::from_secs(60));
+        if self.history.generation == generation && self.history.day == Some(day) && !stale {
+            return;
+        }
+
+        self.history.today = state::today_counts(&self.store, now);
+        self.history.histogram = state::daily_histogram(&self.store, 7, now);
+        self.history.recent = self
+            .store
+            .recent_events(now - chrono::Duration::days(7), now)
+            .unwrap_or_default();
+        self.history.generation = generation;
+        self.history.day = Some(day);
+        self.history.refreshed_at = Some(std::time::Instant::now());
+    }
+
     fn draw_history(&mut self, ui: &mut egui::Ui) {
         let now = Utc::now();
-        let today = state::today_counts(&self.store, now);
+        self.refresh_history_if_needed(now);
+        let today = &self.history.today;
 
         ui.heading("Today");
         ui.horizontal_wrapped(|ui| {
@@ -460,12 +541,12 @@ impl SinusApp {
             / 60.0;
         ui.label(format!(
             "congestion score: {:.2} / monitored hour",
-            state::congestion_score(&today, monitored_hours.max(0.1))
+            state::congestion_score(today, monitored_hours.max(0.1))
         ));
 
         ui.separator();
         ui.heading("Last 7 days");
-        let hist = state::daily_histogram(&self.store, 7, now);
+        let hist = &self.history.histogram;
         let dark = ui.visuals().dark_mode;
         let surface = ui.visuals().panel_fill;
 
@@ -578,10 +659,9 @@ impl SinusApp {
             );
         }
 
-        let start = now - chrono::Duration::days(7);
         // Flagged events stay in this list (struck through, with an undo) even
         // though they are excluded from every count above.
-        let events = self.store.recent_events(start, now).unwrap_or_default();
+        let events = &self.history.recent;
         let mut action: Option<HistoryAction> = None;
         egui::ScrollArea::vertical()
             .max_height(220.0)
@@ -682,6 +762,7 @@ impl SinusApp {
                 .lost_focus()
             {
                 let _ = self.store.setting_set("server_url", &self.form.server_url);
+                self.shared.notify_sync();
             }
         });
         ui.horizontal(|ui| {
@@ -695,6 +776,7 @@ impl SinusApp {
                 if trimmed.is_empty() || trimmed.parse::<i64>().is_ok_and(|id| id > 0) {
                     self.form.patient_id = trimmed;
                     let _ = self.store.setting_set("patient_id", &self.form.patient_id);
+                    self.shared.notify_sync();
                     self.form.token_message.clear();
                 } else {
                     self.form.token_message =
@@ -749,6 +831,24 @@ impl SinusApp {
             // Only once the drag settles — syncing on every tick would push a
             // document per frame.
             self.shared.request_sync_now();
+        }
+        if ui
+            .checkbox(
+                &mut self.form.pause_on_low_power,
+                "Pause microphone while OS low-power mode is active",
+            )
+            .on_hover_text("Releases the microphone and resumes automatically")
+            .changed()
+        {
+            let _ = self.store.setting_set(
+                "pause_low_power",
+                if self.form.pause_on_low_power {
+                    "true"
+                } else {
+                    "false"
+                },
+            );
+            self.shared.request_settings_reload();
         }
         ui.label(
             "Sensitivity and quiet hours sync with the PHR, so they follow you between \
@@ -1070,7 +1170,7 @@ impl eframe::App for SinusApp {
 
         if self.instance.take_activation_request() {
             self.tab = Tab::History;
-            Self::show_window(ctx);
+            self.show_window(ctx);
         }
         self.update_tray_status();
 
@@ -1079,6 +1179,15 @@ impl eframe::App for SinusApp {
         if ctx.input(|input| input.viewport().close_requested()) && !self.shared.quitting() {
             ctx.send_viewport_cmd(egui::ViewportCommand::CancelClose);
             ctx.send_viewport_cmd(egui::ViewportCommand::Visible(false));
+            self.window_visible = false;
+        }
+
+        // The tray and workers are event-driven. While hidden, avoid constructing
+        // panels/charts or touching SQLite; this slow tick only preserves the
+        // file-based second-instance activation fallback.
+        if !self.window_visible {
+            ctx.request_repaint_after(std::time::Duration::from_secs(5));
+            return;
         }
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
@@ -1107,6 +1216,10 @@ impl eframe::App for SinusApp {
                     ui.separator();
                     ui.label("🌙 quiet hours");
                 }
+                if self.shared.low_power() {
+                    ui.separator();
+                    ui.label("🔋 low-power pause");
+                }
                 if let Some(rem) = self.pause.remaining(Utc::now()) {
                     ui.separator();
                     ui.label(format!("paused {}m", rem.num_minutes() + 1));
@@ -1123,9 +1236,16 @@ impl eframe::App for SinusApp {
             }
         });
 
-        // Event-driven repaint only (SPEC §9): request a slow tick so counts and
-        // pause countdown stay fresh without a busy render loop.
-        ctx.request_repaint_after(std::time::Duration::from_secs(1));
+        // Data changes request repaint through SharedStatus. A minute tick keeps
+        // the monitored-hours label/date boundary fresh without a render loop;
+        // timed pause expiry gets one precise wake at its deadline.
+        let mut next = std::time::Duration::from_secs(60);
+        if let Some(remaining) = self.pause.remaining(Utc::now()) {
+            if let Ok(remaining) = remaining.to_std() {
+                next = next.min(remaining);
+            }
+        }
+        ctx.request_repaint_after(next.max(std::time::Duration::from_millis(1)));
     }
 }
 
