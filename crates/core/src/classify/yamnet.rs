@@ -61,7 +61,7 @@ impl YamnetOnnx {
             )));
         }
         let build = || -> ort::Result<Session> {
-            let mut builder = Session::builder()?
+            let builder = Session::builder()?
                 .with_optimization_level(GraphOptimizationLevel::Level3)?
                 // YAMNet patches arrive only twice per second while the gate is
                 // open. A many-core pool saves little latency but wakes the whole
@@ -69,11 +69,12 @@ impl YamnetOnnx {
                 .with_intra_threads(1)?
                 .with_inter_threads(1)?;
             #[cfg(target_os = "macos")]
-            let mut builder = builder.with_execution_providers([ort::ep::CoreML::default()
+            let builder = builder.with_execution_providers([ort::ep::CoreML::default()
                 .with_compute_units(ort::ep::coreml::ComputeUnits::CPUAndNeuralEngine)
                 .with_model_format(ort::ep::coreml::ModelFormat::MLProgram)
                 .with_static_input_shapes(true)
                 .build()])?;
+            let mut builder = builder;
             builder.commit_from_file(path)
         };
         let session = build().map_err(|e| {
