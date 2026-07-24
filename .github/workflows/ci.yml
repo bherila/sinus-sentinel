@@ -32,6 +32,8 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: cargo clippy -p sinus-core -p sinus-cli --all-targets -- -D warnings
       - run: cargo test -p sinus-core -p sinus-cli
+      - name: 10-minute quiet-room pipeline soak
+        run: cargo run --release -p sinus-cli -- soak --secs 600
       - name: onnx feature compile-check
         run: cargo build -p sinus-core --features onnx
 

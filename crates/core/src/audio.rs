@@ -139,38 +139,56 @@ pub fn write_wav_16k_mono(path: impl AsRef<std::path::Path>, samples: &[f32]) ->
 pub struct RubatoResampler {
     inner: rubato::FastFixedIn<f32>,
     chunk: usize,
-    in_buf: Vec<f32>,
+    in_buf: std::collections::VecDeque<f32>,
+    input_chunk: Vec<f32>,
+    output: Vec<Vec<f32>>,
 }
 
 #[cfg(feature = "live-audio")]
 impl RubatoResampler {
     pub fn new(from: u32, to: u32) -> Result<Self> {
-        use rubato::{FastFixedIn, PolynomialDegree};
+        use rubato::{FastFixedIn, PolynomialDegree, Resampler};
         let chunk = 1024;
         let ratio = to as f64 / from as f64;
         let inner = FastFixedIn::<f32>::new(ratio, 1.1, PolynomialDegree::Linear, chunk, 1)
             .map_err(|e| Error::Audio(format!("rubato init: {e}")))?;
+        let output = inner.output_buffer_allocate(true);
         Ok(RubatoResampler {
             inner,
             chunk,
-            in_buf: Vec::new(),
+            in_buf: std::collections::VecDeque::new(),
+            input_chunk: vec![0.0; chunk],
+            output,
         })
     }
 
     /// Push input samples; returns any resampled output produced from full chunks.
     pub fn push(&mut self, input: &[f32]) -> Result<Vec<f32>> {
+        let mut output = Vec::new();
+        self.push_into(input, &mut output)?;
+        Ok(output)
+    }
+
+    /// Allocation-reusing live variant. `output` is appended to and may be reused
+    /// by the caller across every microphone read.
+    pub fn push_into(&mut self, input: &[f32], output: &mut Vec<f32>) -> Result<()> {
         use rubato::Resampler;
-        self.in_buf.extend_from_slice(input);
-        let mut out = Vec::new();
+        self.in_buf.extend(input.iter().copied());
         while self.in_buf.len() >= self.chunk {
-            let chunk: Vec<f32> = self.in_buf.drain(..self.chunk).collect();
-            let resampled = self
+            for slot in &mut self.input_chunk {
+                *slot = self.in_buf.pop_front().expect("length checked above");
+            }
+            let (_, written) = self
                 .inner
-                .process(&[chunk], None)
+                .process_into_buffer(
+                    std::slice::from_ref(&self.input_chunk),
+                    &mut self.output,
+                    None,
+                )
                 .map_err(|e| Error::Audio(format!("rubato process: {e}")))?;
-            out.extend_from_slice(&resampled[0]);
+            output.extend_from_slice(&self.output[0][..written]);
         }
-        Ok(out)
+        Ok(())
     }
 }
 
@@ -182,6 +200,8 @@ pub struct CpalAudioSource {
     consumer: ringbuf::HeapCons<f32>,
     resampler: Option<RubatoResampler>,
     pending: std::collections::VecDeque<f32>,
+    drained: Vec<f32>,
+    resampled: Vec<f32>,
     _stream: cpal::Stream,
 }
 
@@ -192,6 +212,8 @@ impl CpalAudioSource {
     pub fn open_default() -> Result<Self> {
         use cpal::traits::{DeviceTrait, HostTrait};
         use ringbuf::traits::{Producer, Split};
+        use std::sync::atomic::{AtomicUsize, Ordering};
+        use std::sync::Arc;
 
         let host = cpal::default_host();
         let device = host
@@ -206,6 +228,10 @@ impl CpalAudioSource {
         // 3 s ring buffer at the device rate (SPEC §4.1).
         let rb = ringbuf::HeapRb::<f32>::new((device_rate as usize) * 3);
         let (mut producer, consumer) = rb.split();
+        let capture_thread = std::thread::current();
+        let samples_since_wake = Arc::new(AtomicUsize::new(0));
+        let callback_wake_count = Arc::clone(&samples_since_wake);
+        let wake_after = (device_rate as usize / 20).max(1);
 
         let err_fn = |e| eprintln!("cpal stream error: {e}");
         let stream = match config.sample_format() {
@@ -213,9 +239,16 @@ impl CpalAudioSource {
                 &config.into(),
                 move |data: &[f32], _: &cpal::InputCallbackInfo| {
                     // Real-time-safe: downmix + push only.
+                    let mut frames = 0usize;
                     for frame in data.chunks(channels) {
                         let mono = frame.iter().sum::<f32>() / channels as f32;
                         let _ = producer.try_push(mono);
+                        frames += 1;
+                    }
+                    let accumulated = callback_wake_count.fetch_add(frames, Ordering::Relaxed);
+                    if accumulated + frames >= wake_after {
+                        callback_wake_count.store(0, Ordering::Relaxed);
+                        capture_thread.unpark();
                     }
                 },
                 err_fn,
@@ -244,6 +277,8 @@ impl CpalAudioSource {
             consumer,
             resampler,
             pending: std::collections::VecDeque::new(),
+            drained: Vec::with_capacity((device_rate as usize / 20).max(1024)),
+            resampled: Vec::with_capacity(SAMPLE_RATE as usize / 20),
             _stream: stream,
         })
     }
@@ -254,22 +289,36 @@ impl AudioSource for CpalAudioSource {
     fn read(&mut self, out: &mut [f32]) -> Result<usize> {
         use ringbuf::traits::Consumer;
 
-        // Drain whatever the callback has queued.
-        let mut drained: Vec<f32> = Vec::new();
-        while let Some(s) = self.consumer.try_pop() {
-            drained.push(s);
-        }
-        let sixteen_k = match &mut self.resampler {
-            Some(r) => r.push(&drained)?,
-            None => drained,
-        };
-        self.pending.extend(sixteen_k);
+        // One gate hop per worker wake keeps latency at 50 ms while avoiding the
+        // old 20 ms polling loop. A timeout lets control changes and broken audio
+        // devices return to the outer loop even if callbacks stop entirely.
+        let target = out.len().min(SAMPLE_RATE as usize / 20).max(1);
+        let deadline = std::time::Instant::now() + std::time::Duration::from_millis(250);
+        loop {
+            self.drained.clear();
+            while let Some(sample) = self.consumer.try_pop() {
+                self.drained.push(sample);
+            }
+            if let Some(resampler) = &mut self.resampler {
+                self.resampled.clear();
+                resampler.push_into(&self.drained, &mut self.resampled)?;
+                self.pending.extend(self.resampled.iter().copied());
+            } else {
+                self.pending.extend(self.drained.iter().copied());
+            }
 
-        let n = out.len().min(self.pending.len());
-        for slot in out.iter_mut().take(n) {
-            *slot = self.pending.pop_front().unwrap();
+            if self.pending.len() >= target || std::time::Instant::now() >= deadline {
+                let n = out.len().min(self.pending.len());
+                for slot in out.iter_mut().take(n) {
+                    *slot = self.pending.pop_front().expect("length checked above");
+                }
+                return Ok(n);
+            }
+
+            std::thread::park_timeout(
+                deadline.saturating_duration_since(std::time::Instant::now()),
+            );
         }
-        Ok(n)
     }
 }
 

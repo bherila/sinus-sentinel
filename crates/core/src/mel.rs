@@ -110,6 +110,14 @@ pub struct MelFrontend {
     r2c: std::sync::Arc<dyn realfft::RealToComplex<f32>>,
 }
 
+/// Reusable FFT work buffers for the streaming path. Keeping one of these in
+/// the stream state avoids two heap allocations for every 10 ms mel frame.
+pub struct MelScratch {
+    indata: Vec<f32>,
+    spectrum: Vec<Complex<f32>>,
+    mag: [f32; N_SPEC_BINS],
+}
+
 impl MelFrontend {
     pub fn new(sample_rate: u32) -> Self {
         let mut planner = RealFftPlanner::<f32>::new();
@@ -151,14 +159,33 @@ impl MelFrontend {
 
     /// Compute one log-mel frame from exactly [`FRAME_LEN`] samples. Used by the
     /// streaming pipeline, which carries a remainder buffer across `push` calls so
-    /// no frame is dropped at a chunk boundary (SPEC §4.1 ②). Allocates its own
-    /// scratch; batch callers should prefer [`Self::log_mel_frames`].
+    /// no frame is dropped at a chunk boundary (SPEC §4.1 ②).
     pub fn log_mel_frame(&self, frame: &[f32]) -> [f32; N_MEL] {
+        let mut scratch = self.make_scratch();
+        self.log_mel_frame_with_scratch(frame, &mut scratch)
+    }
+
+    pub fn make_scratch(&self) -> MelScratch {
+        MelScratch {
+            indata: self.r2c.make_input_vec(),
+            spectrum: self.r2c.make_output_vec(),
+            mag: [0.0; N_SPEC_BINS],
+        }
+    }
+
+    /// Streaming variant that reuses caller-owned FFT work buffers.
+    pub fn log_mel_frame_with_scratch(
+        &self,
+        frame: &[f32],
+        scratch: &mut MelScratch,
+    ) -> [f32; N_MEL] {
         debug_assert_eq!(frame.len(), FRAME_LEN);
-        let mut indata = self.r2c.make_input_vec();
-        let mut spectrum = self.r2c.make_output_vec();
-        let mut mag = [0.0f32; N_SPEC_BINS];
-        self.mel_row(frame, &mut indata, &mut spectrum, &mut mag)
+        self.mel_row(
+            frame,
+            &mut scratch.indata,
+            &mut scratch.spectrum,
+            &mut scratch.mag,
+        )
     }
 
     /// The shared inner STFT→mel→log computation for one frame (SPEC §4.1 ②). The
