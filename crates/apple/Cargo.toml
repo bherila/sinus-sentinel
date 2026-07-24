@@ -1,0 +1,18 @@
+[package]
+name = "sinus-apple"
+version = "0.3.0-alpha"
+edition.workspace = true
+publish = false
+
+[lib]
+crate-type = ["lib", "cdylib", "staticlib"]
+
+[dependencies]
+sinus-core.workspace = true
+sinus-app.workspace = true
+chrono.workspace = true
+thiserror.workspace = true
+uniffi.workspace = true
+
+[dev-dependencies]
+uuid.workspace = true

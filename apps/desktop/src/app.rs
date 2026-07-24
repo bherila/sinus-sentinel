@@ -14,7 +14,7 @@ use sinus_core::types::{Event, EventType};
 
 use crate::instance::InstanceGuard;
 use crate::shared::{ModelStatus, SharedStatus, TeachState};
-use crate::state::{self, PauseState};
+use sinus_app::state::{self, PauseState};
 
 /// Menu item ids.
 #[cfg_attr(test, allow(dead_code))]

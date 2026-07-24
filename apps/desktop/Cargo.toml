@@ -24,6 +24,7 @@ keyring = ["sinus-core/keyring"]
 
 [dependencies]
 sinus-core = { path = "../../crates/core" }
+sinus-app.workspace = true
 chrono.workspace = true
 uuid.workspace = true
 eframe.workspace = true

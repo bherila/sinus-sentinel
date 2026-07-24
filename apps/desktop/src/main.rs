@@ -11,7 +11,6 @@ mod instance;
 #[cfg(feature = "live-audio")]
 mod power;
 mod shared;
-mod state;
 mod sync;
 
 use std::path::PathBuf;
