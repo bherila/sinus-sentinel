@@ -25,7 +25,9 @@ use crate::classify::native::AudiosetMap;
 use crate::classify::proto::PrototypeMatcher;
 use crate::error::Result;
 use crate::gate::{Gate, GateEdge};
-use crate::mel::{MelFrontend, MelPatch, HOP_LEN, N_MEL, PATCH_FRAMES, PATCH_HOP_FRAMES};
+use crate::mel::{
+    MelFrontend, MelPatch, MelScratch, FRAME_LEN, HOP_LEN, N_MEL, PATCH_FRAMES, PATCH_HOP_FRAMES,
+};
 use crate::session::{DetectedEvent, SessionConfig, Sessionizer, WindowLevels, WindowObservation};
 use crate::types::{Event, EventType, Source};
 
@@ -98,21 +100,28 @@ struct StreamState {
     /// Absolute hop indices of gate opening edges (rolling; pruned with hops).
     open_edges: VecDeque<usize>,
 
-    /// Samples not yet consumed into mel frames (carries the STFT overlap remainder
-    /// across pushes so no frame is dropped at a boundary — SPEC §4.1 ②).
-    mel_buf: Vec<f32>,
+    /// Rolling raw audio retained until the gate has enough look-ahead to decide
+    /// whether a classifier patch is active. Quiet patches never run an FFT; when
+    /// the gate opens this buffer supplies the required one-second pre-roll.
+    raw_samples: VecDeque<f32>,
+    raw_base_sample: usize,
+    total_samples: usize,
     /// Absolute index of the next mel frame to emit.
     next_frame: usize,
-    /// Rolling log-mel frames, `frames[0]` at absolute frame index `frames_base`.
-    frames: VecDeque<[f32; N_MEL]>,
+    /// Lazy rolling log-mel frames. `None` means the frame is available in
+    /// `raw_samples` but has not consumed DSP because no active patch needed it.
+    frames: VecDeque<Option<[f32; N_MEL]>>,
     frames_base: usize,
+    mel_scratch: MelScratch,
+    #[cfg(test)]
+    mel_frames_computed: usize,
 
     /// Absolute index of the next patch to finalize.
     next_patch: usize,
 }
 
 impl StreamState {
-    fn new(cfg: &PipelineConfig) -> Self {
+    fn new(cfg: &PipelineConfig, mel: &MelFrontend) -> Self {
         StreamState {
             gate: Gate::new(cfg.gate.clone()),
             sessionizer: Sessionizer::new(cfg.session.clone()),
@@ -124,10 +133,15 @@ impl StreamState {
             hops_floor: VecDeque::new(),
             hops_base: 0,
             open_edges: VecDeque::new(),
-            mel_buf: Vec::new(),
+            raw_samples: VecDeque::new(),
+            raw_base_sample: 0,
+            total_samples: 0,
             next_frame: 0,
             frames: VecDeque::new(),
             frames_base: 0,
+            mel_scratch: mel.make_scratch(),
+            #[cfg(test)]
+            mel_frames_computed: 0,
             next_patch: 0,
         }
     }
@@ -156,26 +170,42 @@ impl StreamState {
         self.gate_buf.drain(..consumed);
     }
 
-    /// Drain `mel_buf` into log-mel frames (SPEC §4.1 ②), advancing by `HOP_LEN`
-    /// and retaining the `FRAME_LEN - HOP_LEN` overlap remainder for the next push.
-    fn push_mel_samples(&mut self, mel: &MelFrontend, samples: &[f32]) {
-        self.mel_buf.extend_from_slice(samples);
-        let mut pos = 0;
-        while self.mel_buf.len() - pos >= crate::mel::FRAME_LEN {
-            let row = mel.log_mel_frame(&self.mel_buf[pos..pos + crate::mel::FRAME_LEN]);
-            self.frames.push_back(row);
+    /// Retain raw samples and advance the *logical* mel-frame clock. Actual
+    /// log-mel/FFT work is lazy and happens only if the energy gate marks a patch
+    /// active. This makes quiet-room work gate-only while preserving exact pre-roll.
+    fn push_raw_samples(&mut self, samples: &[f32]) {
+        self.raw_samples.extend(samples.iter().copied());
+        self.total_samples += samples.len();
+        while self.total_samples >= self.next_frame * HOP_LEN + FRAME_LEN {
+            self.frames.push_back(None);
             self.next_frame += 1;
-            pos += HOP_LEN;
         }
-        self.mel_buf.drain(..pos);
     }
 
     /// Assemble the 96-frame patch starting at absolute frame `frame_start`.
-    fn assemble_patch(&self, frame_start: usize) -> MelPatch {
+    fn assemble_patch(&mut self, mel: &MelFrontend, frame_start: usize) -> MelPatch {
         let mut data = Vec::with_capacity(PATCH_FRAMES * N_MEL);
         for i in 0..PATCH_FRAMES {
-            let rel = frame_start + i - self.frames_base;
-            data.extend_from_slice(&self.frames[rel]);
+            let absolute_frame = frame_start + i;
+            let rel = absolute_frame - self.frames_base;
+            if self.frames[rel].is_none() {
+                let absolute_sample = absolute_frame * HOP_LEN;
+                let raw_offset = absolute_sample - self.raw_base_sample;
+                let mut frame = [0.0f32; FRAME_LEN];
+                for (slot, sample) in frame
+                    .iter_mut()
+                    .zip(self.raw_samples.iter().skip(raw_offset).take(FRAME_LEN))
+                {
+                    *slot = *sample;
+                }
+                self.frames[rel] =
+                    Some(mel.log_mel_frame_with_scratch(&frame, &mut self.mel_scratch));
+                #[cfg(test)]
+                {
+                    self.mel_frames_computed += 1;
+                }
+            }
+            data.extend_from_slice(self.frames[rel].as_ref().expect("frame computed above"));
         }
         MelPatch {
             frames: PATCH_FRAMES,
@@ -279,6 +309,12 @@ impl StreamState {
             self.frames.pop_front();
             self.frames_base += 1;
         }
+        let sample_keep_from = frame_keep_from * HOP_LEN;
+        let drop_samples = sample_keep_from
+            .saturating_sub(self.raw_base_sample)
+            .min(self.raw_samples.len());
+        self.raw_samples.drain(..drop_samples);
+        self.raw_base_sample += drop_samples;
     }
 }
 
@@ -342,7 +378,7 @@ impl<E: Embedder> Pipeline<E> {
     /// whole buffer, then flush. Produces the same windows/events as feeding the
     /// same samples through a [`StreamingPipeline`] in arbitrary chunks.
     pub fn process(&self, samples: &[f32]) -> Result<PipelineResult> {
-        let mut st = StreamState::new(&self.cfg);
+        let mut st = StreamState::new(&self.cfg, &self.mel);
         let mut out = self.stream_advance(&mut st, samples)?;
         let tail = self.stream_flush(&mut st)?;
         out.windows.extend(tail.windows);
@@ -358,7 +394,7 @@ impl<E: Embedder> Pipeline<E> {
     /// resolve the pre-roll extension deterministically.
     fn stream_advance(&self, st: &mut StreamState, samples: &[f32]) -> Result<StreamOutput> {
         st.push_gate_samples(samples);
-        st.push_mel_samples(&self.mel, samples);
+        st.push_raw_samples(samples);
         let mut out = StreamOutput::default();
         self.finalize_ready(st, false, &mut out)?;
         Ok(out)
@@ -425,7 +461,7 @@ impl<E: Embedder> Pipeline<E> {
                     hit: None,
                 });
             } else {
-                let patch = st.assemble_patch(frame_start);
+                let patch = st.assemble_patch(&self.mel, frame_start);
                 let features = self.embedder.embed(&patch, energy_peak)?;
                 let native = match &features.audioset_scores {
                     Some(a) => self.audioset_map.native_scores(a),
@@ -551,11 +587,9 @@ pub struct StreamingPipeline<E: Embedder> {
 
 impl<E: Embedder> StreamingPipeline<E> {
     pub fn new(cfg: PipelineConfig, embedder: E) -> Self {
-        let state = StreamState::new(&cfg);
-        StreamingPipeline {
-            inner: Pipeline::new(cfg, embedder),
-            state,
-        }
+        let inner = Pipeline::new(cfg, embedder);
+        let state = StreamState::new(&inner.cfg, &inner.mel);
+        StreamingPipeline { inner, state }
     }
 
     /// Attach a prototype matcher for the enrolled custom classes (SPEC §5 B-lite).
@@ -579,6 +613,13 @@ impl<E: Embedder> StreamingPipeline<E> {
     /// Retune detection sensitivity without restarting the microphone stream.
     pub fn set_sensitivity(&mut self, sensitivity: f32) {
         self.inner.set_sensitivity(sensitivity);
+    }
+
+    /// Start a fresh sample-clock/gate/session stream while retaining the loaded
+    /// model and personalized prototypes. Used after a real microphone pause so
+    /// events cannot merge across an unmonitored gap.
+    pub fn reset_stream(&mut self) {
+        self.state = StreamState::new(&self.inner.cfg, &self.inner.mel);
     }
 
     /// Whether the energy gate is currently open — i.e. the app is analyzing a
@@ -609,6 +650,11 @@ impl<E: Embedder> StreamingPipeline<E> {
     pub fn gate_floor_db(&self) -> f32 {
         self.state.gate.floor_db()
     }
+
+    #[cfg(test)]
+    fn mel_frames_computed(&self) -> usize {
+        self.state.mel_frames_computed
+    }
 }
 
 #[cfg(test)]
@@ -627,6 +673,20 @@ mod tests {
         let result = pipe.process(&silence).unwrap();
         assert!(result.events.is_empty());
         assert!(result.windows.iter().all(|w| !w.active));
+    }
+
+    #[test]
+    fn closed_gate_skips_all_mel_fft_work() {
+        let mut pipeline = StreamingPipeline::new(PipelineConfig::default(), BandHeuristicEmbedder);
+        for chunk in synth::silence(16_000 * 30).chunks(777) {
+            assert!(pipeline.push(chunk).unwrap().is_empty());
+        }
+        assert!(pipeline.flush().unwrap().is_empty());
+        assert_eq!(
+            pipeline.mel_frames_computed(),
+            0,
+            "quiet-room processing must remain gate-only"
+        );
     }
 
     /// Loudness is recorded, and a loud event is measurably louder than a quiet

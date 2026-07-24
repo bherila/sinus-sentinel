@@ -30,3 +30,9 @@ eframe.workspace = true
 egui.workspace = true
 egui_plot.workspace = true
 tray-icon.workspace = true
+
+[target.'cfg(target_os = "macos")'.dependencies]
+objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSProcessInfo"] }
+
+[target.'cfg(target_os = "windows")'.dependencies]
+windows-sys = { version = "0.61", features = ["Win32_System_Power"] }

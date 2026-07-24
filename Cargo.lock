@@ -4224,9 +4224,11 @@ dependencies = [
  "eframe",
  "egui",
  "egui_plot",
+ "objc2-foundation 0.3.2",
  "sinus-core",
  "tray-icon",
  "uuid",
+ "windows-sys 0.61.2",
 ]
 
 [[package]]

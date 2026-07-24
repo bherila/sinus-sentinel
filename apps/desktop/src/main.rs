@@ -8,6 +8,8 @@ mod app;
 #[cfg(feature = "live-audio")]
 mod capture;
 mod instance;
+#[cfg(feature = "live-audio")]
+mod power;
 mod shared;
 mod state;
 mod sync;
@@ -54,8 +56,8 @@ fn main() -> eframe::Result<()> {
         std::process::exit(1);
     });
 
-    // Shared, lock-free status bus between the capture/sync worker threads and the
-    // tray/UI (SPEC §6). Cloned into each thread; the same cells are observed.
+    // Shared status and wake bus between the capture/sync worker threads and the
+    // tray/UI (SPEC §6). Cloned into each thread; the same state is observed.
     let shared = shared::SharedStatus::default();
 
     // The background sync thread drives SyncEngine off the UI thread (SPEC §4.3).

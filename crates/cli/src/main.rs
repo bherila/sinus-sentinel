@@ -3,8 +3,8 @@
 //!
 //! - `classify <file.wav>` — per-window scores + final sessionized events.
 //! - `enroll <db> <class> <file.wav>` — store local prototype embeddings.
-//! - `soak [--secs N]` — quiet-room CPU soak: gate over N s of silence must never
-//!   open (SPEC §9).
+//! - `soak [--secs N]` — quiet-room CPU soak: the complete streaming pipeline
+//!   over N s of silence must remain gate-only (SPEC §9).
 //! - `calibrate <dir>` — derive per-class thresholds from a labeled corpus.
 //! - `gen-testdata <dir>` — write the synthetic golden corpus (clearly synthetic).
 
@@ -15,9 +15,9 @@ use std::process::ExitCode;
 use sinus_core::audio::{write_wav_16k_mono, AudioSource, BufferedAudioSource};
 use sinus_core::classify::embed::{BandHeuristicEmbedder, Embedder, WindowFeatures};
 use sinus_core::classify::proto::PrototypeMatcher;
-use sinus_core::gate::{Gate, GateConfig};
+use sinus_core::gate::GateConfig;
 use sinus_core::mel::{loudest_patch, MelPatch};
-use sinus_core::pipeline::{Pipeline, PipelineConfig, PipelineResult};
+use sinus_core::pipeline::{Pipeline, PipelineConfig, PipelineResult, StreamingPipeline};
 use sinus_core::store::Store;
 use sinus_core::synth;
 use sinus_core::types::EventType;
@@ -351,34 +351,38 @@ fn cmd_soak(args: &[String]) -> Result<(), String> {
 
     let cfg = GateConfig::default();
     let hop = cfg.hop_samples();
-    let mut gate = Gate::new(cfg.clone());
+    let mut pipeline = StreamingPipeline::new(PipelineConfig::default(), BandHeuristicEmbedder);
     // Very-low-level noise stands in for a "quiet room" (not digital-zero).
     let silence_hop = synth::white_noise(hop, 0.0005, 12345);
 
     let total_hops = (secs * cfg.sample_rate as u64) / hop as u64;
     let start = std::time::Instant::now();
-    let mut opens = 0u64;
+    let mut open_hops = 0u64;
+    let mut events = Vec::new();
     for _ in 0..total_hops {
-        let r = gate.process_hop(&silence_hop);
-        if r.open {
-            opens += 1;
+        events.extend(pipeline.push(&silence_hop).map_err(|e| e.to_string())?);
+        if pipeline.gate_open() {
+            open_hops += 1;
         }
     }
+    events.extend(pipeline.flush().map_err(|e| e.to_string())?);
     let elapsed = start.elapsed();
 
     println!("soak: {secs}s silence, {total_hops} hops");
-    println!("  gate opens: {opens} (want 0)");
+    println!("  gate-open hops: {open_hops} (want 0)");
+    println!("  events: {} (want 0)", events.len());
     println!(
         "  processing wall time: {:.3}s ({:.0} hops/s)",
         elapsed.as_secs_f64(),
         total_hops as f64 / elapsed.as_secs_f64().max(1e-9)
     );
-    if opens > 0 {
+    if open_hops > 0 || !events.is_empty() {
         return Err(format!(
-            "gate opened {opens} times on silence — quiet-room budget violated"
+            "quiet-room budget violated: {open_hops} open hops, {} events",
+            events.len()
         ));
     }
-    println!("  OK: gate stayed closed the entire soak");
+    println!("  OK: full pipeline stayed gate-only for the entire soak");
     Ok(())
 }
 
