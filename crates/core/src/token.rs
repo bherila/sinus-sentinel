@@ -36,6 +36,24 @@ impl TokenStore for Box<dyn TokenStore> {
     }
 }
 
+/// Forward the trait through an `Arc`, so a driver that rebuilds its engine on
+/// every mode/config change can clone the token store instead of
+/// re-constructing it — which matters because a keychain-backed store holds a
+/// cache that a fresh construction would not share.
+impl<T: TokenStore + ?Sized> TokenStore for std::sync::Arc<T> {
+    fn get_token(&self) -> Result<Option<String>> {
+        (**self).get_token()
+    }
+
+    fn set_token(&self, token: &str) -> Result<()> {
+        (**self).set_token(token)
+    }
+
+    fn clear(&self) -> Result<()> {
+        (**self).clear()
+    }
+}
+
 /// In-memory token store for tests and ephemeral use.
 #[derive(Debug, Default)]
 pub struct InMemoryTokenStore {

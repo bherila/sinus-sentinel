@@ -9,4 +9,5 @@ pub mod instance;
 pub mod monitor;
 pub mod settings;
 pub mod state;
+pub mod sync;
 pub mod teach;

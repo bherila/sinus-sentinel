@@ -168,27 +168,14 @@ impl SinusApp {
             receiver
         };
         let sensitivity = settings::sensitivity(&store);
-        let server_url = store
-            .setting_get("server_url")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let server_url = settings::server_url(&store);
         let pause_on_low_power = settings::pause_on_low_power(&store);
-        let patient_id = store
-            .setting_get("patient_id")
-            .ok()
-            .flatten()
+        // The form field is a `String` for editing; the typed accessor's
+        // `None` (absent/invalid) just becomes an empty field.
+        let patient_id = settings::patient_id(&store)
+            .map(|id| id.to_string())
             .unwrap_or_default();
-        let mode = store
-            .setting_get("mode")
-            .ok()
-            .flatten()
-            .map(|s| match s.as_str() {
-                "offline-first" => Mode::OfflineFirst,
-                "offline-strict" => Mode::OfflineStrict,
-                _ => Mode::AutoBatch,
-            })
-            .unwrap_or(Mode::AutoBatch);
+        let mode = settings::mode(&store);
         let device_id = settings::ensure_device_id(&store);
 
         SinusApp {
@@ -224,7 +211,7 @@ impl SinusApp {
 
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
-        let _ = self.store.setting_set("mode", mode.as_str());
+        let _ = settings::set_mode(&self.store, mode);
         self.shared.notify_sync();
     }
 
@@ -707,7 +694,7 @@ impl SinusApp {
                 .text_edit_singleline(&mut self.form.server_url)
                 .lost_focus()
             {
-                let _ = self.store.setting_set("server_url", &self.form.server_url);
+                let _ = settings::set_server_url(&self.store, &self.form.server_url);
                 self.shared.notify_sync();
             }
         });
@@ -719,9 +706,10 @@ impl SinusApp {
                 .lost_focus()
             {
                 let trimmed = self.form.patient_id.trim().to_string();
-                if trimmed.is_empty() || trimmed.parse::<i64>().is_ok_and(|id| id > 0) {
+                let parsed = trimmed.parse::<i64>().ok().filter(|id| *id > 0);
+                if trimmed.is_empty() || parsed.is_some() {
                     self.form.patient_id = trimmed;
-                    let _ = self.store.setting_set("patient_id", &self.form.patient_id);
+                    let _ = settings::set_patient_id(&self.store, parsed);
                     self.shared.notify_sync();
                     self.form.token_message.clear();
                 } else {
