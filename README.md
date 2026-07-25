@@ -53,7 +53,9 @@ make apple-macos-run
 
 The prototype uses an explicit monitoring-session model. On iPhone, the active
 recording session declares the audio background mode so it can continue through
-screen lock; this still needs real-device and App Review validation. Until a
+screen lock; this still needs real-device and App Review validation. As on the
+desktop, monitoring releases the microphone while the OS is in Low Power Mode and
+resumes by itself afterwards — both shells read the same setting. Until a
 compiled `apps/apple/Resources/yamnet.mlmodelc` is supplied, the UI uses a
 neutral preview model and deliberately emits no detections. See
 [the Apple architecture handoff](docs/APPLE_ARCHITECTURE.md).

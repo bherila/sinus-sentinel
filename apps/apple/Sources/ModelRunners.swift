@@ -47,8 +47,23 @@ final class CoreMLYamnetRunner: ModelRunner, @unchecked Sendable {
         )
     }
 
+    /// Copy an `MLMultiArray` out as `[Float]`.
+    ///
+    /// The subscript path boxes every element in an `NSNumber`; that is ~1,500
+    /// allocations per inference, and inference runs for every gate-active
+    /// analysis window. Read the backing storage directly for the contiguous
+    /// float32 case the contract specifies, and keep the slow path only as a
+    /// fallback for a model that was converted to some other layout or dtype.
     private static func floats(_ array: MLMultiArray, count: Int) -> [Float] {
-        (0..<min(count, array.count)).map { array[$0].floatValue }
+        let count = min(count, array.count)
+        let isContiguousFloat32 = array.dataType == .float32
+            && array.strides.last?.intValue == 1
+        guard isContiguousFloat32 else {
+            return (0..<count).map { array[$0].floatValue }
+        }
+        return array.withUnsafeBufferPointer(ofType: Float.self) { buffer in
+            Array(UnsafeBufferPointer(start: buffer.baseAddress, count: count))
+        }
     }
 }
 

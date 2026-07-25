@@ -15,11 +15,18 @@ apple-macos-run:
 apple-macos-build:
 	./scripts/apple-dev.sh macos build
 
-# Linux-safe contract check used before handing the branch to a Mac.
+# Regenerate the committed bindings from the cdylib and normalize them. Runs on
+# Linux (CI's drift gate) and on a Mac (where the same command must reproduce
+# byte-identical output, or the gate would only ever be satisfiable in CI) — hence
+# resolving the platform's shared-library extension rather than hardcoding `.so`.
+UNIFFI_LIB_EXT := $(if $(filter Darwin,$(shell uname -s)),dylib,so)
+UNIFFI_LIB := target/debug/libsinus_apple.$(UNIFFI_LIB_EXT)
+BINDGEN := target/debug/uniffi-bindgen-swift
+
 apple-bindings-check:
 	cargo build --locked -p sinus-apple
 	cargo build --locked -p uniffi-bindgen-swift
-	target/debug/uniffi-bindgen-swift --swift-sources target/debug/libsinus_apple.so apps/apple/Generated/Swift
-	target/debug/uniffi-bindgen-swift --headers target/debug/libsinus_apple.so apps/apple/Generated/Headers
-	target/debug/uniffi-bindgen-swift --modulemap --xcframework --module-name SinusAppleFFI --modulemap-filename module.modulemap target/debug/libsinus_apple.so apps/apple/Generated/Modules
+	$(BINDGEN) --swift-sources $(UNIFFI_LIB) apps/apple/Generated/Swift
+	$(BINDGEN) --headers $(UNIFFI_LIB) apps/apple/Generated/Headers
+	$(BINDGEN) --modulemap --xcframework --module-name SinusAppleFFI --modulemap-filename module.modulemap $(UNIFFI_LIB) apps/apple/Generated/Modules
 	./scripts/normalize-apple-bindings.sh apps/apple/Generated

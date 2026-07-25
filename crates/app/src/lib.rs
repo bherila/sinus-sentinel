@@ -5,4 +5,5 @@
 //! and history projections shared by every UI.
 
 pub mod monitor;
+pub mod settings;
 pub mod state;

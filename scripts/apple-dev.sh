@@ -89,12 +89,10 @@ swift_args=(
   -module-name SinusSentinel
   -I "$ffi_root"
   "$generated_root/SinusApple.swift"
-  "$source_root/AppModel.swift"
-  "$source_root/AudioMonitoringService.swift"
-  "$source_root/ContentView.swift"
-  "$source_root/HistoryChartView.swift"
-  "$source_root/ModelRunners.swift"
-  "$source_root/SinusSentinelApp.swift"
+  # Every app source, in glob (sorted) order — adding a file to Sources/ must not
+  # require editing this script, and a missed entry fails as a confusing
+  # "cannot find X in scope" rather than a missing-file error.
+  "$source_root"/*.swift
   "$rust_library"
   -framework AVFoundation
   -framework Charts

@@ -5,13 +5,28 @@ import SwiftUI
 
 @MainActor
 final class AppModel: ObservableObject {
-    @Published private(set) var isMonitoring = false
+    /// The user asked for a session. Capture may still be suspended — battery
+    /// policy suspends the microphone without discarding that intent, so the
+    /// session resumes by itself when the device leaves Low Power Mode.
+    @Published private(set) var sessionRequested = false
+    @Published private(set) var isCapturing = false
+    @Published private(set) var suspendedForLowPower = false
     @Published private(set) var snapshot: HistorySnapshot?
-    @Published private(set) var latestEvents: [AppleEvent] = []
     @Published var errorMessage: String?
+
+    @Published var pauseOnLowPower = true {
+        didSet {
+            guard pauseOnLowPower != oldValue else { return }
+            try? engine?.setPauseOnLowPower(enabled: pauseOnLowPower)
+            applyPowerPolicy()
+        }
+    }
+
+    var isLowPowerModeEnabled: Bool { power.isLowPower }
 
     private var audio: AudioMonitoringService?
     private var engine: AppleEngine?
+    private let power = LowPowerMonitor()
 
     init() {
         do {
@@ -28,20 +43,22 @@ final class AppModel: ObservableObject {
                 model: runner
             )
             let audio = AudioMonitoringService(engine: engine)
-            audio.onEvents = { [weak self] events in
+            audio.onEvents = { [weak self] _ in
                 Task { @MainActor in
-                    self?.latestEvents = events + (self?.latestEvents ?? [])
                     self?.refreshHistory()
                 }
             }
             audio.onFailure = { [weak self] message in
                 Task { @MainActor in
-                    self?.isMonitoring = false
-                    self?.errorMessage = message
+                    self?.handleCaptureFailure(message)
                 }
             }
             self.engine = engine
             self.audio = audio
+            pauseOnLowPower = (try? engine.pauseOnLowPower()) ?? true
+            power.onChange = { [weak self] _ in
+                self?.applyPowerPolicy()
+            }
             refreshHistory()
         } catch {
             errorMessage = error.localizedDescription
@@ -49,16 +66,20 @@ final class AppModel: ObservableObject {
     }
 
     func toggleMonitoring() {
-        if isMonitoring {
-            stopMonitoring()
-        } else {
-            Task {
-                guard await AudioMonitoringService.requestPermission() else {
-                    errorMessage = "Microphone access is required for a monitoring session."
-                    return
-                }
-                startMonitoring()
+        if sessionRequested {
+            sessionRequested = false
+            suspendedForLowPower = false
+            stopCapture()
+            return
+        }
+        Task {
+            guard await AudioMonitoringService.requestPermission() else {
+                errorMessage = "Microphone access is required for a monitoring session."
+                return
             }
+            sessionRequested = true
+            errorMessage = nil
+            applyPowerPolicy()
         }
     }
 
@@ -75,27 +96,51 @@ final class AppModel: ObservableObject {
         }
     }
 
-    private func startMonitoring() {
+    /// The single place that reconciles "the user wants a session" with "the OS
+    /// wants us to use less power". Called on every input that can change either.
+    private func applyPowerPolicy() {
+        guard sessionRequested else { return }
+        let shouldSuspend = pauseOnLowPower && power.isLowPower
+        suspendedForLowPower = shouldSuspend
+        if shouldSuspend {
+            // Releasing the microphone — not merely skipping analysis — is what
+            // actually lets the audio hardware and its wake-ups idle.
+            stopCapture()
+        } else if !isCapturing {
+            startCapture()
+        }
+    }
+
+    private func startCapture() {
         guard let audio else { return }
         do {
             try audio.start()
-            isMonitoring = true
+            isCapturing = true
             errorMessage = nil
         } catch {
+            sessionRequested = false
+            isCapturing = false
             errorMessage = error.localizedDescription
         }
     }
 
-    private func stopMonitoring() {
-        guard let audio else { return }
+    private func stopCapture() {
+        guard let audio, isCapturing else { return }
         do {
-            let events = try audio.stop()
-            latestEvents = events + latestEvents
-            isMonitoring = false
+            _ = try audio.stop()
+            isCapturing = false
             refreshHistory()
         } catch {
+            isCapturing = false
             errorMessage = error.localizedDescription
         }
+    }
+
+    private func handleCaptureFailure(_ message: String) {
+        sessionRequested = false
+        suspendedForLowPower = false
+        stopCapture()
+        errorMessage = message
     }
 
     private static var platform: ApplePlatform {

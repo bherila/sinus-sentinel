@@ -15,6 +15,10 @@ final class AudioMonitoringService: @unchecked Sendable {
     )
     private var converter: AVAudioConverter?
     private var running = false
+    /// Reused across callbacks: at 20 buffers a second, allocating a fresh
+    /// converted buffer each time is pure churn on a `.userInitiated` queue that
+    /// wakes up continuously while a session is active.
+    private var convertedBuffer: AVAudioPCMBuffer?
 
     init(engine: AppleEngine) {
         detector = engine
@@ -92,6 +96,7 @@ final class AudioMonitoringService: @unchecked Sendable {
         audioEngine.stop()
         processingQueue.sync {}
         converter = nil
+        convertedBuffer = nil
         running = false
 
         #if os(iOS)
@@ -110,10 +115,16 @@ final class AudioMonitoringService: @unchecked Sendable {
         let capacity = AVAudioFrameCount(
             ceil(Double(input.frameLength) * ratio) + 32
         )
-        guard let output = AVAudioPCMBuffer(
-            pcmFormat: outputFormat,
-            frameCapacity: capacity
-        ) else { return }
+        // Grow only when a callback is larger than anything seen so far; the tap
+        // size is stable in practice, so this allocates once per session.
+        if convertedBuffer == nil || convertedBuffer!.frameCapacity < capacity {
+            convertedBuffer = AVAudioPCMBuffer(
+                pcmFormat: outputFormat,
+                frameCapacity: capacity
+            )
+        }
+        guard let output = convertedBuffer else { return }
+        output.frameLength = 0
 
         var supplied = false
         var conversionError: NSError?

@@ -15,8 +15,13 @@ use sinus_core::pipeline::{EventContext, PipelineConfig, StreamingPipeline};
 use sinus_core::store::Store;
 use sinus_core::types::{Event, Source};
 
-const PROTOTYPE_SIM_THRESHOLD: f32 = 0.65;
-const PROTOTYPE_NEGATIVE_MARGIN: f32 = 0.05;
+/// Cosine similarity a personalized prototype must reach to fire, and how far a
+/// negative prototype must beat the positive to veto it. Shared so the desktop
+/// capture thread, the Apple bridge and Teach-mode scoring cannot drift apart —
+/// a take enrolled under one threshold and matched under another would score
+/// differently in the UI than in the detector.
+pub const PROTOTYPE_SIM_THRESHOLD: f32 = 0.65;
+pub const PROTOTYPE_NEGATIVE_MARGIN: f32 = 0.05;
 
 #[derive(Debug, Clone)]
 pub struct MonitoringConfig {
@@ -30,7 +35,7 @@ impl MonitoringConfig {
         Self {
             source,
             device_id: device_id.into(),
-            sensitivity: 0.5,
+            sensitivity: crate::settings::DEFAULT_SENSITIVITY,
         }
     }
 }
@@ -106,8 +111,7 @@ impl<E: Embedder> MonitoringEngine<E> {
         let sensitivity = sensitivity.clamp(0.0, 1.0);
         self.pipeline.set_sensitivity(sensitivity);
         self.config.sensitivity = sensitivity;
-        self.store
-            .setting_set("sensitivity", &sensitivity.to_string())
+        crate::settings::set_sensitivity(&self.store, sensitivity)
     }
 
     pub fn reload_enrollments(&mut self) -> Result<()> {
@@ -137,7 +141,10 @@ impl<E: Embedder> MonitoringEngine<E> {
     }
 }
 
-fn prototypes_from_store(store: &Store) -> Result<Option<PrototypeMatcher>> {
+/// Build the personalized matcher from every stored Teach-mode enrollment, or
+/// `None` when the user has taught nothing yet (in which case the pipeline runs
+/// the generic decision rules alone).
+pub fn prototypes_from_store(store: &Store) -> Result<Option<PrototypeMatcher>> {
     let enrollments: Vec<_> = store
         .enrollments()?
         .into_iter()

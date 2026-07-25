@@ -51,12 +51,19 @@ it into the app bundle. Without it, `PreviewModelRunner` returns neutral,
 correctly shaped values so the UI and capture lifecycle can run without false
 detections.
 
+## Battery
+
+Monitoring pauses while the OS reports Low Power Mode, releasing the microphone
+and resuming on its own when it turns off. The toggle in the app writes the same
+`pause_low_power` row the desktop tray reads, so both shells on one Mac share the
+policy. See [the architecture notes](../../docs/APPLE_ARCHITECTURE.md#battery-policy).
+
 ## Still requires a Mac / device
 
-- compile both Swift destinations and address any SDK/Swift concurrency drift;
 - convert and validate YAMNet as a Core ML package;
 - handle audio interruptions, route changes, and media-services resets;
 - verify that an active session continues through iPhone screen lock;
-- profile battery use on a physical iPhone and Apple-silicon Mac;
+- measure real battery draw on a physical iPhone and Apple-silicon Mac, including
+  the Low Power Mode transition;
 - validate the declared background-audio use with App Review requirements;
 - add signing, provisioning, XCTest/UI tests, and distributable XCFrameworks.

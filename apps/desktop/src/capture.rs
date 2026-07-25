@@ -22,10 +22,14 @@ use sinus_core::pipeline::{EventContext, PipelineConfig, StreamingPipeline};
 use sinus_core::store::{EnrollmentInsert, Store};
 use sinus_core::types::Source;
 
+use sinus_app::monitor::{
+    prototypes_from_store, PROTOTYPE_NEGATIVE_MARGIN, PROTOTYPE_SIM_THRESHOLD,
+};
+use sinus_app::settings;
+use sinus_app::state::local_offset_minutes;
+
 use crate::shared::{ModelStatus, SharedStatus};
 
-const PROTOTYPE_SIM_THRESHOLD: f32 = 0.65;
-const PROTOTYPE_NEGATIVE_MARGIN: f32 = 0.05;
 const TEACH_CAPTURE_SAMPLES: usize = sinus_core::types::SAMPLE_RATE as usize * 3;
 const TEACH_COUNTDOWN_SAMPLES: usize = sinus_core::types::SAMPLE_RATE as usize;
 
@@ -186,7 +190,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
 
     let embedder = build_embedder(&store, &shared);
 
-    let prototypes = prototypes_from_store(&store)?;
+    let prototypes = prototypes_from_store(&store).map_err(|e| e.to_string())?;
 
     // One StreamingPipeline for the life of the stream (SPEC §1, live capture):
     // gate/sessionizer/mel state persists across reads, so events straddling a read
@@ -194,7 +198,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     // events carry sample-counter timestamps relative to the stream start; map that
     // origin to wall-clock ONCE, here, rather than doing per-chunk `Utc::now()` math.
     let mut config = PipelineConfig::default();
-    config.decision.sensitivity = read_sensitivity(&store);
+    config.decision.sensitivity = settings::sensitivity(&store);
     let mut pipeline = StreamingPipeline::new(config, embedder);
     if let Some(prototypes) = prototypes {
         pipeline = pipeline.with_prototypes(prototypes);
@@ -211,7 +215,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     let mut source: Option<CpalAudioSource> = None;
     let mut teach_capture: Option<TeachCapture> = None;
     let mut gate_was_open = false;
-    let mut pause_on_low_power = read_pause_on_low_power(&store);
+    let mut pause_on_low_power = settings::pause_on_low_power(&store);
     let mut last_power_check: Option<std::time::Instant> = None;
     loop {
         if shared.quitting() {
@@ -219,13 +223,13 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
         }
 
         if shared.take_enrollment_reload() {
-            pipeline.set_prototypes(prototypes_from_store(&store)?);
+            pipeline.set_prototypes(prototypes_from_store(&store).map_err(|e| e.to_string())?);
         }
 
         // Sensitivity and power policy can change locally or arrive from sync.
         if shared.take_settings_reload() {
-            pipeline.set_sensitivity(read_sensitivity(&store));
-            pause_on_low_power = read_pause_on_low_power(&store);
+            pipeline.set_sensitivity(settings::sensitivity(&store));
+            pause_on_low_power = settings::pause_on_low_power(&store);
             last_power_check = None;
         }
         if last_power_check
@@ -328,22 +332,6 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     }
 }
 
-fn prototypes_from_store(store: &Store) -> Result<Option<PrototypeMatcher>, String> {
-    let enrollments: Vec<_> = store
-        .enrollments()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|stored| stored.enrollment)
-        .collect();
-    Ok((!enrollments.is_empty()).then(|| {
-        PrototypeMatcher::from_enrollments(
-            &enrollments,
-            PROTOTYPE_SIM_THRESHOLD,
-            PROTOTYPE_NEGATIVE_MARGIN,
-        )
-    }))
-}
-
 fn save_teach_sample(
     store: &Store,
     pipeline: &mut StreamingPipeline<CaptureEmbedder>,
@@ -402,7 +390,7 @@ fn save_teach_sample(
             negative_scoped: false,
         })
         .map_err(|e| e.to_string())?;
-    pipeline.set_prototypes(prototypes_from_store(store)?);
+    pipeline.set_prototypes(prototypes_from_store(store).map_err(|e| e.to_string())?);
     let examples = store
         .enrollment_counts()
         .map_err(|e| e.to_string())?
@@ -428,29 +416,6 @@ fn peak_dbfs(samples: &[f32]) -> Option<f32> {
         .fold(None, |best: Option<f32>, db| {
             Some(best.map_or(db, |b| b.max(db)))
         })
-}
-
-/// Detection sensitivity from settings, neutral (0.5) when unset.
-fn read_sensitivity(store: &Store) -> f32 {
-    store
-        .setting_get("sensitivity")
-        .ok()
-        .flatten()
-        .and_then(|value| value.parse().ok())
-        .unwrap_or(0.5)
-}
-
-fn read_pause_on_low_power(store: &Store) -> bool {
-    store
-        .setting_get("pause_low_power")
-        .ok()
-        .flatten()
-        .is_none_or(|value| value != "false")
-}
-
-/// Local UTC offset in minutes.
-fn local_offset_minutes() -> i32 {
-    chrono::Local::now().offset().local_minus_utc() / 60
 }
 
 #[cfg(test)]

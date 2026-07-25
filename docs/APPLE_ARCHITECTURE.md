@@ -37,6 +37,36 @@ The Swift shell owns:
 
 No raw PCM crosses into persistence or networking.
 
+## Battery policy
+
+`ProcessInfo.isLowPowerModeEnabled` is the one signal both Apple platforms share
+(iOS 9+, macOS 12+), and the system posts `NSProcessInfoPowerStateDidChange` on
+every transition, so `LowPowerMonitor` never polls. When Low Power Mode turns on
+and the `pause_low_power` setting is enabled — the default, and the same store
+row the desktop tray uses, so a Mac running both shells agrees with itself — the
+shell tears down the `AVAudioEngine` tap and deactivates the audio session. That
+releases the microphone rather than merely skipping analysis, which is what
+actually lets the audio hardware and its 20-per-second wake-ups idle.
+
+The user's intent is kept separately from whether capture is running
+(`sessionRequested` vs `isCapturing`), so a session suspended for battery resumes
+by itself when the device leaves Low Power Mode instead of silently ending.
+
+## Cost of the hot path
+
+Two things run continuously while a session is active, and both are kept off the
+allocator:
+
+- the converted 16 kHz buffer is allocated once per session and reused across
+  the ~20 tap callbacks a second, not rebuilt per callback;
+- Core ML outputs are copied out through `withUnsafeBufferPointer`, because the
+  `MLMultiArray` subscript boxes each element in an `NSNumber` — roughly 1,500
+  allocations per inference, on every gate-active window.
+
+Projections (`history`) read through a second SQLite connection rather than the
+mutex that serializes the detector. WAL readers never block on the writer, so a
+UI refresh cannot stall behind a Core ML inference holding the engine lock.
+
 ## Monitoring through screen lock
 
 The iOS prototype declares `UIBackgroundModes = audio`, activates an

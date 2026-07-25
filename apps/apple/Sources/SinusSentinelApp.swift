@@ -15,8 +15,11 @@ struct SinusSentinelApp: App {
         }
 
         #if os(macOS)
-        MenuBarExtra("Sinus Sentinel", systemImage: model.isMonitoring ? "waveform" : "pause.circle") {
-            Button(model.isMonitoring ? "Stop monitoring" : "Start monitoring") {
+        MenuBarExtra("Sinus Sentinel", systemImage: model.isCapturing ? "waveform" : "pause.circle") {
+            if model.suspendedForLowPower {
+                Text("Paused for Low Power Mode")
+            }
+            Button(model.sessionRequested ? "Stop monitoring" : "Start monitoring") {
                 model.toggleMonitoring()
             }
             Button("Open Sinus Sentinel") {

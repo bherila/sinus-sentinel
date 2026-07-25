@@ -11,6 +11,7 @@ use sinus_app::monitor::{MonitoringConfig, MonitoringEngine};
 use sinus_core::classify::embed::{Embedder, WindowFeatures, AUDIOSET_CLASSES, EMBED_DIM};
 use sinus_core::error::{Error as CoreError, Result as CoreResult};
 use sinus_core::mel::MelPatch;
+use sinus_core::store::Store;
 use sinus_core::types::{Event, EventType, Source};
 use thiserror::Error;
 
@@ -222,9 +223,19 @@ pub struct HistorySnapshot {
     pub congestion_score_per_monitored_hour: f64,
 }
 
+/// How many events the "recent" list carries across the FFI boundary. The UI
+/// shows a handful; fetching a whole week would copy every row on every refresh.
+const RECENT_EVENT_LIMIT: usize = 50;
+
 #[derive(uniffi::Object)]
 pub struct AppleEngine {
     inner: Mutex<MonitoringEngine<ForeignEmbedder>>,
+    /// A second, read-only connection to the same database. Projections are read
+    /// from the UI thread while `inner` can be held for the length of a Core ML
+    /// inference on the audio queue; sharing one lock would stall the UI behind
+    /// the model. SQLite's WAL mode is built for exactly this — concurrent
+    /// readers never block on the writer.
+    reader: Mutex<Store>,
 }
 
 #[uniffi::export]
@@ -257,8 +268,10 @@ impl AppleEngine {
             MonitoringConfig::new(config.platform.source(), config.device_id);
         monitoring_config.sensitivity = config.sensitivity;
         let engine = MonitoringEngine::open(&config.database_path, embedder, monitoring_config)?;
+        let reader = Store::open(&config.database_path)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(engine),
+            reader: Mutex::new(reader),
         }))
     }
 
@@ -268,6 +281,7 @@ impl AppleEngine {
         timezone_offset_minutes: i32,
     ) -> Result<(), AppleEngineError> {
         let started_at = timestamp(started_at_epoch_ms)?;
+        check_timezone_offset(timezone_offset_minutes)?;
         self.lock()?
             .start_session(started_at, timezone_offset_minutes);
         Ok(())
@@ -316,24 +330,22 @@ impl AppleEngine {
                 message: "history days must be between 1 and 90".to_string(),
             });
         }
-        if !(-1_439..=1_439).contains(&timezone_offset_minutes) {
-            return Err(AppleEngineError::InvalidArgument {
-                message: "timezone offset must be between -1439 and 1439 minutes".to_string(),
-            });
-        }
+        check_timezone_offset(timezone_offset_minutes)?;
         let now = timestamp(now_epoch_ms)?;
-        let engine = self.lock()?;
-        let today =
-            sinus_app::state::today_counts_at_offset(engine.store(), now, timezone_offset_minutes);
+        let store = self.reader()?;
+        let today = sinus_app::state::today_counts_at_offset(&store, now, timezone_offset_minutes);
         let histogram = sinus_app::state::daily_histogram_at_offset(
-            engine.store(),
+            &store,
             days as i64,
             now,
             timezone_offset_minutes,
         );
-        let recent_events = engine
-            .store()
-            .recent_events(now - chrono::Duration::days(days as i64), now)?
+        let recent_events = store
+            .recent_events_limited(
+                now - chrono::Duration::days(days as i64),
+                now,
+                RECENT_EVENT_LIMIT,
+            )?
             .into_iter()
             .map(AppleEvent::from)
             .collect();
@@ -359,8 +371,21 @@ impl AppleEngine {
         })
     }
 
+    /// Whether the shell should release the microphone while the OS reports Low
+    /// Power Mode. Same row, same default as the desktop tray's battery policy,
+    /// so a Mac running both shells behaves consistently.
+    pub fn pause_on_low_power(&self) -> Result<bool, AppleEngineError> {
+        let store = self.reader()?;
+        Ok(sinus_app::settings::pause_on_low_power(&store))
+    }
+
+    pub fn set_pause_on_low_power(&self, enabled: bool) -> Result<(), AppleEngineError> {
+        sinus_app::settings::set_pause_on_low_power(self.lock()?.store(), enabled)?;
+        Ok(())
+    }
+
     pub fn get_setting(&self, key: String) -> Result<Option<String>, AppleEngineError> {
-        Ok(self.lock()?.store().setting_get(&key)?)
+        Ok(self.reader()?.setting_get(&key)?)
     }
 
     pub fn set_setting(&self, key: String, value: String) -> Result<(), AppleEngineError> {
@@ -373,6 +398,22 @@ impl AppleEngine {
     fn lock(&self) -> Result<MutexGuard<'_, MonitoringEngine<ForeignEmbedder>>, AppleEngineError> {
         self.inner.lock().map_err(|_| AppleEngineError::Engine {
             message: "engine state lock was poisoned".to_string(),
+        })
+    }
+
+    fn reader(&self) -> Result<MutexGuard<'_, Store>, AppleEngineError> {
+        self.reader.lock().map_err(|_| AppleEngineError::Engine {
+            message: "engine read lock was poisoned".to_string(),
+        })
+    }
+}
+
+fn check_timezone_offset(offset_minutes: i32) -> Result<(), AppleEngineError> {
+    if (-1_439..=1_439).contains(&offset_minutes) {
+        Ok(())
+    } else {
+        Err(AppleEngineError::InvalidArgument {
+            message: "timezone offset must be between -1439 and 1439 minutes".to_string(),
         })
     }
 }
@@ -428,6 +469,43 @@ mod tests {
                 embedding: output.embedding,
             })
         }
+    }
+
+    fn temp_engine() -> (Arc<AppleEngine>, std::path::PathBuf) {
+        let path =
+            std::env::temp_dir().join(format!("sinus-apple-test-{}.db", uuid::Uuid::new_v4()));
+        let engine = AppleEngine::new(
+            AppleEngineConfig {
+                database_path: path.to_string_lossy().into_owned(),
+                device_id: "test-device".to_string(),
+                platform: ApplePlatform::Ios,
+                sensitivity: 0.5,
+            },
+            Arc::new(TestModel),
+        )
+        .unwrap();
+        (engine, path)
+    }
+
+    #[test]
+    fn battery_policy_defaults_on_and_round_trips() {
+        let (engine, path) = temp_engine();
+        assert!(engine.pause_on_low_power().unwrap());
+        engine.set_pause_on_low_power(false).unwrap();
+        assert!(!engine.pause_on_low_power().unwrap());
+        engine.set_pause_on_low_power(true).unwrap();
+        assert!(engine.pause_on_low_power().unwrap());
+        drop(engine);
+        let _ = std::fs::remove_file(path);
+    }
+
+    #[test]
+    fn bridge_rejects_an_impossible_timezone_offset() {
+        let (engine, path) = temp_engine();
+        let error = engine.start_monitoring(0, 5_000).unwrap_err();
+        assert!(error.to_string().contains("timezone offset"));
+        drop(engine);
+        let _ = std::fs::remove_file(path);
     }
 
     #[test]

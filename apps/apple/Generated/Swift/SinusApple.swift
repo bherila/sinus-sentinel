@@ -645,7 +645,16 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
 
     func isMonitoring() throws  -> Bool
 
+    /**
+     * Whether the shell should release the microphone while the OS reports Low
+     * Power Mode. Same row, same default as the desktop tray's battery policy,
+     * so a Mac running both shells behaves consistently.
+     */
+    func pauseOnLowPower() throws  -> Bool
+
     func pushPcm16k(samples: [Float]) throws  -> [AppleEvent]
+
+    func setPauseOnLowPower(enabled: Bool) throws
 
     func setSensitivity(sensitivity: Float) throws
 
@@ -750,6 +759,20 @@ open func isMonitoring()throws  -> Bool  {
 })
 }
 
+    /**
+     * Whether the shell should release the microphone while the OS reports Low
+     * Power Mode. Same row, same default as the desktop tray's battery policy,
+     * so a Mac running both shells behaves consistently.
+     */
+open func pauseOnLowPower()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_pause_on_low_power(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
 open func pushPcm16k(samples: [Float])throws  -> [AppleEvent]  {
     return try  FfiConverterSequenceTypeAppleEvent.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
@@ -758,6 +781,15 @@ open func pushPcm16k(samples: [Float])throws  -> [AppleEvent]  {
         FfiConverterSequenceFloat.lower(samples),uniffiCallStatus
     )
 })
+}
+
+open func setPauseOnLowPower(enabled: Bool)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_set_pause_on_low_power(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(enabled),uniffiCallStatus
+    )
+}
 }
 
 open func setSensitivity(sensitivity: Float)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
@@ -1985,7 +2017,13 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sinus_apple_checksum_method_appleengine_is_monitoring() != 61257) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sinus_apple_checksum_method_appleengine_pause_on_low_power() != 39259) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sinus_apple_checksum_method_appleengine_push_pcm_16k() != 19245) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_set_pause_on_low_power() != 14460) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_set_sensitivity() != 11213) {

@@ -25,12 +25,9 @@ pub fn counts_in_range(
     counts
 }
 
-/// Counts for the UTC day containing `now`.
-pub fn today_counts(store: &Store, now: DateTime<Utc>) -> HashMap<EventType, i64> {
-    today_counts_at_offset(store, now, 0)
-}
-
-/// Counts for the local day containing `now` at a fixed UTC offset.
+/// Counts for the local day containing `now` at a fixed UTC offset. Every shell
+/// passes its own offset: "today" is the user's day, not UTC's, so an evening
+/// cough west of Greenwich must not land on tomorrow's bar.
 pub fn today_counts_at_offset(
     store: &Store,
     now: DateTime<Utc>,
@@ -58,13 +55,8 @@ impl DayCount {
     }
 }
 
-/// The last `days` days (oldest first), each with per-class counts. The final
-/// entry is the day containing `now`.
-pub fn daily_histogram(store: &Store, days: i64, now: DateTime<Utc>) -> Vec<DayCount> {
-    daily_histogram_at_offset(store, days, now, 0)
-}
-
-/// Local-day buckets at a fixed UTC offset, oldest first.
+/// The last `days` local days at a fixed UTC offset, oldest first, each with
+/// per-class counts. The final entry is the day containing `now`.
 pub fn daily_histogram_at_offset(
     store: &Store,
     days: i64,
@@ -85,6 +77,12 @@ pub fn daily_histogram_at_offset(
             }
         })
         .collect()
+}
+
+/// This machine's current UTC offset in minutes. Shells that have a richer
+/// notion of the local zone (Swift's `TimeZone.current`) pass their own instead.
+pub fn local_offset_minutes() -> i32 {
+    chrono::Local::now().offset().local_minus_utc() / 60
 }
 
 fn fixed_offset(offset_minutes: i32) -> FixedOffset {
@@ -190,7 +188,7 @@ mod tests {
         store.insert_event(&event(EventType::Cough, now)).unwrap();
         store.insert_event(&event(EventType::Cough, now)).unwrap();
         store.insert_event(&event(EventType::Sniffle, now)).unwrap();
-        let counts = today_counts(&store, now);
+        let counts = today_counts_at_offset(&store, now, 0);
         assert_eq!(counts[&EventType::Cough], 2);
         assert_eq!(counts[&EventType::Sniffle], 1);
     }
@@ -204,7 +202,7 @@ mod tests {
         store
             .insert_event(&event(EventType::Hawk, yesterday))
             .unwrap();
-        let hist = daily_histogram(&store, 7, now);
+        let hist = daily_histogram_at_offset(&store, 7, now, 0);
         assert_eq!(hist.len(), 7);
         assert_eq!(hist[6].total(), 1); // today
         assert_eq!(hist[5].total(), 1); // yesterday

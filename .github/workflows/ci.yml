@@ -54,6 +54,11 @@ jobs:
 
   # Compile and link both native Swift destinations against Rust. This is the
   # Mac-side check that cannot run in the Linux development environment.
+  #
+  # `macos-latest` is GitHub's *standard* hosted runner (currently arm64, 3-core),
+  # which is free for public repositories — verified against the run timing API:
+  # billable MACOS ms is 0. Keep this label. The paid tier is opted into by name
+  # (`macos-…-large`/`-xlarge`), so never switch to one of those for CI.
   apple-native:
     runs-on: macos-latest
     steps:

@@ -615,13 +615,26 @@ impl Store {
     /// congestion score are built from. Use [`Store::recent_events`] for the
     /// history list, which must still show flagged rows so they can be undone.
     pub fn events_in_range(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Event>> {
-        self.events_in_range_inner(from, to, false)
+        self.events_in_range_inner(from, to, false, None)
     }
 
     /// Events in `[from, to)`, newest first, **including** reported
     /// misdetections so the UI can render them struck through with an undo.
     pub fn recent_events(&self, from: DateTime<Utc>, to: DateTime<Utc>) -> Result<Vec<Event>> {
-        self.events_in_range_inner(from, to, true)
+        self.events_in_range_inner(from, to, true, None)
+    }
+
+    /// The newest `limit` events in `[from, to)`. Clients that render a short
+    /// "recent" list use this so a heavy week is bounded in SQLite rather than
+    /// materialized in full and then truncated — on the Apple bridge every row
+    /// would otherwise be copied across the FFI boundary on each refresh.
+    pub fn recent_events_limited(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<Event>> {
+        self.events_in_range_inner(from, to, true, Some(limit))
     }
 
     fn events_in_range_inner(
@@ -629,15 +642,25 @@ impl Store {
         from: DateTime<Utc>,
         to: DateTime<Utc>,
         include_false_positives: bool,
+        limit: Option<usize>,
     ) -> Result<Vec<Event>> {
+        // SQLite treats a negative LIMIT as unbounded, which is exactly the
+        // "no limit" case, so one prepared statement covers both callers.
+        let limit = limit.map_or(-1i64, |n| n as i64);
         let mut stmt = self.conn.prepare(
             "SELECT * FROM events
              WHERE occurred_at >= ?1 AND occurred_at < ?2 AND deleted = 0
                AND (?3 OR false_positive_at IS NULL)
-             ORDER BY occurred_at DESC",
+             ORDER BY occurred_at DESC
+             LIMIT ?4",
         )?;
         let rows = stmt.query_map(
-            params![from.to_rfc3339(), to.to_rfc3339(), include_false_positives],
+            params![
+                from.to_rfc3339(),
+                to.to_rfc3339(),
+                include_false_positives,
+                limit
+            ],
             Self::row_to_event,
         )?;
         Ok(rows

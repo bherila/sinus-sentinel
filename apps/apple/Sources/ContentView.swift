@@ -24,6 +24,7 @@ struct ContentView: View {
                     }
 
                     recentEvents
+                    batterySettings
                 }
                 .padding()
             }
@@ -45,21 +46,14 @@ struct ContentView: View {
 
     private var monitoringCard: some View {
         VStack(alignment: .leading, spacing: 12) {
-            Label(
-                model.isMonitoring ? "Monitoring is active" : "Ready to monitor",
-                systemImage: model.isMonitoring ? "waveform.circle.fill" : "waveform.circle"
-            )
-            .font(.title2.bold())
-            .foregroundStyle(model.isMonitoring ? .green : .primary)
+            Label(status.title, systemImage: status.symbol)
+                .font(.title2.bold())
+                .foregroundStyle(status.tint)
 
-            Text(
-                model.isMonitoring
-                    ? "The session continues when the iPhone locks. Audio is analyzed locally and is never stored."
-                    : "Start an explicit session when you want Sinus Sentinel to listen."
-            )
-            .foregroundStyle(.secondary)
+            Text(status.detail)
+                .foregroundStyle(.secondary)
 
-            Button(model.isMonitoring ? "Stop monitoring" : "Start monitoring") {
+            Button(model.sessionRequested ? "Stop monitoring" : "Start monitoring") {
                 model.toggleMonitoring()
             }
             .buttonStyle(.borderedProminent)
@@ -69,12 +63,55 @@ struct ContentView: View {
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
     }
 
+    private var status: (title: String, detail: String, symbol: String, tint: Color) {
+        if model.suspendedForLowPower {
+            return (
+                "Paused for Low Power Mode",
+                "The microphone is released while the device saves power. Monitoring resumes on its own when Low Power Mode turns off.",
+                "battery.25",
+                .orange
+            )
+        }
+        if model.isCapturing {
+            return (
+                "Monitoring is active",
+                "The session continues when the iPhone locks. Audio is analyzed locally and is never stored.",
+                "waveform.circle.fill",
+                .green
+            )
+        }
+        return (
+            "Ready to monitor",
+            "Start an explicit session when you want Sinus Sentinel to listen.",
+            "waveform.circle",
+            .primary
+        )
+    }
+
+    private var batterySettings: some View {
+        VStack(alignment: .leading, spacing: 8) {
+            Text("Battery")
+                .font(.title2.bold())
+            Toggle(
+                "Pause while Low Power Mode is on",
+                isOn: $model.pauseOnLowPower
+            )
+            Text(
+                model.isLowPowerModeEnabled
+                    ? "Low Power Mode is on right now."
+                    : "Releases the microphone and resumes automatically. Shared with the desktop app through the same database."
+            )
+            .font(.footnote)
+            .foregroundStyle(.secondary)
+        }
+    }
+
     @ViewBuilder
     private var recentEvents: some View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Recent")
                 .font(.title2.bold())
-            let events = model.snapshot?.recentEvents ?? model.latestEvents
+            let events = model.snapshot?.recentEvents ?? []
             if events.isEmpty {
                 Text("No recent events")
                     .foregroundStyle(.secondary)
