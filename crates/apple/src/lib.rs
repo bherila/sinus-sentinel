@@ -5,15 +5,19 @@
 
 use std::fmt;
 use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
-use std::sync::{Arc, Mutex, MutexGuard};
+use std::sync::{Arc, Condvar, Mutex, MutexGuard};
+use std::thread::JoinHandle;
+use std::time::{Duration, Instant};
 
 use chrono::{DateTime, Utc};
 use sinus_app::instance::InstanceGuard;
 use sinus_app::monitor::{MonitoringConfig, MonitoringEngine};
+use sinus_app::sync::{FlushPolicy, SyncDriver, TickInput};
 use sinus_core::classify::embed::{Embedder, WindowFeatures, AUDIOSET_CLASSES, EMBED_DIM};
 use sinus_core::error::{Error as CoreError, Result as CoreResult};
 use sinus_core::mel::MelPatch;
 use sinus_core::store::Store;
+use sinus_core::token::TokenStore;
 use sinus_core::types::{Event, EventType, Source};
 use thiserror::Error;
 
@@ -163,6 +167,101 @@ impl Embedder for ForeignEmbedder {
             embedding: output.embedding,
             energy_peak,
         })
+    }
+}
+
+#[derive(Debug, Error, uniffi::Error)]
+pub enum TokenError {
+    #[error("keychain failure: {message}")]
+    Keychain { message: String },
+}
+
+impl From<uniffi::UnexpectedUniFFICallbackError> for TokenError {
+    fn from(value: uniffi::UnexpectedUniFFICallbackError) -> Self {
+        Self::Keychain {
+            message: value.reason,
+        }
+    }
+}
+
+/// Implemented in Swift over Security.framework. Rust never stores the PHR
+/// bearer token itself on Apple platforms — the Keychain is the only copy, and
+/// it is bound to the app's code signature rather than to a file Rust could read.
+#[uniffi::export(foreign)]
+pub trait TokenProvider: Send + Sync {
+    fn get_token(&self) -> Result<Option<String>, TokenError>;
+    fn set_token(&self, token: String) -> Result<(), TokenError>;
+    fn clear_token(&self) -> Result<(), TokenError>;
+}
+
+/// Adapts a Swift [`TokenProvider`] to [`sinus_core::token::TokenStore`].
+///
+/// `SyncEngine::bearer()` is called once per HTTP request, and a flush makes
+/// up to five of those; without a cache, each one becomes a Keychain round
+/// trip, turning a backoff storm into a Keychain-prompt storm. This is the
+/// same reason `KeyringTokenStore` caches (see `crates/core/src/token.rs`) —
+/// mirrored here because the source of truth on Apple platforms is a Swift
+/// callback rather than a local `keyring::Entry`.
+struct ForeignTokenStore {
+    provider: Arc<dyn TokenProvider>,
+    /// Outer `None` means "not yet read from the provider"; `Some(None)` is a
+    /// cached "provider has no token" answer.
+    cached: Mutex<Option<Option<String>>>,
+}
+
+impl ForeignTokenStore {
+    fn new(provider: Arc<dyn TokenProvider>) -> Self {
+        ForeignTokenStore {
+            provider,
+            cached: Mutex::new(None),
+        }
+    }
+}
+
+impl TokenStore for ForeignTokenStore {
+    fn get_token(&self) -> CoreResult<Option<String>> {
+        // A poisoned cache is not fatal: the token is still readable straight
+        // from the provider, and failing a sync because a lock was poisoned
+        // would be a worse outcome than a redundant Keychain read.
+        match self.cached.lock() {
+            Ok(mut cache) => {
+                if let Some(token) = cache.as_ref() {
+                    return Ok(token.clone());
+                }
+                let token = self
+                    .provider
+                    .get_token()
+                    .map_err(|error| CoreError::Token(error.to_string()))?;
+                *cache = Some(token.clone());
+                Ok(token)
+            }
+            Err(_) => self
+                .provider
+                .get_token()
+                .map_err(|error| CoreError::Token(error.to_string())),
+        }
+    }
+
+    fn set_token(&self, token: &str) -> CoreResult<()> {
+        self.provider
+            .set_token(token.to_string())
+            .map_err(|error| CoreError::Token(error.to_string()))?;
+        // Only updated once the provider has actually accepted the write, so a
+        // failed write cannot leave the cache claiming a token it never stored.
+        if let Ok(mut cache) = self.cached.lock() {
+            *cache = Some(Some(token.to_string()));
+        }
+        Ok(())
+    }
+
+    fn clear(&self) -> CoreResult<()> {
+        self.provider
+            .clear_token()
+            .map_err(|error| CoreError::Token(error.to_string()))?;
+        if let Ok(mut cache) = self.cached.lock() {
+            *cache = Some(None);
+        }
+        Ok(())
     }
 }
 
@@ -553,6 +652,12 @@ pub struct AppleEngine {
     /// the OS owns the underlying file lock — hands this machine back to whichever
     /// shell the user opens next.
     instance: InstanceGuard,
+    /// Kept so `SyncController::new` can open its own connection to the same
+    /// database without Swift threading the path through a second time.
+    database_path: String,
+    /// Kept so `SyncController::new` uploads under the right `Source` — an
+    /// iPhone must not report as `desktop-mac`.
+    platform: ApplePlatform,
 }
 
 #[uniffi::export]
@@ -596,6 +701,7 @@ impl AppleEngine {
             MonitoringConfig::new(config.platform.source()),
         )?;
         let reader = Store::open(&config.database_path)?;
+        let database_path = config.database_path.clone();
         Ok(Arc::new(Self {
             inner: Mutex::new(engine),
             reader: Mutex::new(reader),
@@ -604,6 +710,8 @@ impl AppleEngine {
             monitoring: AtomicBool::new(false),
             model_version: version,
             instance,
+            database_path,
+            platform: config.platform,
         }))
     }
 
@@ -1078,6 +1186,334 @@ impl AppleEngine {
         engine.reload_enrollments()?;
         Ok(removed as u32)
     }
+}
+
+/// Sync health, mirroring `sinus_app::sync::SyncState`. A separate type so this
+/// crate's FFI surface has no dependency on any shell's UI types, matching why
+/// `sinus_app::sync` keeps its own `SyncState` rather than reusing the desktop
+/// tray's.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum SyncState {
+    Idle,
+    Syncing,
+    Failed,
+}
+
+impl From<sinus_app::sync::SyncState> for SyncState {
+    fn from(value: sinus_app::sync::SyncState) -> Self {
+        match value {
+            sinus_app::sync::SyncState::Idle => Self::Idle,
+            sinus_app::sync::SyncState::Syncing => Self::Syncing,
+            sinus_app::sync::SyncState::Failed => Self::Failed,
+        }
+    }
+}
+
+/// One tick's worth of sync state, pushed to the shell rather than polled —
+/// the driver thread sleeps between ticks, so a poll would either be stale or
+/// force it awake.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct SyncStatusSnapshot {
+    pub state: SyncState,
+    pub mode: SyncMode,
+    /// Badge count — events only, which is what "pending" means to a user.
+    pub pending_events: u32,
+    /// The flush gate: events plus tombstones, flags and enrollments.
+    pub pending_work: u32,
+    /// Whether the current local hour falls in the quiet-hours window.
+    pub quiet: bool,
+    /// The failure text from the last attempt, if it failed. Before this
+    /// existed the reason only reached stderr, so a user saw "sync failing"
+    /// with no way to learn why.
+    ///
+    /// The shell distinguishes exactly two failures by substring rather than
+    /// by a structured error code: text containing "no API token configured"
+    /// (see `sinus_core::sync::SyncEngine::bearer`) means the PHR API token
+    /// has not been set and the user should be sent to Settings › PHR; text
+    /// containing "keychain" (see `TokenError::Keychain`) means the Keychain
+    /// read itself failed. This comment is the contract — do not add parsing
+    /// or error-code plumbing in Rust for it.
+    pub error: Option<String>,
+    /// Epoch milliseconds of the last successful flush; `None` if none yet.
+    pub last_success_epoch_ms: Option<i64>,
+}
+
+impl SyncStatusSnapshot {
+    /// What `SyncController::status()` returns before the driver thread has
+    /// completed its first tick.
+    fn idle() -> Self {
+        SyncStatusSnapshot {
+            state: SyncState::Idle,
+            mode: SyncMode::AutoBatch,
+            pending_events: 0,
+            pending_work: 0,
+            quiet: false,
+            error: None,
+            last_success_epoch_ms: None,
+        }
+    }
+}
+
+/// Implemented in Swift to receive sync status pushes.
+#[uniffi::export(foreign)]
+pub trait SyncObserver: Send + Sync {
+    /// Called on the driver thread, not the main thread — Swift implementations
+    /// must hop to the main actor before touching UI state.
+    fn on_status(&self, status: SyncStatusSnapshot);
+}
+
+/// Runs [`sinus_app::sync::SyncDriver`] on its own thread against its own
+/// database connection, pushing every tick's result to a Swift-side
+/// [`SyncObserver`].
+///
+/// Takes `Arc<AppleEngine>` rather than the raw config the engine was built
+/// from, and holds onto it for as long as the controller lives: a
+/// `SyncController` can then structurally not exist unless this process holds
+/// the machine's `InstanceGuard` (owned by `AppleEngine`), so two shells can
+/// never sync the same database concurrently, and dropping the caller's own
+/// `Arc<AppleEngine>` while keeping the controller cannot release the guard
+/// out from under it.
+#[derive(uniffi::Object)]
+pub struct SyncController {
+    /// Kept alive only for its `InstanceGuard` — the controller opens its own
+    /// `Store` connection below rather than sharing the engine's, since
+    /// `Store` is not `Sync` and `SyncDriver::tick` needs `&mut Store`.
+    _engine: Arc<AppleEngine>,
+    /// The same object the driver thread reads from, so `set_token` /
+    /// `clear_token` update the one cache the thread sees. A Swift caller that
+    /// wrote the Keychain directly instead would leave that cache serving a
+    /// stale token until relaunch.
+    tokens: Arc<dyn TokenStore>,
+    /// Wakes the driver thread immediately for a manual sync or a shutdown,
+    /// rather than letting it sleep through the request until its next
+    /// scheduled tick.
+    wake: Arc<(Mutex<u64>, Condvar)>,
+    manual_requested: Arc<AtomicBool>,
+    quitting: Arc<AtomicBool>,
+    /// The last snapshot the driver thread pushed, for a caller that reads
+    /// `status()` before the first tick or between ticks.
+    status: Arc<Mutex<SyncStatusSnapshot>>,
+    /// Taken by `shutdown`; `None` once a shutdown has run, so a second call
+    /// finds nothing left to join instead of panicking.
+    thread: Mutex<Option<JoinHandle<()>>>,
+}
+
+#[uniffi::export]
+impl SyncController {
+    #[uniffi::constructor]
+    pub fn new(
+        engine: Arc<AppleEngine>,
+        tokens: Arc<dyn TokenProvider>,
+        observer: Arc<dyn SyncObserver>,
+    ) -> Result<Arc<SyncController>, AppleEngineError> {
+        let store = Store::open(&engine.database_path)?;
+        let source = engine.platform.source();
+        let token_store: Arc<dyn TokenStore> = Arc::new(ForeignTokenStore::new(tokens));
+        let wake = Arc::new((Mutex::new(0u64), Condvar::new()));
+        let manual_requested = Arc::new(AtomicBool::new(false));
+        let quitting = Arc::new(AtomicBool::new(false));
+        let status = Arc::new(Mutex::new(SyncStatusSnapshot::idle()));
+
+        let handle = {
+            let tokens = Arc::clone(&token_store);
+            let wake = Arc::clone(&wake);
+            let manual_requested = Arc::clone(&manual_requested);
+            let quitting = Arc::clone(&quitting);
+            let status = Arc::clone(&status);
+            // The thread holds its own reference to the engine, not just the
+            // controller does. `Drop` signals stop without joining, so the
+            // thread can outlive the controller; without this the engine — and
+            // with it the machine's `InstanceGuard` — could be released while
+            // this thread was still writing to the database, letting another
+            // shell take the machine mid-flush.
+            let engine = Arc::clone(&engine);
+            std::thread::spawn(move || {
+                run_sync_driver(
+                    store,
+                    source,
+                    tokens,
+                    observer,
+                    wake,
+                    manual_requested,
+                    quitting,
+                    status,
+                );
+                drop(engine);
+            })
+        };
+
+        Ok(Arc::new(SyncController {
+            _engine: engine,
+            tokens: token_store,
+            wake,
+            manual_requested,
+            quitting,
+            status,
+            thread: Mutex::new(Some(handle)),
+        }))
+    }
+
+    /// Ask for a flush now, regardless of schedule. Returns immediately; the
+    /// result arrives via the observer.
+    pub fn sync_now(&self) {
+        self.manual_requested.store(true, Ordering::Relaxed);
+        signal_wake(&self.wake);
+    }
+
+    /// Routes through the controller's `TokenStore` rather than letting Swift
+    /// write the Keychain directly, so the `ForeignTokenStore` cache the
+    /// driver thread reads from stays coherent instead of serving a stale
+    /// token until relaunch.
+    pub fn set_token(&self, token: String) -> Result<(), AppleEngineError> {
+        self.tokens.set_token(&token)?;
+        Ok(())
+    }
+
+    /// See [`Self::set_token`] — routes through the same store for the same reason.
+    pub fn clear_token(&self) -> Result<(), AppleEngineError> {
+        self.tokens.clear()?;
+        Ok(())
+    }
+
+    pub fn has_token(&self) -> Result<bool, AppleEngineError> {
+        Ok(self
+            .tokens
+            .get_token()?
+            .is_some_and(|token| !token.is_empty()))
+    }
+
+    /// The last snapshot pushed to the observer, for a view that appears after
+    /// a tick rather than before it.
+    pub fn status(&self) -> SyncStatusSnapshot {
+        self.status
+            .lock()
+            .map(|guard| guard.clone())
+            .unwrap_or_else(|_| SyncStatusSnapshot::idle())
+    }
+
+    /// Stop the driver thread and wait up to `timeout_ms` for it to finish its
+    /// final flush. The deterministic counterpart to `Drop`, which signals stop
+    /// but does not join.
+    pub fn shutdown(&self, timeout_ms: u64) {
+        self.quitting.store(true, Ordering::Relaxed);
+        signal_wake(&self.wake);
+
+        let Ok(mut slot) = self.thread.lock() else {
+            return;
+        };
+        let Some(handle) = slot.take() else {
+            // Already shut down — nothing left to join.
+            return;
+        };
+        let deadline = Instant::now() + Duration::from_millis(timeout_ms);
+        // `JoinHandle` has no timed join, so poll `is_finished` instead of
+        // blocking on `join` outright.
+        while !handle.is_finished() && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(20));
+        }
+        if handle.is_finished() {
+            let _ = handle.join();
+        }
+        // Otherwise the deadline passed with a flush still in flight. Dropping
+        // the handle here lets the thread finish in the background rather than
+        // blocking the caller — typically the UI thread — indefinitely.
+    }
+}
+
+impl Drop for SyncController {
+    /// Signals the driver thread to stop but does not join it: `Drop` running
+    /// on whatever thread drops the last `Arc` must not block on a flush that
+    /// can take up to the HTTP client's 30-second timeout. `shutdown` is the
+    /// deterministic, bounded way to stop and wait.
+    fn drop(&mut self) {
+        self.quitting.store(true, Ordering::Relaxed);
+        signal_wake(&self.wake);
+    }
+}
+
+/// The driver thread body: tick `SyncDriver` in a loop, publish each result to
+/// `observer` and the shared `status` cell, and sleep on `wake` between ticks.
+/// Mirrors `apps/desktop/src/sync.rs::run_sync`; the difference is that state
+/// reaches the shell via a push (`SyncObserver::on_status`) instead of a
+/// shared-memory struct the UI polls.
+#[allow(clippy::too_many_arguments)]
+fn run_sync_driver(
+    mut store: Store,
+    source: Source,
+    tokens: Arc<dyn TokenStore>,
+    observer: Arc<dyn SyncObserver>,
+    wake: Arc<(Mutex<u64>, Condvar)>,
+    manual_requested: Arc<AtomicBool>,
+    quitting: Arc<AtomicBool>,
+    status: Arc<Mutex<SyncStatusSnapshot>>,
+) {
+    let mut driver = SyncDriver::new(source, FlushPolicy::default(), tokens);
+    let mut last_success_epoch_ms: Option<i64> = None;
+    let mut observed = wake_generation(&wake);
+
+    loop {
+        let input = TickInput {
+            manual: manual_requested.swap(false, Ordering::Relaxed),
+            quitting: quitting.load(Ordering::Relaxed),
+        };
+        let output = driver.tick(&mut store, input);
+
+        if output.flushed.is_some() {
+            last_success_epoch_ms = Some(Utc::now().timestamp_millis());
+        }
+
+        let snapshot = SyncStatusSnapshot {
+            state: output.state.into(),
+            mode: output.mode.into(),
+            pending_events: output.pending_events as u32,
+            pending_work: output.pending_work as u32,
+            quiet: output.quiet,
+            error: output.error,
+            last_success_epoch_ms,
+        };
+        if let Ok(mut slot) = status.lock() {
+            *slot = snapshot.clone();
+        }
+        observer.on_status(snapshot);
+
+        if output.done {
+            break;
+        }
+        if output.next_wait == Duration::ZERO {
+            // A flush just succeeded; there may be more pending work to drain.
+            continue;
+        }
+        observed = wait_for_wake(&wake, observed, output.next_wait);
+    }
+}
+
+fn wake_generation(wake: &(Mutex<u64>, Condvar)) -> u64 {
+    wake.0.lock().map_or(0, |generation| *generation)
+}
+
+fn signal_wake(wake: &(Mutex<u64>, Condvar)) {
+    if let Ok(mut generation) = wake.0.lock() {
+        *generation = generation.wrapping_add(1);
+        wake.1.notify_one();
+    }
+}
+
+fn wait_for_wake(wake: &(Mutex<u64>, Condvar), observed: u64, timeout: Duration) -> u64 {
+    let (generation, condvar) = wake;
+    let Ok(generation) = generation.lock() else {
+        // Practically unreachable — nothing inside this lock can panic — but the
+        // fallback still has to sleep. Returning straight away would turn a
+        // poisoned mutex into a loop that ticks the driver as fast as it can,
+        // hammering the database and the server instead of degrading quietly.
+        std::thread::sleep(timeout);
+        return observed;
+    };
+    if *generation != observed {
+        return *generation;
+    }
+    condvar
+        .wait_timeout_while(generation, timeout, |current| *current == observed)
+        .map_or(observed, |(current, _)| *current)
 }
 
 fn check_timezone_offset(offset_minutes: i32) -> Result<(), AppleEngineError> {
@@ -1642,6 +2078,185 @@ mod tests {
         );
 
         drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    // --- Sync bridge ----------------------------------------------------
+
+    use std::sync::atomic::AtomicUsize;
+
+    /// A `TokenProvider` over an in-memory cell, counting `get_token` calls so
+    /// tests can assert `ForeignTokenStore` actually caches rather than
+    /// forwarding every read.
+    #[derive(Debug, Default)]
+    struct TestTokenProvider {
+        token: Mutex<Option<String>>,
+        get_calls: AtomicUsize,
+        fail_writes: AtomicBool,
+    }
+
+    impl TestTokenProvider {
+        fn new(initial: Option<&str>) -> Self {
+            TestTokenProvider {
+                token: Mutex::new(initial.map(str::to_string)),
+                get_calls: AtomicUsize::new(0),
+                fail_writes: AtomicBool::new(false),
+            }
+        }
+    }
+
+    impl TokenProvider for TestTokenProvider {
+        fn get_token(&self) -> Result<Option<String>, TokenError> {
+            self.get_calls.fetch_add(1, Ordering::Relaxed);
+            Ok(self.token.lock().unwrap().clone())
+        }
+
+        fn set_token(&self, token: String) -> Result<(), TokenError> {
+            if self.fail_writes.load(Ordering::Relaxed) {
+                return Err(TokenError::Keychain {
+                    message: "write denied".to_string(),
+                });
+            }
+            *self.token.lock().unwrap() = Some(token);
+            Ok(())
+        }
+
+        fn clear_token(&self) -> Result<(), TokenError> {
+            if self.fail_writes.load(Ordering::Relaxed) {
+                return Err(TokenError::Keychain {
+                    message: "write denied".to_string(),
+                });
+            }
+            *self.token.lock().unwrap() = None;
+            Ok(())
+        }
+    }
+
+    /// A `SyncObserver` that records every pushed snapshot for later inspection.
+    #[derive(Debug, Default)]
+    struct TestObserver {
+        snapshots: Mutex<Vec<SyncStatusSnapshot>>,
+    }
+
+    impl SyncObserver for TestObserver {
+        fn on_status(&self, status: SyncStatusSnapshot) {
+            self.snapshots.lock().unwrap().push(status);
+        }
+    }
+
+    impl TestObserver {
+        fn count(&self) -> usize {
+            self.snapshots.lock().unwrap().len()
+        }
+    }
+
+    #[test]
+    fn foreign_token_store_caches_reads_and_absorbs_a_write() {
+        let provider = Arc::new(TestTokenProvider::new(Some("first")));
+        let store = ForeignTokenStore::new(Arc::clone(&provider) as Arc<dyn TokenProvider>);
+
+        // The important assertion: three reads, one provider call.
+        assert_eq!(store.get_token().unwrap().as_deref(), Some("first"));
+        assert_eq!(store.get_token().unwrap().as_deref(), Some("first"));
+        assert_eq!(store.get_token().unwrap().as_deref(), Some("first"));
+        assert_eq!(provider.get_calls.load(Ordering::Relaxed), 1);
+
+        store.set_token("second").unwrap();
+        assert_eq!(store.get_token().unwrap().as_deref(), Some("second"));
+        // The write updated the cache directly; no extra provider read needed.
+        assert_eq!(provider.get_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn foreign_token_store_caches_an_absent_token() {
+        let provider = Arc::new(TestTokenProvider::new(None));
+        let store = ForeignTokenStore::new(Arc::clone(&provider) as Arc<dyn TokenProvider>);
+
+        assert_eq!(store.get_token().unwrap(), None);
+        assert_eq!(store.get_token().unwrap(), None);
+        assert_eq!(provider.get_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn a_failed_write_leaves_the_cache_untouched() {
+        let provider = Arc::new(TestTokenProvider::new(Some("old")));
+        let store = ForeignTokenStore::new(Arc::clone(&provider) as Arc<dyn TokenProvider>);
+        assert_eq!(store.get_token().unwrap().as_deref(), Some("old"));
+
+        provider.fail_writes.store(true, Ordering::Relaxed);
+        assert!(store.set_token("new").is_err());
+
+        // The failed write must not have poisoned the cache with the rejected
+        // value, and reading it back must not have cost a second provider call.
+        assert_eq!(store.get_token().unwrap().as_deref(), Some("old"));
+        assert_eq!(provider.get_calls.load(Ordering::Relaxed), 1);
+    }
+
+    #[test]
+    fn sync_controller_token_round_trip_and_repeated_shutdown() {
+        let (engine, dir) = temp_engine();
+        let provider: Arc<dyn TokenProvider> = Arc::new(TestTokenProvider::new(None));
+        let observer: Arc<dyn SyncObserver> = Arc::new(TestObserver::default());
+        let controller = SyncController::new(engine, provider, observer).unwrap();
+
+        assert!(!controller.has_token().unwrap());
+        controller.set_token("a-token".to_string()).unwrap();
+        assert!(controller.has_token().unwrap());
+        controller.clear_token().unwrap();
+        assert!(!controller.has_token().unwrap());
+
+        controller.shutdown(2_000);
+        // A second shutdown, after the thread has already stopped, must not panic.
+        controller.shutdown(2_000);
+
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Before the driver thread has run a tick with real PHR settings
+    /// configured, its output is indistinguishable from the seeded idle
+    /// default — no server URL means no flush is ever attempted — so this
+    /// holds whether or not a tick has actually landed by the time `status()`
+    /// is called, without asserting on any network outcome.
+    #[test]
+    fn status_never_panics_and_starts_idle() {
+        let (engine, dir) = temp_engine();
+        let provider: Arc<dyn TokenProvider> = Arc::new(TestTokenProvider::new(None));
+        let observer: Arc<dyn SyncObserver> = Arc::new(TestObserver::default());
+        let controller = SyncController::new(engine, provider, observer).unwrap();
+
+        let status = controller.status();
+        assert!(matches!(status.state, SyncState::Idle));
+        assert_eq!(status.pending_events, 0);
+        assert_eq!(status.last_success_epoch_ms, None);
+
+        controller.shutdown(2_000);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Exercises the whole thread wiring end to end: the driver spawns, ticks,
+    /// and pushes its result to the Swift-side observer. Everything else here
+    /// tests the pieces; nothing else tests that they are actually connected.
+    #[test]
+    fn the_driver_thread_pushes_status_to_the_observer() {
+        let (engine, dir) = temp_engine();
+        let observer = Arc::new(TestObserver::default());
+        let controller = SyncController::new(
+            engine,
+            Arc::new(TestTokenProvider::new(None)),
+            Arc::clone(&observer) as Arc<dyn SyncObserver>,
+        )
+        .unwrap();
+
+        controller.sync_now();
+        // Polled rather than slept on a fixed delay: the first tick is
+        // near-immediate, and a fixed sleep would be either flaky or slow.
+        let deadline = Instant::now() + Duration::from_secs(5);
+        while observer.count() == 0 && Instant::now() < deadline {
+            std::thread::sleep(Duration::from_millis(10));
+        }
+        assert!(observer.count() > 0, "the observer was never called");
+
+        controller.shutdown(2_000);
         let _ = std::fs::remove_dir_all(dir);
     }
 }

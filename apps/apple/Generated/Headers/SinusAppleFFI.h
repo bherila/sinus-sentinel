@@ -257,6 +257,34 @@ typedef void (*UniffiCallbackInterfaceModelRunnerMethod1)(uint64_t, RustBuffer, 
     );
 
 #endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_SYNC_OBSERVER_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_SYNC_OBSERVER_METHOD0
+typedef void (*UniffiCallbackInterfaceSyncObserverMethod0)(uint64_t, RustBuffer, void* _Nonnull,
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_TOKEN_PROVIDER_METHOD0
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_TOKEN_PROVIDER_METHOD0
+typedef void (*UniffiCallbackInterfaceTokenProviderMethod0)(uint64_t, RustBuffer* _Nonnull,
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_TOKEN_PROVIDER_METHOD1
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_TOKEN_PROVIDER_METHOD1
+typedef void (*UniffiCallbackInterfaceTokenProviderMethod1)(uint64_t, RustBuffer, void* _Nonnull,
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
+#ifndef UNIFFI_FFIDEF_CALLBACK_INTERFACE_TOKEN_PROVIDER_METHOD2
+#define UNIFFI_FFIDEF_CALLBACK_INTERFACE_TOKEN_PROVIDER_METHOD2
+typedef void (*UniffiCallbackInterfaceTokenProviderMethod2)(uint64_t, void* _Nonnull,
+        RustCallStatus *_Nonnull uniffiCallStatus
+    );
+
+#endif
 #ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_MODEL_RUNNER
 #define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_MODEL_RUNNER
 typedef struct UniffiVTableCallbackInterfaceModelRunner {
@@ -265,6 +293,26 @@ typedef struct UniffiVTableCallbackInterfaceModelRunner {
     UniffiCallbackInterfaceModelRunnerMethod0 _Nonnull modelVersion;
     UniffiCallbackInterfaceModelRunnerMethod1 _Nonnull infer;
 } UniffiVTableCallbackInterfaceModelRunner;
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_SYNC_OBSERVER
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_SYNC_OBSERVER
+typedef struct UniffiVTableCallbackInterfaceSyncObserver {
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+    UniffiCallbackInterfaceClone _Nonnull uniffiClone;
+    UniffiCallbackInterfaceSyncObserverMethod0 _Nonnull onStatus;
+} UniffiVTableCallbackInterfaceSyncObserver;
+
+#endif
+#ifndef UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_TOKEN_PROVIDER
+#define UNIFFI_FFIDEF_V_TABLE_CALLBACK_INTERFACE_TOKEN_PROVIDER
+typedef struct UniffiVTableCallbackInterfaceTokenProvider {
+    UniffiCallbackInterfaceFree _Nonnull uniffiFree;
+    UniffiCallbackInterfaceClone _Nonnull uniffiClone;
+    UniffiCallbackInterfaceTokenProviderMethod0 _Nonnull getToken;
+    UniffiCallbackInterfaceTokenProviderMethod1 _Nonnull setToken;
+    UniffiCallbackInterfaceTokenProviderMethod2 _Nonnull clearToken;
+} UniffiVTableCallbackInterfaceTokenProvider;
 
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_CLONE_APPLEENGINE
@@ -470,6 +518,101 @@ RustBuffer uniffi_sinus_apple_fn_method_modelrunner_model_version(uint64_t ptr, 
 #ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_MODELRUNNER_INFER
 #define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_MODELRUNNER_INFER
 RustBuffer uniffi_sinus_apple_fn_method_modelrunner_infer(uint64_t ptr, RustBuffer log_mel, uint32_t frames, uint32_t bands, int8_t energy_peak, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_CLONE_SYNCCONTROLLER
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_CLONE_SYNCCONTROLLER
+uint64_t uniffi_sinus_apple_fn_clone_synccontroller(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_FREE_SYNCCONTROLLER
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_FREE_SYNCCONTROLLER
+void uniffi_sinus_apple_fn_free_synccontroller(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_CONSTRUCTOR_SYNCCONTROLLER_NEW
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_CONSTRUCTOR_SYNCCONTROLLER_NEW
+uint64_t uniffi_sinus_apple_fn_constructor_synccontroller_new(uint64_t engine, uint64_t tokens, uint64_t observer, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_CLEAR_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_CLEAR_TOKEN
+void uniffi_sinus_apple_fn_method_synccontroller_clear_token(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_HAS_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_HAS_TOKEN
+int8_t uniffi_sinus_apple_fn_method_synccontroller_has_token(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_SET_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_SET_TOKEN
+void uniffi_sinus_apple_fn_method_synccontroller_set_token(uint64_t ptr, RustBuffer token, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_SHUTDOWN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_SHUTDOWN
+void uniffi_sinus_apple_fn_method_synccontroller_shutdown(uint64_t ptr, uint64_t timeout_ms, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_STATUS
+RustBuffer uniffi_sinus_apple_fn_method_synccontroller_status(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_SYNC_NOW
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCCONTROLLER_SYNC_NOW
+void uniffi_sinus_apple_fn_method_synccontroller_sync_now(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_CLONE_SYNCOBSERVER
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_CLONE_SYNCOBSERVER
+uint64_t uniffi_sinus_apple_fn_clone_syncobserver(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_FREE_SYNCOBSERVER
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_FREE_SYNCOBSERVER
+void uniffi_sinus_apple_fn_free_syncobserver(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_INIT_CALLBACK_VTABLE_SYNCOBSERVER
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_INIT_CALLBACK_VTABLE_SYNCOBSERVER
+void uniffi_sinus_apple_fn_init_callback_vtable_syncobserver(const UniffiVTableCallbackInterfaceSyncObserver* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCOBSERVER_ON_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_SYNCOBSERVER_ON_STATUS
+void uniffi_sinus_apple_fn_method_syncobserver_on_status(uint64_t ptr, RustBuffer status, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_CLONE_TOKENPROVIDER
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_CLONE_TOKENPROVIDER
+uint64_t uniffi_sinus_apple_fn_clone_tokenprovider(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_FREE_TOKENPROVIDER
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_FREE_TOKENPROVIDER
+void uniffi_sinus_apple_fn_free_tokenprovider(uint64_t handle, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_INIT_CALLBACK_VTABLE_TOKENPROVIDER
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_INIT_CALLBACK_VTABLE_TOKENPROVIDER
+void uniffi_sinus_apple_fn_init_callback_vtable_tokenprovider(const UniffiVTableCallbackInterfaceTokenProvider* _Nonnull vtable
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_TOKENPROVIDER_GET_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_TOKENPROVIDER_GET_TOKEN
+RustBuffer uniffi_sinus_apple_fn_method_tokenprovider_get_token(uint64_t ptr, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_TOKENPROVIDER_SET_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_TOKENPROVIDER_SET_TOKEN
+void uniffi_sinus_apple_fn_method_tokenprovider_set_token(uint64_t ptr, RustBuffer token, RustCallStatus *_Nonnull out_status
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_TOKENPROVIDER_CLEAR_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_METHOD_TOKENPROVIDER_CLEAR_TOKEN
+void uniffi_sinus_apple_fn_method_tokenprovider_clear_token(uint64_t ptr, RustCallStatus *_Nonnull out_status
 );
 #endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_FN_FUNC_TEACH_COUNTDOWN_SAMPLES
@@ -978,9 +1121,75 @@ uint16_t uniffi_sinus_apple_checksum_method_modelrunner_infer(void
 
 );
 #endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_CLEAR_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_CLEAR_TOKEN
+uint16_t uniffi_sinus_apple_checksum_method_synccontroller_clear_token(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_HAS_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_HAS_TOKEN
+uint16_t uniffi_sinus_apple_checksum_method_synccontroller_has_token(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_SET_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_SET_TOKEN
+uint16_t uniffi_sinus_apple_checksum_method_synccontroller_set_token(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_SHUTDOWN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_SHUTDOWN
+uint16_t uniffi_sinus_apple_checksum_method_synccontroller_shutdown(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_STATUS
+uint16_t uniffi_sinus_apple_checksum_method_synccontroller_status(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_SYNC_NOW
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCCONTROLLER_SYNC_NOW
+uint16_t uniffi_sinus_apple_checksum_method_synccontroller_sync_now(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCOBSERVER_ON_STATUS
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_SYNCOBSERVER_ON_STATUS
+uint16_t uniffi_sinus_apple_checksum_method_syncobserver_on_status(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_TOKENPROVIDER_GET_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_TOKENPROVIDER_GET_TOKEN
+uint16_t uniffi_sinus_apple_checksum_method_tokenprovider_get_token(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_TOKENPROVIDER_SET_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_TOKENPROVIDER_SET_TOKEN
+uint16_t uniffi_sinus_apple_checksum_method_tokenprovider_set_token(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_TOKENPROVIDER_CLEAR_TOKEN
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_METHOD_TOKENPROVIDER_CLEAR_TOKEN
+uint16_t uniffi_sinus_apple_checksum_method_tokenprovider_clear_token(void
+
+);
+#endif
 #ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_CONSTRUCTOR_APPLEENGINE_NEW
 #define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_CONSTRUCTOR_APPLEENGINE_NEW
 uint16_t uniffi_sinus_apple_checksum_constructor_appleengine_new(void
+
+);
+#endif
+#ifndef UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_CONSTRUCTOR_SYNCCONTROLLER_NEW
+#define UNIFFI_FFIDEF_UNIFFI_SINUS_APPLE_CHECKSUM_CONSTRUCTOR_SYNCCONTROLLER_NEW
+uint16_t uniffi_sinus_apple_checksum_constructor_synccontroller_new(void
 
 );
 #endif

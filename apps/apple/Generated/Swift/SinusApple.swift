@@ -1541,6 +1541,745 @@ public func FfiConverterTypeModelRunner_lower(_ value: ModelRunner) -> UInt64 {
 
 
 
+
+
+/**
+ * Runs [`sinus_app::sync::SyncDriver`] on its own thread against its own
+ * database connection, pushing every tick's result to a Swift-side
+ * [`SyncObserver`].
+ *
+ * Takes `Arc<AppleEngine>` rather than the raw config the engine was built
+ * from, and holds onto it for as long as the controller lives: a
+ * `SyncController` can then structurally not exist unless this process holds
+ * the machine's `InstanceGuard` (owned by `AppleEngine`), so two shells can
+ * never sync the same database concurrently, and dropping the caller's own
+ * `Arc<AppleEngine>` while keeping the controller cannot release the guard
+ * out from under it.
+ */
+public protocol SyncControllerProtocol: AnyObject, Sendable {
+
+    /**
+     * See [`Self::set_token`] — routes through the same store for the same reason.
+     */
+    func clearToken() throws
+
+    func hasToken() throws  -> Bool
+
+    /**
+     * Routes through the controller's `TokenStore` rather than letting Swift
+     * write the Keychain directly, so the `ForeignTokenStore` cache the
+     * driver thread reads from stays coherent instead of serving a stale
+     * token until relaunch.
+     */
+    func setToken(token: String) throws
+
+    /**
+     * Stop the driver thread and wait up to `timeout_ms` for it to finish its
+     * final flush. The deterministic counterpart to `Drop`, which signals stop
+     * but does not join.
+     */
+    func shutdown(timeoutMs: UInt64)
+
+    /**
+     * The last snapshot pushed to the observer, for a view that appears after
+     * a tick rather than before it.
+     */
+    func status()  -> SyncStatusSnapshot
+
+    /**
+     * Ask for a flush now, regardless of schedule. Returns immediately; the
+     * result arrives via the observer.
+     */
+    func syncNow()
+
+}
+/**
+ * Runs [`sinus_app::sync::SyncDriver`] on its own thread against its own
+ * database connection, pushing every tick's result to a Swift-side
+ * [`SyncObserver`].
+ *
+ * Takes `Arc<AppleEngine>` rather than the raw config the engine was built
+ * from, and holds onto it for as long as the controller lives: a
+ * `SyncController` can then structurally not exist unless this process holds
+ * the machine's `InstanceGuard` (owned by `AppleEngine`), so two shells can
+ * never sync the same database concurrently, and dropping the caller's own
+ * `Arc<AppleEngine>` while keeping the controller cannot release the guard
+ * out from under it.
+ */
+open class SyncController: SyncControllerProtocol, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sinus_apple_fn_clone_synccontroller(self.handle, $0) }
+    }
+public convenience init(engine: AppleEngine, tokens: TokenProvider, observer: SyncObserver)throws  {
+    let handle =
+        try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_constructor_synccontroller_new(
+        FfiConverterTypeAppleEngine_lower(engine),
+        FfiConverterTypeTokenProvider_lower(tokens),
+        FfiConverterTypeSyncObserver_lower(observer),uniffiCallStatus
+    )
+}
+    self.init(unsafeFromHandle: handle)
+}
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sinus_apple_fn_free_synccontroller(handle, $0) }
+    }
+
+
+
+
+    /**
+     * See [`Self::set_token`] — routes through the same store for the same reason.
+     */
+open func clearToken()throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_synccontroller_clear_token(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+
+open func hasToken()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_synccontroller_has_token(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Routes through the controller's `TokenStore` rather than letting Swift
+     * write the Keychain directly, so the `ForeignTokenStore` cache the
+     * driver thread reads from stays coherent instead of serving a stale
+     * token until relaunch.
+     */
+open func setToken(token: String)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_synccontroller_set_token(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(token),uniffiCallStatus
+    )
+}
+}
+
+    /**
+     * Stop the driver thread and wait up to `timeout_ms` for it to finish its
+     * final flush. The deterministic counterpart to `Drop`, which signals stop
+     * but does not join.
+     */
+open func shutdown(timeoutMs: UInt64)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_synccontroller_shutdown(
+            self.uniffiCloneHandle(),
+        FfiConverterUInt64.lower(timeoutMs),uniffiCallStatus
+    )
+}
+}
+
+    /**
+     * The last snapshot pushed to the observer, for a view that appears after
+     * a tick rather than before it.
+     */
+open func status() -> SyncStatusSnapshot  {
+    return try!  FfiConverterTypeSyncStatusSnapshot_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_synccontroller_status(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Ask for a flush now, regardless of schedule. Returns immediately; the
+     * result arrives via the observer.
+     */
+open func syncNow()  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_synccontroller_sync_now(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+
+
+
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncController: FfiConverter {
+    typealias FfiType = UInt64
+    typealias SwiftType = SyncController
+
+    public static func lift(_ handle: UInt64) throws -> SyncController {
+        return SyncController(unsafeFromHandle: handle)
+    }
+
+    public static func lower(_ value: SyncController) -> UInt64 {
+        return value.uniffiCloneHandle()
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncController {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: SyncController, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncController_lift(_ handle: UInt64) throws -> SyncController {
+    return try FfiConverterTypeSyncController.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncController_lower(_ value: SyncController) -> UInt64 {
+    return FfiConverterTypeSyncController.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Implemented in Swift to receive sync status pushes.
+ */
+public protocol SyncObserver: AnyObject, Sendable {
+
+    /**
+     * Called on the driver thread, not the main thread — Swift implementations
+     * must hop to the main actor before touching UI state.
+     */
+    func onStatus(status: SyncStatusSnapshot)
+
+}
+/**
+ * Implemented in Swift to receive sync status pushes.
+ */
+open class SyncObserverImpl: SyncObserver, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sinus_apple_fn_clone_syncobserver(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sinus_apple_fn_free_syncobserver(handle, $0) }
+    }
+
+
+
+
+    /**
+     * Called on the driver thread, not the main thread — Swift implementations
+     * must hop to the main actor before touching UI state.
+     */
+open func onStatus(status: SyncStatusSnapshot)  {try! rustCall() {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_syncobserver_on_status(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeSyncStatusSnapshot_lower(status),uniffiCallStatus
+    )
+}
+}
+
+
+
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceSyncObserver {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceSyncObserver = UniffiVTableCallbackInterfaceSyncObserver(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeSyncObserver.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface SyncObserver: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeSyncObserver.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface SyncObserver: handle missing in uniffiClone")
+            }
+        },
+        onStatus: { (
+            uniffiHandle: UInt64,
+            status: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeSyncObserver.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return uniffiObj.onStatus(
+                     status: try FfiConverterTypeSyncStatusSnapshot_lift(status)
+                )
+            }
+
+
+            let writeReturn = { () }
+            uniffiTraitInterfaceCall(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceSyncObserver> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceSyncObserver>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitSyncObserver() {
+    uniffi_sinus_apple_fn_init_callback_vtable_syncobserver(UniffiCallbackInterfaceSyncObserver.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncObserver: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<SyncObserver>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = SyncObserver
+
+    public static func lift(_ handle: UInt64) throws -> SyncObserver {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return SyncObserverImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: SyncObserver) -> UInt64 {
+         if let rustImpl = value as? SyncObserverImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncObserver {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: SyncObserver, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncObserver_lift(_ handle: UInt64) throws -> SyncObserver {
+    return try FfiConverterTypeSyncObserver.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncObserver_lower(_ value: SyncObserver) -> UInt64 {
+    return FfiConverterTypeSyncObserver.lower(value)
+}
+
+
+
+
+
+
+/**
+ * Implemented in Swift over Security.framework. Rust never stores the PHR
+ * bearer token itself on Apple platforms — the Keychain is the only copy, and
+ * it is bound to the app's code signature rather than to a file Rust could read.
+ */
+public protocol TokenProvider: AnyObject, Sendable {
+
+    func getToken() throws  -> String?
+
+    func setToken(token: String) throws
+
+    func clearToken() throws
+
+}
+/**
+ * Implemented in Swift over Security.framework. Rust never stores the PHR
+ * bearer token itself on Apple platforms — the Keychain is the only copy, and
+ * it is bound to the app's code signature rather than to a file Rust could read.
+ */
+open class TokenProviderImpl: TokenProvider, @unchecked Sendable {
+    fileprivate let handle: UInt64
+
+    /// Used to instantiate a [FFIObject] without an actual handle, for fakes in tests, mostly.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public struct NoHandle {
+        public init() {}
+    }
+
+    // TODO: We'd like this to be `private` but for Swifty reasons,
+    // we can't implement `FfiConverter` without making this `required` and we can't
+    // make it `required` without making it `public`.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    required public init(unsafeFromHandle handle: UInt64) {
+        self.handle = handle
+    }
+
+    // This constructor can be used to instantiate a fake object.
+    // - Parameter noHandle: Placeholder value so we can have a constructor separate from the default empty one that may be implemented for classes extending [FFIObject].
+    //
+    // - Warning:
+    //     Any object instantiated with this constructor cannot be passed to an actual Rust-backed object. Since there isn't a backing handle the FFI lower functions will crash.
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public init(noHandle: NoHandle) {
+        self.handle = 0
+    }
+
+#if swift(>=5.8)
+    @_documentation(visibility: private)
+#endif
+    public func uniffiCloneHandle() -> UInt64 {
+        return try! rustCall { uniffi_sinus_apple_fn_clone_tokenprovider(self.handle, $0) }
+    }
+    // No primary constructor declared for this class.
+
+    deinit {
+        if handle == 0 {
+            // Mock objects have handle=0 don't try to free them
+            return
+        }
+
+        try! rustCall { uniffi_sinus_apple_fn_free_tokenprovider(handle, $0) }
+    }
+
+
+
+
+open func getToken()throws  -> String?  {
+    return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeTokenError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_tokenprovider_get_token(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+open func setToken(token: String)throws   {try rustCallWithError(FfiConverterTypeTokenError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_tokenprovider_set_token(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(token),uniffiCallStatus
+    )
+}
+}
+
+open func clearToken()throws   {try rustCallWithError(FfiConverterTypeTokenError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_tokenprovider_clear_token(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+
+
+
+}
+
+
+
+// Put the implementation in a struct so we don't pollute the top-level namespace
+fileprivate struct UniffiCallbackInterfaceTokenProvider {
+
+    // Create the VTable using a series of closures.
+    // Swift automatically converts these into C callback functions.
+    //
+    // Store the vtable directly.
+    static let vtable: UniffiVTableCallbackInterfaceTokenProvider = UniffiVTableCallbackInterfaceTokenProvider(
+        uniffiFree: { (uniffiHandle: UInt64) -> () in
+            do {
+                try FfiConverterTypeTokenProvider.handleMap.remove(handle: uniffiHandle)
+            } catch {
+                print("Uniffi callback interface TokenProvider: handle missing in uniffiFree")
+            }
+        },
+        uniffiClone: { (uniffiHandle: UInt64) -> UInt64 in
+            do {
+                return try FfiConverterTypeTokenProvider.handleMap.clone(handle: uniffiHandle)
+            } catch {
+                fatalError("Uniffi callback interface TokenProvider: handle missing in uniffiClone")
+            }
+        },
+        getToken: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutablePointer<RustBuffer>,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> String? in
+                guard let uniffiObj = try? FfiConverterTypeTokenProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.getToken(
+                )
+            }
+
+
+            let writeReturn = { uniffiOutReturn.pointee = FfiConverterOptionString.lower($0) }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeTokenError_lower
+            )
+        },
+        setToken: { (
+            uniffiHandle: UInt64,
+            token: RustBuffer,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeTokenProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.setToken(
+                     token: try FfiConverterString.lift(token)
+                )
+            }
+
+
+            let writeReturn = { () }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeTokenError_lower
+            )
+        },
+        clearToken: { (
+            uniffiHandle: UInt64,
+            uniffiOutReturn: UnsafeMutableRawPointer,
+            uniffiCallStatus: UnsafeMutablePointer<RustCallStatus>
+        ) in
+            let makeCall = {
+                () throws -> () in
+                guard let uniffiObj = try? FfiConverterTypeTokenProvider.handleMap.get(handle: uniffiHandle) else {
+                    throw UniffiInternalError.unexpectedStaleHandle
+                }
+                return try uniffiObj.clearToken(
+                )
+            }
+
+
+            let writeReturn = { () }
+            uniffiTraitInterfaceCallWithError(
+                callStatus: uniffiCallStatus,
+                makeCall: makeCall,
+                writeReturn: writeReturn,
+                lowerError: FfiConverterTypeTokenError_lower
+            )
+        }
+    )
+
+    // Rust stores this pointer for future callback invocations, so it must live
+    // for the process lifetime (not just for the init function call).
+    //
+    // `nonisolated(unsafe)` is needed under Swift 6 strict concurrency.
+    // This is safe because the pointee is initialized once during static init
+    // and never mutated by either side of the FFI.  Its fields are C function pointers.
+    nonisolated(unsafe) static let vtablePtr: UnsafePointer<UniffiVTableCallbackInterfaceTokenProvider> = {
+        let ptr = UnsafeMutablePointer<UniffiVTableCallbackInterfaceTokenProvider>.allocate(capacity: 1)
+        ptr.initialize(to: vtable)
+        return UnsafePointer(ptr)
+    }()
+}
+
+private func uniffiCallbackInitTokenProvider() {
+    uniffi_sinus_apple_fn_init_callback_vtable_tokenprovider(UniffiCallbackInterfaceTokenProvider.vtablePtr)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTokenProvider: FfiConverter {
+    fileprivate static let handleMap = UniffiHandleMap<TokenProvider>()
+
+    typealias FfiType = UInt64
+    typealias SwiftType = TokenProvider
+
+    public static func lift(_ handle: UInt64) throws -> TokenProvider {
+        if ((handle & 1) == 0) {
+            // Rust-generated handle, construct a new class that uses the handle to implement the
+            // interface
+            return TokenProviderImpl(unsafeFromHandle: handle)
+        } else {
+            // Swift-generated handle, get the object from the handle map
+            return try handleMap.remove(handle: handle)
+        }
+    }
+
+    public static func lower(_ value: TokenProvider) -> UInt64 {
+         if let rustImpl = value as? TokenProviderImpl {
+             // Rust-implemented object.  Clone the handle and return it
+            return rustImpl.uniffiCloneHandle()
+         } else {
+            // Swift object, generate a new vtable handle and return that.
+            return handleMap.insert(obj: value)
+         }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TokenProvider {
+        let handle: UInt64 = try readInt(&buf)
+        return try lift(handle)
+    }
+
+    public static func write(_ value: TokenProvider, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTokenProvider_lift(_ handle: UInt64) throws -> TokenProvider {
+    return try FfiConverterTypeTokenProvider.lift(handle)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTokenProvider_lower(_ value: TokenProvider) -> UInt64 {
+    return FfiConverterTypeTokenProvider.lower(value)
+}
+
+
+
+
 /**
  * Only what the platform knows. The device identity, sensitivity and battery
  * policy all live in the database, which this machine's other Sinus Sentinel
@@ -2417,6 +3156,135 @@ public func FfiConverterTypeQuietHours_lower(_ value: QuietHours) -> RustBuffer 
 
 
 /**
+ * One tick's worth of sync state, pushed to the shell rather than polled —
+ * the driver thread sleeps between ticks, so a poll would either be stale or
+ * force it awake.
+ */
+public struct SyncStatusSnapshot: Equatable, Hashable {
+    public let state: SyncState
+    public let mode: SyncMode
+    /**
+     * Badge count — events only, which is what "pending" means to a user.
+     */
+    public let pendingEvents: UInt32
+    /**
+     * The flush gate: events plus tombstones, flags and enrollments.
+     */
+    public let pendingWork: UInt32
+    /**
+     * Whether the current local hour falls in the quiet-hours window.
+     */
+    public let quiet: Bool
+    /**
+     * The failure text from the last attempt, if it failed. Before this
+     * existed the reason only reached stderr, so a user saw "sync failing"
+     * with no way to learn why.
+     *
+     * The shell distinguishes exactly two failures by substring rather than
+     * by a structured error code: text containing "no API token configured"
+     * (see `sinus_core::sync::SyncEngine::bearer`) means the PHR API token
+     * has not been set and the user should be sent to Settings › PHR; text
+     * containing "keychain" (see `TokenError::Keychain`) means the Keychain
+     * read itself failed. This comment is the contract — do not add parsing
+     * or error-code plumbing in Rust for it.
+     */
+    public let error: String?
+    /**
+     * Epoch milliseconds of the last successful flush; `None` if none yet.
+     */
+    public let lastSuccessEpochMs: Int64?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(state: SyncState, mode: SyncMode,
+        /**
+         * Badge count — events only, which is what "pending" means to a user.
+         */pendingEvents: UInt32,
+        /**
+         * The flush gate: events plus tombstones, flags and enrollments.
+         */pendingWork: UInt32,
+        /**
+         * Whether the current local hour falls in the quiet-hours window.
+         */quiet: Bool,
+        /**
+         * The failure text from the last attempt, if it failed. Before this
+         * existed the reason only reached stderr, so a user saw "sync failing"
+         * with no way to learn why.
+         *
+         * The shell distinguishes exactly two failures by substring rather than
+         * by a structured error code: text containing "no API token configured"
+         * (see `sinus_core::sync::SyncEngine::bearer`) means the PHR API token
+         * has not been set and the user should be sent to Settings › PHR; text
+         * containing "keychain" (see `TokenError::Keychain`) means the Keychain
+         * read itself failed. This comment is the contract — do not add parsing
+         * or error-code plumbing in Rust for it.
+         */error: String?,
+        /**
+         * Epoch milliseconds of the last successful flush; `None` if none yet.
+         */lastSuccessEpochMs: Int64?) {
+        self.state = state
+        self.mode = mode
+        self.pendingEvents = pendingEvents
+        self.pendingWork = pendingWork
+        self.quiet = quiet
+        self.error = error
+        self.lastSuccessEpochMs = lastSuccessEpochMs
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SyncStatusSnapshot: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncStatusSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncStatusSnapshot {
+        return
+            try SyncStatusSnapshot(
+                state: FfiConverterTypeSyncState.read(from: &buf),
+                mode: FfiConverterTypeSyncMode.read(from: &buf),
+                pendingEvents: FfiConverterUInt32.read(from: &buf),
+                pendingWork: FfiConverterUInt32.read(from: &buf),
+                quiet: FfiConverterBool.read(from: &buf),
+                error: FfiConverterOptionString.read(from: &buf),
+                lastSuccessEpochMs: FfiConverterOptionInt64.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: SyncStatusSnapshot, into buf: inout [UInt8]) {
+        FfiConverterTypeSyncState.write(value.state, into: &buf)
+        FfiConverterTypeSyncMode.write(value.mode, into: &buf)
+        FfiConverterUInt32.write(value.pendingEvents, into: &buf)
+        FfiConverterUInt32.write(value.pendingWork, into: &buf)
+        FfiConverterBool.write(value.quiet, into: &buf)
+        FfiConverterOptionString.write(value.error, into: &buf)
+        FfiConverterOptionInt64.write(value.lastSuccessEpochMs, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncStatusSnapshot_lift(_ buf: RustBuffer) throws -> SyncStatusSnapshot {
+    return try FfiConverterTypeSyncStatusSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncStatusSnapshot_lower(_ value: SyncStatusSnapshot) -> RustBuffer {
+    return FfiConverterTypeSyncStatusSnapshot.lower(value)
+}
+
+
+/**
  * The outcome of enrolling one take.
  */
 public struct TeachResult: Equatable, Hashable {
@@ -3204,6 +4072,160 @@ public func FfiConverterTypeSyncMode_lower(_ value: SyncMode) -> RustBuffer {
 
 
 /**
+ * Sync health, mirroring `sinus_app::sync::SyncState`. A separate type so this
+ * crate's FFI surface has no dependency on any shell's UI types, matching why
+ * `sinus_app::sync` keeps its own `SyncState` rather than reusing the desktop
+ * tray's.
+ */
+
+public enum SyncState: Equatable, Hashable, CaseIterable {
+
+    case idle
+    case syncing
+    case failed
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SyncState: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncState: FfiConverterRustBuffer {
+    typealias SwiftType = SyncState
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncState {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .idle
+
+        case 2: return .syncing
+
+        case 3: return .failed
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SyncState, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .idle:
+            writeInt(&buf, Int32(1))
+
+
+        case .syncing:
+            writeInt(&buf, Int32(2))
+
+
+        case .failed:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncState_lift(_ buf: RustBuffer) throws -> SyncState {
+    return try FfiConverterTypeSyncState.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncState_lower(_ value: SyncState) -> RustBuffer {
+    return FfiConverterTypeSyncState.lower(value)
+}
+
+
+
+public
+enum TokenError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
+
+
+
+    case Keychain(message: String
+    )
+
+
+
+
+
+
+    public var errorDescription: String? {
+        String(reflecting: self)
+    }
+
+}
+
+#if compiler(>=6)
+extension TokenError: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTokenError: FfiConverterRustBuffer {
+    typealias SwiftType = TokenError
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TokenError {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+
+
+
+        case 1: return .Keychain(
+            message: try FfiConverterString.read(from: &buf)
+            )
+
+         default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TokenError, into buf: inout [UInt8]) {
+        switch value {
+
+
+
+
+
+        case let .Keychain(message):
+            writeInt(&buf, Int32(1))
+            FfiConverterString.write(message, into: &buf)
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTokenError_lift(_ buf: RustBuffer) throws -> TokenError {
+    return try FfiConverterTypeTokenError.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTokenError_lower(_ value: TokenError) -> RustBuffer {
+    return FfiConverterTypeTokenError.lower(value)
+}
+
+
+/**
  * Where a class stands in Settings. Mirrors `sinus_app::teach::ClassStatus`.
  */
 
@@ -3732,11 +4754,46 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sinus_apple_checksum_method_modelrunner_infer() != 54452) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sinus_apple_checksum_method_synccontroller_clear_token() != 27506) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_synccontroller_has_token() != 47766) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_synccontroller_set_token() != 44047) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_synccontroller_shutdown() != 12791) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_synccontroller_status() != 41476) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_synccontroller_sync_now() != 9245) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_syncobserver_on_status() != 61977) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_tokenprovider_get_token() != 43639) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_tokenprovider_set_token() != 25796) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_tokenprovider_clear_token() != 27302) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sinus_apple_checksum_constructor_appleengine_new() != 27933) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_constructor_synccontroller_new() != 34081) {
         return InitializationResult.apiChecksumMismatch
     }
 
     uniffiCallbackInitModelRunner()
+    uniffiCallbackInitSyncObserver()
+    uniffiCallbackInitTokenProvider()
     return InitializationResult.ok
 }()
 

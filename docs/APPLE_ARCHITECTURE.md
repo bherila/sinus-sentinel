@@ -33,9 +33,54 @@ The Swift shell owns:
 - sample-rate/channel conversion;
 - background, interruption, and route lifecycle;
 - Core ML execution;
+- the PHR bearer token, in the Keychain;
 - Swift Charts and all accessibility/presentation behavior.
 
 No raw PCM crosses into persistence or networking.
+
+## Who owns the token
+
+On Apple platforms Rust never stores the bearer token. The Keychain item is
+bound to the app's code signature, which is something only the shell can
+satisfy, so Swift implements the `TokenProvider` foreign trait over
+Security.framework and Rust reaches the token through it. The `keyring` feature
+in `sinus-core` and `sinus-desktop` stays for the Windows tray app;
+`sinus-apple` does not reference it.
+
+`ForeignTokenStore` adapts that trait to `sinus_core::token::TokenStore` and
+caches. `SyncEngine::bearer()` runs once per HTTP request and a flush makes up
+to five, so an uncached provider turns a backoff storm into a Keychain-prompt
+storm — the same reason `KeyringTokenStore` caches. Token writes therefore go
+through `SyncController::set_token` rather than Swift writing the Keychain
+directly; a direct write would leave that cache serving a stale token until
+relaunch.
+
+Two failures the shell distinguishes by message text, because they need
+different remedies: `"no API token configured"` means send the user to
+Settings › PHR, and anything containing `"keychain"` means the read itself
+failed.
+
+## Who schedules sync
+
+Rust. `SyncController` runs `sinus_app::sync::SyncDriver` on its own thread
+against a third `Store` connection — `Store` is not `Sync`, `tick` needs
+`&mut Store`, and a flush blocks on HTTP for up to 30 seconds, so it can share
+neither the writer nor the reader. Reimplementing the backoff and rebuild rules
+in Swift would have meant two schedulers to keep in agreement.
+
+Status is pushed to a `SyncObserver`, not polled: the thread sleeps between
+ticks, so a poll would be either stale or a reason to wake it. The observer is
+called on the driver thread, so Swift implementations hop to the main actor
+before touching UI state.
+
+`SyncController::new` takes `Arc<AppleEngine>`, which is what makes it
+structurally impossible to sync a database this process does not own — the
+engine holds the `InstanceGuard`. The driver thread holds its own reference for
+the same reason: `Drop` signals stop without joining, so the thread can outlive
+the controller, and releasing the guard mid-flush would let another shell take
+the machine. `shutdown(timeout_ms)` is the bounded, deterministic stop; `Drop`
+deliberately does not block, since a 30-second flush would otherwise hang
+whatever released the last reference.
 
 ## One app per machine
 
@@ -54,9 +99,10 @@ starts first owns the machine:
   *before* opening the database or the microphone, and shows an explanatory
   screen instead of a half-live UI.
 
-Known gap: the marker handoff only works owner-to-owner between tray apps. If the
-SwiftUI app is the owner, launching the tray app exits silently instead of
-revealing the running window — it does not yet consume activation requests.
+`AppleEngine::take_activation_request` consumes that marker, so a SwiftUI owner
+can now raise its window when a second launch bounces off the lock. The Swift
+shell has yet to poll it — until it does, launching the tray app against a
+SwiftUI owner still exits silently.
 
 Everything that is not platform knowledge now comes from that shared database.
 `AppleEngineConfig` carries only the database path and the platform;
