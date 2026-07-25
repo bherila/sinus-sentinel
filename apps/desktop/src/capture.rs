@@ -15,61 +15,18 @@ use std::thread::JoinHandle;
 use chrono::Utc;
 use sinus_core::audio::{AudioSource, CpalAudioSource};
 use sinus_core::classify::embed::{BandHeuristicEmbedder, Embedder, WindowFeatures};
-use sinus_core::classify::proto::PrototypeMatcher;
 use sinus_core::error::Result as CoreResult;
-use sinus_core::mel::{loudest_patch, MelPatch};
+use sinus_core::mel::MelPatch;
 use sinus_core::pipeline::{EventContext, PipelineConfig, StreamingPipeline};
-use sinus_core::store::{EnrollmentInsert, Store};
+use sinus_core::store::Store;
 use sinus_core::types::Source;
 
-use sinus_app::monitor::{
-    prototypes_from_store, PROTOTYPE_NEGATIVE_MARGIN, PROTOTYPE_SIM_THRESHOLD,
-};
+use sinus_app::monitor::prototypes_from_store;
 use sinus_app::settings;
 use sinus_app::state::local_offset_minutes;
+use sinus_app::teach::{self, TakeBuffer};
 
 use crate::shared::{ModelStatus, SharedStatus};
-
-const TEACH_CAPTURE_SAMPLES: usize = sinus_core::types::SAMPLE_RATE as usize * 3;
-const TEACH_COUNTDOWN_SAMPLES: usize = sinus_core::types::SAMPLE_RATE as usize;
-
-struct TeachCapture {
-    class: sinus_core::types::EventType,
-    samples: Vec<f32>,
-    countdown_remaining: usize,
-}
-
-impl TeachCapture {
-    fn new(class: sinus_core::types::EventType) -> Self {
-        TeachCapture {
-            class,
-            samples: Vec::with_capacity(TEACH_CAPTURE_SAMPLES),
-            countdown_remaining: TEACH_COUNTDOWN_SAMPLES,
-        }
-    }
-
-    /// Consume microphone samples, returning true exactly when the countdown
-    /// crosses into recording. Samples before that edge are discarded.
-    fn push(&mut self, input: &[f32]) -> bool {
-        let was_counting_down = self.countdown_remaining > 0;
-        let countdown_samples = self.countdown_remaining.min(input.len());
-        self.countdown_remaining -= countdown_samples;
-        let started_recording = was_counting_down && self.countdown_remaining == 0;
-
-        if self.countdown_remaining == 0 {
-            let remaining = TEACH_CAPTURE_SAMPLES.saturating_sub(self.samples.len());
-            let available = input.len().saturating_sub(countdown_samples).min(remaining);
-            self.samples.extend_from_slice(
-                &input[countdown_samples..countdown_samples.saturating_add(available)],
-            );
-        }
-        started_recording
-    }
-
-    fn is_complete(&self) -> bool {
-        self.samples.len() >= TEACH_CAPTURE_SAMPLES
-    }
-}
 
 /// The backbone the capture thread runs. An enum (not `dyn`) so the generic
 /// [`Pipeline`] stays monomorphized and the ONNX variant only exists when the
@@ -209,7 +166,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
 
     let mut buf = vec![0.0f32; 4096];
     let mut source: Option<CpalAudioSource> = None;
-    let mut teach_capture: Option<TeachCapture> = None;
+    let mut teach_capture: Option<TakeBuffer> = None;
     let mut gate_was_open = false;
     let mut pause_on_low_power = settings::pause_on_low_power(&store);
     let mut last_power_check: Option<std::time::Instant> = None;
@@ -243,7 +200,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             source = None;
             pipeline.reset_stream();
             if let Some(capture) = teach_capture.take() {
-                shared.fail_teach(capture.class);
+                shared.fail_teach(capture.class());
             }
             gate_was_open = false;
             shared.set_analyzing(false);
@@ -261,7 +218,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
 
         if teach_capture.is_none() {
             if let Some(class) = shared.take_teach_request() {
-                teach_capture = Some(TeachCapture::new(class));
+                teach_capture = Some(TakeBuffer::new(class));
             }
         }
 
@@ -276,7 +233,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
         let teaching = teach_capture.is_some();
         if let Some(capture) = teach_capture.as_mut() {
             if capture.push(&buf[..n]) {
-                shared.set_teach_recording(capture.class);
+                shared.set_teach_recording(capture.class());
             }
         }
 
@@ -307,127 +264,27 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             }
         }
 
-        if teach_capture
-            .as_ref()
-            .is_some_and(TeachCapture::is_complete)
-        {
+        if teach_capture.as_ref().is_some_and(TakeBuffer::is_complete) {
             let capture = teach_capture.take().expect("checked above");
-            match save_teach_sample(&store, &mut pipeline, capture.class, &capture.samples) {
-                Ok((examples, similarity, separation)) => {
-                    shared.finish_teach(capture.class, examples, similarity, separation);
+            match teach::enroll_take(&store, &pipeline, capture.class(), capture.samples()) {
+                Ok(result) => {
+                    pipeline
+                        .set_prototypes(prototypes_from_store(&store).map_err(|e| e.to_string())?);
+                    shared.finish_teach(
+                        result.class,
+                        result.examples,
+                        result.similarity,
+                        result.separation,
+                    );
                     // Push the new take so another machine inherits it without
                     // waiting for an unrelated event flush.
                     shared.request_sync_now();
                 }
                 Err(error) => {
                     eprintln!("teach: {error}");
-                    shared.fail_teach(capture.class);
+                    shared.fail_teach(capture.class());
                 }
             }
         }
-    }
-}
-
-fn save_teach_sample(
-    store: &Store,
-    pipeline: &mut StreamingPipeline<CaptureEmbedder>,
-    class: sinus_core::types::EventType,
-    samples: &[f32],
-) -> Result<(usize, f32, f32), String> {
-    let patch = loudest_patch(samples).ok_or("no complete analysis window captured")?;
-    let embedding = pipeline
-        .embed_patch(&patch, true)
-        .map_err(|e| e.to_string())?;
-
-    let existing: Vec<_> = store
-        .enrollments()
-        .map_err(|e| e.to_string())?
-        .into_iter()
-        .map(|stored| stored.enrollment)
-        .collect();
-    let has_same_class = existing.iter().any(|example| example.class == class);
-    let (similarity, separation) = if existing.is_empty() || !has_same_class {
-        (-1.0, 0.0)
-    } else {
-        let matcher = PrototypeMatcher::from_enrollments(
-            &existing,
-            PROTOTYPE_SIM_THRESHOLD,
-            PROTOTYPE_NEGATIVE_MARGIN,
-        );
-        let similarities = matcher.similarities(&embedding);
-        let same = similarities
-            .iter()
-            .find(|(candidate, _)| *candidate == class)
-            .map(|(_, score)| *score)
-            .unwrap_or(-1.0);
-        let other = similarities
-            .iter()
-            .filter(|(candidate, _)| *candidate != class)
-            .map(|(_, score)| *score)
-            .fold(-1.0f32, f32::max);
-        (same, same - other)
-    };
-
-    let quality_similarity = (similarity >= 0.0).then_some(similarity);
-    let quality_separation = (similarity >= 0.0).then_some(separation);
-    let model_version = pipeline.model_version();
-    store
-        .add_enrollment_full(EnrollmentInsert {
-            class,
-            embedding: &embedding,
-            is_negative: false,
-            similarity: quality_similarity,
-            separation: quality_separation,
-            peak_dbfs: peak_dbfs(samples),
-            model_version: Some(&model_version),
-            source_event_uuid: None,
-            // Irrelevant for a positive take; scoping only governs how far a
-            // negative's veto reaches.
-            negative_scoped: false,
-        })
-        .map_err(|e| e.to_string())?;
-    pipeline.set_prototypes(prototypes_from_store(store).map_err(|e| e.to_string())?);
-    let examples = store
-        .enrollment_counts()
-        .map_err(|e| e.to_string())?
-        .get(&class)
-        .copied()
-        .unwrap_or(0) as usize;
-    Ok((examples, similarity, separation))
-}
-
-/// Loudest 50 ms hop in a buffer, dBFS — the same measure events record, so a
-/// take that matches poorly can be checked against how loud it actually was.
-/// `None` for a buffer shorter than one hop.
-fn peak_dbfs(samples: &[f32]) -> Option<f32> {
-    const HOP: usize = sinus_core::types::SAMPLE_RATE as usize / 20;
-
-    samples
-        .chunks_exact(HOP)
-        .map(|hop| {
-            let sum_sq: f64 = hop.iter().map(|&x| (x as f64) * (x as f64)).sum();
-            let rms = (sum_sq / hop.len() as f64).sqrt();
-            20.0 * (rms + 1e-9).log10() as f32
-        })
-        .fold(None, |best: Option<f32>, db| {
-            Some(best.map_or(db, |b| b.max(db)))
-        })
-}
-
-#[cfg(test)]
-mod tests {
-    use super::*;
-
-    #[test]
-    fn teach_capture_discards_countdown_and_keeps_exactly_three_seconds() {
-        let mut capture = TeachCapture::new(sinus_core::types::EventType::Sniffle);
-        assert!(!capture.push(&vec![0.1; TEACH_COUNTDOWN_SAMPLES - 1]));
-        assert!(capture.samples.is_empty());
-        assert!(capture.push(&[0.2, 0.3]));
-        assert_eq!(capture.samples, vec![0.3]);
-
-        assert!(!capture.push(&vec![0.4; TEACH_CAPTURE_SAMPLES + 100]));
-        assert!(capture.is_complete());
-        assert_eq!(capture.samples.len(), TEACH_CAPTURE_SAMPLES);
     }
 }
