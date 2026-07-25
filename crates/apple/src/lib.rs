@@ -7,6 +7,7 @@ use std::fmt;
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
+use sinus_app::instance::InstanceGuard;
 use sinus_app::monitor::{MonitoringConfig, MonitoringEngine};
 use sinus_core::classify::embed::{Embedder, WindowFeatures, AUDIOSET_CLASSES, EMBED_DIM};
 use sinus_core::error::{Error as CoreError, Result as CoreResult};
@@ -57,12 +58,13 @@ impl From<EventType> for AppleEventType {
     }
 }
 
+/// Only what the platform knows. The device identity, sensitivity and battery
+/// policy all live in the database, which this machine's other Sinus Sentinel
+/// shell reads too.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AppleEngineConfig {
     pub database_path: String,
-    pub device_id: String,
     pub platform: ApplePlatform,
-    pub sensitivity: f32,
 }
 
 #[derive(Debug, Clone, uniffi::Record)]
@@ -157,6 +159,11 @@ pub enum AppleEngineError {
     Engine { message: String },
     #[error("model failure: {message}")]
     Model { message: String },
+    /// Another Sinus Sentinel — the menu-bar app, or a second copy of this one —
+    /// already owns this machine's database. Two detectors on one microphone
+    /// would log every event twice, so the second one refuses to start.
+    #[error("another Sinus Sentinel is already running on this computer")]
+    AlreadyRunning,
 }
 
 impl From<CoreError> for AppleEngineError {
@@ -236,6 +243,10 @@ pub struct AppleEngine {
     /// the model. SQLite's WAL mode is built for exactly this — concurrent
     /// readers never block on the writer.
     reader: Mutex<Store>,
+    /// Held for the engine's lifetime. Dropping it — including on a crash, since
+    /// the OS owns the underlying file lock — hands this machine back to whichever
+    /// shell the user opens next.
+    _instance: InstanceGuard,
 }
 
 #[uniffi::export]
@@ -250,11 +261,20 @@ impl AppleEngine {
                 message: "database_path cannot be empty".to_string(),
             });
         }
-        if config.device_id.trim().is_empty() {
-            return Err(AppleEngineError::InvalidArgument {
-                message: "device_id cannot be empty".to_string(),
-            });
-        }
+        let database_path = std::path::Path::new(&config.database_path);
+        let data_dir = database_path
+            .parent()
+            .ok_or_else(|| AppleEngineError::InvalidArgument {
+                message: "database_path must name a file inside a data directory".to_string(),
+            })?;
+        // Claim the machine before touching the microphone or the database, so a
+        // refusal costs nothing and leaves no partially-initialized state.
+        let instance = InstanceGuard::try_acquire(data_dir)
+            .map_err(|error| AppleEngineError::Engine {
+                message: format!("could not establish single-instance ownership: {error}"),
+            })?
+            .ok_or(AppleEngineError::AlreadyRunning)?;
+
         let version = model
             .model_version()
             .map_err(|error| AppleEngineError::Model {
@@ -264,14 +284,16 @@ impl AppleEngine {
             runner: model,
             version,
         };
-        let mut monitoring_config =
-            MonitoringConfig::new(config.platform.source(), config.device_id);
-        monitoring_config.sensitivity = config.sensitivity;
-        let engine = MonitoringEngine::open(&config.database_path, embedder, monitoring_config)?;
+        let engine = MonitoringEngine::open(
+            &config.database_path,
+            embedder,
+            MonitoringConfig::new(config.platform.source()),
+        )?;
         let reader = Store::open(&config.database_path)?;
         Ok(Arc::new(Self {
             inner: Mutex::new(engine),
             reader: Mutex::new(reader),
+            _instance: instance,
         }))
     }
 
@@ -471,77 +493,98 @@ mod tests {
         }
     }
 
-    fn temp_engine() -> (Arc<AppleEngine>, std::path::PathBuf) {
-        let path =
-            std::env::temp_dir().join(format!("sinus-apple-test-{}.db", uuid::Uuid::new_v4()));
-        let engine = AppleEngine::new(
+    /// A private data directory per test: the engine takes a single-instance lock
+    /// on the database's parent, so tests sharing one would contend.
+    fn temp_dir() -> std::path::PathBuf {
+        let dir = std::env::temp_dir().join(format!("sinus-apple-test-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        dir
+    }
+
+    fn engine_in(dir: &std::path::Path) -> Result<Arc<AppleEngine>, AppleEngineError> {
+        AppleEngine::new(
             AppleEngineConfig {
-                database_path: path.to_string_lossy().into_owned(),
-                device_id: "test-device".to_string(),
+                database_path: dir.join("events.db").to_string_lossy().into_owned(),
                 platform: ApplePlatform::Ios,
-                sensitivity: 0.5,
             },
             Arc::new(TestModel),
         )
-        .unwrap();
-        (engine, path)
+    }
+
+    fn temp_engine() -> (Arc<AppleEngine>, std::path::PathBuf) {
+        let dir = temp_dir();
+        let engine = engine_in(&dir).unwrap();
+        (engine, dir)
     }
 
     #[test]
     fn battery_policy_defaults_on_and_round_trips() {
-        let (engine, path) = temp_engine();
+        let (engine, dir) = temp_engine();
         assert!(engine.pause_on_low_power().unwrap());
         engine.set_pause_on_low_power(false).unwrap();
         assert!(!engine.pause_on_low_power().unwrap());
         engine.set_pause_on_low_power(true).unwrap();
         assert!(engine.pause_on_low_power().unwrap());
         drop(engine);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn bridge_rejects_an_impossible_timezone_offset() {
-        let (engine, path) = temp_engine();
+        let (engine, dir) = temp_engine();
         let error = engine.start_monitoring(0, 5_000).unwrap_err();
         assert!(error.to_string().contains("timezone offset"));
         drop(engine);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn bridge_rejects_pcm_before_session_start() {
-        let path =
-            std::env::temp_dir().join(format!("sinus-apple-test-{}.db", uuid::Uuid::new_v4()));
-        let engine = AppleEngine::new(
-            AppleEngineConfig {
-                database_path: path.to_string_lossy().into_owned(),
-                device_id: "test-device".to_string(),
-                platform: ApplePlatform::Ios,
-                sensitivity: 0.5,
-            },
-            Arc::new(TestModel),
-        )
-        .unwrap();
+        let (engine, dir) = temp_engine();
         let error = engine.push_pcm_16k(vec![0.0; 800]).unwrap_err();
         assert!(error.to_string().contains("start a monitoring session"));
         drop(engine);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_second_shell_on_the_same_machine_is_refused() {
+        let dir = temp_dir();
+        let first = engine_in(&dir).unwrap();
+        assert!(matches!(
+            engine_in(&dir),
+            Err(AppleEngineError::AlreadyRunning)
+        ));
+        // Quitting the owner hands the machine back.
+        drop(first);
+        let second = engine_in(&dir).unwrap();
+        drop(second);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn sensitivity_comes_from_the_shared_store_not_the_shell() {
+        let dir = temp_dir();
+        let engine = engine_in(&dir).unwrap();
+        engine.set_sensitivity(0.8).unwrap();
+        drop(engine);
+
+        // A fresh launch must not reset what the user (or a PHR sync) chose.
+        let engine = engine_in(&dir).unwrap();
+        assert_eq!(
+            engine
+                .get_setting("sensitivity".to_string())
+                .unwrap()
+                .as_deref(),
+            Some("0.8")
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
     }
 
     #[test]
     fn bridge_session_emits_and_projects_an_event() {
-        let path =
-            std::env::temp_dir().join(format!("sinus-apple-test-{}.db", uuid::Uuid::new_v4()));
-        let engine = AppleEngine::new(
-            AppleEngineConfig {
-                database_path: path.to_string_lossy().into_owned(),
-                device_id: "test-device".to_string(),
-                platform: ApplePlatform::Ios,
-                sensitivity: 0.5,
-            },
-            Arc::new(TestModel),
-        )
-        .unwrap();
+        let (engine, dir) = temp_engine();
         let now = Utc::now();
         engine.start_monitoring(now.timestamp_millis(), 0).unwrap();
 
@@ -571,6 +614,6 @@ mod tests {
         assert_eq!(history.recent_events.len(), 1);
 
         drop(engine);
-        let _ = std::fs::remove_file(path);
+        let _ = std::fs::remove_dir_all(dir);
     }
 }

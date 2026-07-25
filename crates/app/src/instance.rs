@@ -5,6 +5,12 @@
 //! a marker in the same private app-data directory and exits before opening the
 //! database or starting audio/sync workers. The owner consumes that marker from
 //! its UI tick and reveals its History window.
+//!
+//! The lock is **per data directory, not per shell**: the tray app and the
+//! SwiftUI app share one database, so two of them listening at once would log
+//! every cough twice from two independent detectors. Whichever starts first owns
+//! the microphone, and the other refuses to start rather than quietly
+//! double-counting.
 
 use std::fs::{File, OpenOptions, TryLockError};
 use std::io::{self, Write};
@@ -50,6 +56,27 @@ impl InstanceGuard {
                 signal_activation(&activation_path)?;
                 Ok(AcquireOutcome::ActivatedExisting)
             }
+            Err(TryLockError::Error(error)) => Err(error),
+        }
+    }
+
+    /// Take ownership without the activation handoff, for a shell that has no
+    /// way to be revealed by the owner — `None` means another Sinus Sentinel
+    /// already owns this data directory.
+    pub fn try_acquire(data_dir: &Path) -> io::Result<Option<InstanceGuard>> {
+        let lock_file = OpenOptions::new()
+            .read(true)
+            .write(true)
+            .create(true)
+            .truncate(false)
+            .open(data_dir.join(LOCK_FILE))?;
+
+        match lock_file.try_lock() {
+            Ok(()) => Ok(Some(InstanceGuard {
+                _lock_file: lock_file,
+                activation_path: data_dir.join(ACTIVATE_FILE),
+            })),
+            Err(TryLockError::WouldBlock) => Ok(None),
             Err(TryLockError::Error(error)) => Err(error),
         }
     }
@@ -108,6 +135,30 @@ mod tests {
             InstanceGuard::acquire(&dir).unwrap(),
             AcquireOutcome::Primary(_)
         ));
+
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[test]
+    fn the_second_shell_is_refused_whichever_started_first() {
+        let dir = test_dir();
+        std::fs::create_dir_all(&dir).unwrap();
+
+        // Tray app first, SwiftUI app second.
+        let tray = match InstanceGuard::acquire(&dir).unwrap() {
+            AcquireOutcome::Primary(owner) => owner,
+            AcquireOutcome::ActivatedExisting => panic!("first process must own the lock"),
+        };
+        assert!(InstanceGuard::try_acquire(&dir).unwrap().is_none());
+        drop(tray);
+
+        // SwiftUI app first, tray app second.
+        let apple = InstanceGuard::try_acquire(&dir).unwrap().unwrap();
+        assert!(matches!(
+            InstanceGuard::acquire(&dir).unwrap(),
+            AcquireOutcome::ActivatedExisting
+        ));
+        drop(apple);
 
         std::fs::remove_dir_all(dir).ok();
     }

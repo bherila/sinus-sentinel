@@ -51,6 +51,17 @@ it into the app bundle. Without it, `PreviewModelRunner` returns neutral,
 correctly shaped values so the UI and capture lifecycle can run without false
 detections.
 
+## One app per machine
+
+The SwiftUI app and the menu-bar app share one database, so only one may run at a
+time — two detectors on one microphone would log every event twice. Whichever
+starts first owns the machine through a lock on the shared data directory; the
+other refuses to start and says so. Quit the running one first.
+
+For the same reason both bundles use `com.bherila.sinus-sentinel` and take their
+device id, sensitivity and battery policy from the shared database rather than
+from per-app preferences.
+
 ## Battery
 
 Monitoring pauses while the OS reports Low Power Mode, releasing the microphone

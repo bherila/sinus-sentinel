@@ -182,11 +182,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     let _ = store.prune_event_embeddings(
         Utc::now() - chrono::Duration::days(EVENT_EMBEDDING_RETENTION_DAYS),
     );
-    let device_id = store
-        .setting_get("device_id")
-        .ok()
-        .flatten()
-        .unwrap_or_else(|| "unknown".to_string());
+    let device_id = settings::ensure_device_id(&store);
 
     let embedder = build_embedder(&store, &shared);
 

@@ -11,6 +11,8 @@ use sinus_core::store::Store;
 
 /// Detection sensitivity, 0.0–1.0. Synced with the PHR.
 pub const SENSITIVITY: &str = "sensitivity";
+/// This machine's stable identity in the PHR.
+pub const DEVICE_ID: &str = "device_id";
 /// Whether to release the microphone while the OS reports low-power mode.
 /// Device-local: battery policy is a property of the machine, not the patient.
 pub const PAUSE_LOW_POWER: &str = "pause_low_power";
@@ -53,6 +55,22 @@ pub fn set_pause_on_low_power(store: &Store, enabled: bool) -> Result<()> {
     store.setting_set(PAUSE_LOW_POWER, if enabled { "true" } else { "false" })
 }
 
+/// This machine's device id, minted on first use.
+///
+/// It lives in the database rather than in each shell's own preferences, so the
+/// tray app and the SwiftUI app are one device to the PHR instead of two — they
+/// are, after all, one machine sharing one event history.
+pub fn ensure_device_id(store: &Store) -> String {
+    if let Ok(Some(id)) = store.setting_get(DEVICE_ID) {
+        if !id.is_empty() {
+            return id;
+        }
+    }
+    let id = uuid::Uuid::new_v4().to_string();
+    let _ = store.setting_set(DEVICE_ID, &id);
+    id
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -73,6 +91,14 @@ mod tests {
 
         set_sensitivity(&store, f32::NAN).unwrap();
         assert_eq!(sensitivity(&store), DEFAULT_SENSITIVITY);
+    }
+
+    #[test]
+    fn device_id_is_minted_once_and_shared_by_every_shell() {
+        let store = Store::open_in_memory().unwrap();
+        let first = ensure_device_id(&store);
+        assert!(!first.is_empty());
+        assert_eq!(ensure_device_id(&store), first);
     }
 
     #[test]

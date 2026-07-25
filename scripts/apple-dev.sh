@@ -137,7 +137,7 @@ if [[ "$mode" == "ios" ]]; then
   open -a Simulator
   xcrun simctl bootstatus "$simulator_id" -b
   xcrun simctl install "$simulator_id" "$app_root"
-  xcrun simctl launch "$simulator_id" com.sinussentinel.prototype
+  xcrun simctl launch "$simulator_id" com.bherila.sinus-sentinel
 else
   cp "$info_plist" "$app_root/Contents/Info.plist"
   if [[ -d "$repo_root/apps/apple/Resources/yamnet.mlmodelc" ]]; then
@@ -150,7 +150,7 @@ else
     -o "$app_root/Contents/MacOS/SinusSentinel"
   codesign --force --sign - "$app_root"
   if [[ "$action" == "run" ]]; then
-    open "$app_root"
+    open -n "$app_root"
   else
     echo "built $app_root"
   fi

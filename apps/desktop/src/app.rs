@@ -12,8 +12,8 @@ use sinus_core::store::{EnrollmentInsert, Store, StoredEnrollment};
 use sinus_core::sync::Mode;
 use sinus_core::types::{Event, EventType};
 
-use crate::instance::InstanceGuard;
 use crate::shared::{ModelStatus, SharedStatus, TeachState};
+use sinus_app::instance::InstanceGuard;
 use sinus_app::settings;
 use sinus_app::state::{self, local_offset_minutes, PauseState};
 
@@ -188,7 +188,7 @@ impl SinusApp {
                 _ => Mode::AutoBatch,
             })
             .unwrap_or(Mode::AutoBatch);
-        let device_id = ensure_device_id(&store);
+        let device_id = settings::ensure_device_id(&store);
 
         SinusApp {
             store,
@@ -1240,15 +1240,6 @@ impl eframe::App for SinusApp {
 }
 
 /// Ensure a stable per-install device id exists in settings.
-fn ensure_device_id(store: &Store) -> String {
-    if let Ok(Some(id)) = store.setting_get("device_id") {
-        return id;
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    let _ = store.setting_set("device_id", &id);
-    id
-}
-
 /// Build the tray icon + menu (SPEC §6). Not exercised in tests.
 #[cfg(not(test))]
 fn build_tray() -> Result<tray_icon::TrayIcon, Box<dyn std::error::Error>> {

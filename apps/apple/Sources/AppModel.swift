@@ -13,6 +13,9 @@ final class AppModel: ObservableObject {
     @Published private(set) var suspendedForLowPower = false
     @Published private(set) var snapshot: HistorySnapshot?
     @Published var errorMessage: String?
+    /// Another Sinus Sentinel owns this machine. The app stays open and inert
+    /// rather than pretending to monitor alongside it.
+    @Published private(set) var blockedByOtherInstance = false
 
     @Published var pauseOnLowPower = true {
         didSet {
@@ -36,9 +39,7 @@ final class AppModel: ObservableObject {
             let engine = try AppleEngine(
                 config: AppleEngineConfig(
                     databasePath: database.path,
-                    deviceId: Self.deviceID(),
-                    platform: Self.platform,
-                    sensitivity: 0.5
+                    platform: Self.platform
                 ),
                 model: runner
             )
@@ -60,6 +61,8 @@ final class AppModel: ObservableObject {
                 self?.applyPowerPolicy()
             }
             refreshHistory()
+        } catch AppleEngineError.AlreadyRunning {
+            blockedByOtherInstance = true
         } catch {
             errorMessage = error.localizedDescription
         }
@@ -166,16 +169,6 @@ final class AppModel: ObservableObject {
             withIntermediateDirectories: true
         )
         return directory
-    }
-
-    private static func deviceID() -> String {
-        let key = "sinus-sentinel-device-id"
-        if let existing = UserDefaults.standard.string(forKey: key) {
-            return existing
-        }
-        let created = UUID().uuidString
-        UserDefaults.standard.set(created, forKey: key)
-        return created
     }
 
     private static func modelRunner() -> ModelRunner {

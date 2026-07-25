@@ -7,7 +7,7 @@
     <key>CFBundleExecutable</key>
     <string>SinusSentinel</string>
     <key>CFBundleIdentifier</key>
-    <string>com.sinussentinel.prototype</string>
+    <string>com.bherila.sinus-sentinel</string>
     <key>CFBundleInfoDictionaryVersion</key>
     <string>6.0</string>
     <key>CFBundleName</key>

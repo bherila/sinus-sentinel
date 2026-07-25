@@ -51,6 +51,11 @@ simctl`. For the native Mac shell:
 make apple-macos-run
 ```
 
+Only one Sinus Sentinel may run per Mac: both shells share one database, and two
+detectors on one microphone would log every cough twice. Whichever starts first
+owns the machine and the other refuses, so quit the menu-bar app before running
+the SwiftUI one.
+
 The prototype uses an explicit monitoring-session model. On iPhone, the active
 recording session declares the audio background mode so it can continue through
 screen lock; this still needs real-device and App Review validation. As on the

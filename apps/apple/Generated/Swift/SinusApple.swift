@@ -1129,19 +1129,20 @@ public func FfiConverterTypeModelRunner_lower(_ value: ModelRunner) -> UInt64 {
 
 
 
+/**
+ * Only what the platform knows. The device identity, sensitivity and battery
+ * policy all live in the database, which this machine's other Sinus Sentinel
+ * shell reads too.
+ */
 public struct AppleEngineConfig: Equatable, Hashable {
     public let databasePath: String
-    public let deviceId: String
     public let platform: ApplePlatform
-    public let sensitivity: Float
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(databasePath: String, deviceId: String, platform: ApplePlatform, sensitivity: Float) {
+    public init(databasePath: String, platform: ApplePlatform) {
         self.databasePath = databasePath
-        self.deviceId = deviceId
         self.platform = platform
-        self.sensitivity = sensitivity
     }
 
 
@@ -1161,17 +1162,13 @@ public struct FfiConverterTypeAppleEngineConfig: FfiConverterRustBuffer {
         return
             try AppleEngineConfig(
                 databasePath: FfiConverterString.read(from: &buf),
-                deviceId: FfiConverterString.read(from: &buf),
-                platform: FfiConverterTypeApplePlatform.read(from: &buf),
-                sensitivity: FfiConverterFloat.read(from: &buf)
+                platform: FfiConverterTypeApplePlatform.read(from: &buf)
         )
     }
 
     public static func write(_ value: AppleEngineConfig, into buf: inout [UInt8]) {
         FfiConverterString.write(value.databasePath, into: &buf)
-        FfiConverterString.write(value.deviceId, into: &buf)
         FfiConverterTypeApplePlatform.write(value.platform, into: &buf)
-        FfiConverterFloat.write(value.sensitivity, into: &buf)
     }
 }
 
@@ -1520,6 +1517,12 @@ enum AppleEngineError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErr
     )
     case Model(message: String
     )
+    /**
+     * Another Sinus Sentinel — the menu-bar app, or a second copy of this one —
+     * already owns this machine's database. Two detectors on one microphone
+     * would log every event twice, so the second one refuses to start.
+     */
+    case AlreadyRunning
 
 
 
@@ -1558,6 +1561,7 @@ public struct FfiConverterTypeAppleEngineError: FfiConverterRustBuffer {
         case 3: return .Model(
             message: try FfiConverterString.read(from: &buf)
             )
+        case 4: return .AlreadyRunning
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1583,6 +1587,10 @@ public struct FfiConverterTypeAppleEngineError: FfiConverterRustBuffer {
         case let .Model(message):
             writeInt(&buf, Int32(3))
             FfiConverterString.write(message, into: &buf)
+
+
+        case .AlreadyRunning:
+            writeInt(&buf, Int32(4))
 
         }
     }

@@ -37,6 +37,38 @@ The Swift shell owns:
 
 No raw PCM crosses into persistence or networking.
 
+## One app per machine
+
+Both macOS shells read `~/Library/Application Support/SinusSentinel/events.db`,
+which is the point — one history, one set of settings, one device identity in the
+PHR. It also means two of them listening at once would run two independent
+detectors over one microphone and log every cough twice.
+
+So `sinus_app::instance` is now shared rather than desktop-private, and the lock
+is scoped to the *data directory*, not to a shell or a bundle id. The OS owns the
+file lock, so it is released on a crash with no stale-PID handling. Whichever app
+starts first owns the machine:
+
+- the tray app losing the race writes an activation marker and exits, as before;
+- the Apple shell losing the race fails `AppleEngine::new` with `AlreadyRunning`
+  *before* opening the database or the microphone, and shows an explanatory
+  screen instead of a half-live UI.
+
+Known gap: the marker handoff only works owner-to-owner between tray apps. If the
+SwiftUI app is the owner, launching the tray app exits silently instead of
+revealing the running window — it does not yet consume activation requests.
+
+Everything that is not platform knowledge now comes from that shared database.
+`AppleEngineConfig` carries only the database path and the platform;
+sensitivity, the battery policy and the device id are read from the store, so a
+shell cannot reset a synced setting just by launching (it previously forced
+sensitivity back to 0.5 and minted a second device id in `UserDefaults`).
+
+Both Apple bundles use `com.bherila.sinus-sentinel`, matching the shipped tray
+app: one product identity for the microphone grant, the keychain item and any
+future notarized replacement. `open -n` launches the built prototype by path so
+LaunchServices cannot substitute the other bundle registered under that id.
+
 ## Battery policy
 
 `ProcessInfo.isLowPowerModeEnabled` is the one signal both Apple platforms share

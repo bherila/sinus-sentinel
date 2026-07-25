@@ -23,20 +23,17 @@ use sinus_core::types::{Event, Source};
 pub const PROTOTYPE_SIM_THRESHOLD: f32 = 0.65;
 pub const PROTOTYPE_NEGATIVE_MARGIN: f32 = 0.05;
 
+/// What the *platform* contributes. Everything else — sensitivity, the device
+/// identity, the battery policy — is read from the store the shells share, so
+/// two clients on one machine cannot disagree about it.
 #[derive(Debug, Clone)]
 pub struct MonitoringConfig {
     pub source: Source,
-    pub device_id: String,
-    pub sensitivity: f32,
 }
 
 impl MonitoringConfig {
-    pub fn new(source: Source, device_id: impl Into<String>) -> Self {
-        Self {
-            source,
-            device_id: device_id.into(),
-            sensitivity: crate::settings::DEFAULT_SENSITIVITY,
-        }
+    pub fn new(source: Source) -> Self {
+        Self { source }
     }
 }
 
@@ -47,6 +44,7 @@ pub struct MonitoringEngine<E: Embedder> {
     store: Store,
     pipeline: StreamingPipeline<E>,
     config: MonitoringConfig,
+    device_id: String,
     context: Option<EventContext>,
 }
 
@@ -57,14 +55,18 @@ impl<E: Embedder> MonitoringEngine<E> {
 
     pub fn from_store(store: Store, embedder: E, config: MonitoringConfig) -> Result<Self> {
         let mut pipeline = StreamingPipeline::new(PipelineConfig::default(), embedder);
-        pipeline.set_sensitivity(config.sensitivity);
+        // Sensitivity is a synced, user-visible setting: honor whatever the store
+        // holds instead of letting each shell impose its own starting value.
+        pipeline.set_sensitivity(crate::settings::sensitivity(&store));
         if let Some(prototypes) = prototypes_from_store(&store)? {
             pipeline = pipeline.with_prototypes(prototypes);
         }
+        let device_id = crate::settings::ensure_device_id(&store);
         Ok(Self {
             store,
             pipeline,
             config,
+            device_id,
             context: None,
         })
     }
@@ -74,7 +76,7 @@ impl<E: Embedder> MonitoringEngine<E> {
         self.context = Some(EventContext {
             base_time: started_at,
             tz_offset_min,
-            device_id: self.config.device_id.clone(),
+            device_id: self.device_id.clone(),
             source: self.config.source,
             model_version: self.pipeline.model_version(),
         });
@@ -110,7 +112,6 @@ impl<E: Embedder> MonitoringEngine<E> {
     pub fn set_sensitivity(&mut self, sensitivity: f32) -> Result<()> {
         let sensitivity = sensitivity.clamp(0.0, 1.0);
         self.pipeline.set_sensitivity(sensitivity);
-        self.config.sensitivity = sensitivity;
         crate::settings::set_sensitivity(&self.store, sensitivity)
     }
 
@@ -170,7 +171,7 @@ mod tests {
         MonitoringEngine::from_store(
             Store::open_in_memory().unwrap(),
             BandHeuristicEmbedder,
-            MonitoringConfig::new(Source::MobileIos, "test-device"),
+            MonitoringConfig::new(Source::MobileIos),
         )
         .unwrap()
     }

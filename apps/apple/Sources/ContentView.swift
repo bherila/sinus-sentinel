@@ -5,43 +5,62 @@ struct ContentView: View {
 
     var body: some View {
         NavigationStack {
-            ScrollView {
-                VStack(alignment: .leading, spacing: 24) {
-                    monitoringCard
-
-                    VStack(alignment: .leading, spacing: 8) {
-                        Text("Last 7 days")
-                            .font(.title2.bold())
-                        HistoryChartView(snapshot: model.snapshot)
-                    }
-
-                    if let snapshot = model.snapshot {
-                        Text(
-                            "Congestion score: \(snapshot.congestionScorePerMonitoredHour, specifier: "%.2f") per monitored hour"
-                        )
-                        .font(.subheadline)
-                        .foregroundStyle(.secondary)
-                    }
-
-                    recentEvents
-                    batterySettings
-                }
-                .padding()
-            }
-            .navigationTitle("Sinus Sentinel")
-            .alert(
-                "Sinus Sentinel",
-                isPresented: Binding(
-                    get: { model.errorMessage != nil },
-                    set: { if !$0 { model.errorMessage = nil } }
-                )
-            ) {
-                Button("OK") { model.errorMessage = nil }
-            } message: {
-                Text(model.errorMessage ?? "")
+            if model.blockedByOtherInstance {
+                alreadyRunning
+            } else {
+                main
             }
         }
         .frame(minWidth: 480, minHeight: 540)
+    }
+
+    private var alreadyRunning: some View {
+        ContentUnavailableView {
+            Label("Sinus Sentinel is already running", systemImage: "exclamationmark.triangle")
+        } description: {
+            Text(
+                "Another copy of Sinus Sentinel owns this computer's history. Quit it from the menu bar, then reopen this app — two apps listening at once would record every cough twice."
+            )
+        }
+        .navigationTitle("Sinus Sentinel")
+    }
+
+    private var main: some View {
+        ScrollView {
+            VStack(alignment: .leading, spacing: 24) {
+                monitoringCard
+
+                VStack(alignment: .leading, spacing: 8) {
+                    Text("Last 7 days")
+                        .font(.title2.bold())
+                    HistoryChartView(snapshot: model.snapshot)
+                }
+
+                if let snapshot = model.snapshot {
+                    Text(
+                        "Congestion score: \(snapshot.congestionScorePerMonitoredHour, specifier: "%.2f") per monitored hour"
+                    )
+                    .font(.subheadline)
+                    .foregroundStyle(.secondary)
+                }
+
+                recentEvents
+                batterySettings
+            }
+            .padding()
+        }
+        .navigationTitle("Sinus Sentinel")
+        .alert(
+            "Sinus Sentinel",
+            isPresented: Binding(
+                get: { model.errorMessage != nil },
+                set: { if !$0 { model.errorMessage = nil } }
+            )
+        ) {
+            Button("OK") { model.errorMessage = nil }
+        } message: {
+            Text(model.errorMessage ?? "")
+        }
     }
 
     private var monitoringCard: some View {

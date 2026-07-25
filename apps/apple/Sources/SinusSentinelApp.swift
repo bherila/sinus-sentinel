@@ -16,12 +16,15 @@ struct SinusSentinelApp: App {
 
         #if os(macOS)
         MenuBarExtra("Sinus Sentinel", systemImage: model.isCapturing ? "waveform" : "pause.circle") {
-            if model.suspendedForLowPower {
+            if model.blockedByOtherInstance {
+                Text("Another Sinus Sentinel owns this computer")
+            } else if model.suspendedForLowPower {
                 Text("Paused for Low Power Mode")
             }
             Button(model.sessionRequested ? "Stop monitoring" : "Start monitoring") {
                 model.toggleMonitoring()
             }
+            .disabled(model.blockedByOtherInstance)
             Button("Open Sinus Sentinel") {
                 NSApplication.shared.activate(ignoringOtherApps: true)
             }
