@@ -58,6 +58,20 @@ impl From<EventType> for AppleEventType {
     }
 }
 
+impl From<AppleEventType> for EventType {
+    fn from(value: AppleEventType) -> Self {
+        match value {
+            AppleEventType::Cough => Self::Cough,
+            AppleEventType::ThroatClearing => Self::ThroatClearing,
+            AppleEventType::Sniffle => Self::Sniffle,
+            AppleEventType::Sneeze => Self::Sneeze,
+            AppleEventType::NoseBlow => Self::NoseBlow,
+            AppleEventType::Hawk => Self::Hawk,
+            AppleEventType::SnortSuck => Self::SnortSuck,
+        }
+    }
+}
+
 /// Only what the platform knows. The device identity, sensitivity and battery
 /// policy all live in the database, which this machine's other Sinus Sentinel
 /// shell reads too.
@@ -164,6 +178,10 @@ pub enum AppleEngineError {
     /// would log every event twice, so the second one refuses to start.
     #[error("another Sinus Sentinel is already running on this computer")]
     AlreadyRunning,
+    /// The event uuid the UI holds no longer exists — a stale list, or a row the
+    /// PHR sync removed between render and tap.
+    #[error("no such event: {uuid}")]
+    NotFound { uuid: String },
 }
 
 impl From<CoreError> for AppleEngineError {
@@ -174,10 +192,19 @@ impl From<CoreError> for AppleEngineError {
     }
 }
 
+/// `event_type` is the effective type — what every list should render by
+/// default, and what a correction overrides. `original_event_type` and
+/// `corrected_to` are the audit trail behind it: what the classifier said,
+/// and, if the user corrected it, what they said instead. A UI wanting to
+/// render "Sniffle (was Cough)" needs both.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct AppleEvent {
     pub uuid: String,
     pub event_type: AppleEventType,
+    /// What the classifier originally decided, before any correction.
+    pub original_event_type: AppleEventType,
+    /// What the user corrected the event to, if they did.
+    pub corrected_to: Option<AppleEventType>,
     pub occurred_at_epoch_ms: i64,
     pub timezone_offset_minutes: i32,
     pub duration_ms: i64,
@@ -193,9 +220,13 @@ pub struct AppleEvent {
 impl From<Event> for AppleEvent {
     fn from(value: Event) -> Self {
         let event_type = value.effective_type().into();
+        let original_event_type = value.event_type.into();
+        let corrected_to = value.corrected_to.map(Into::into);
         Self {
             uuid: value.uuid,
             event_type,
+            original_event_type,
+            corrected_to,
             occurred_at_epoch_ms: value.occurred_at.timestamp_millis(),
             timezone_offset_minutes: value.tz_offset_min,
             duration_ms: value.duration_ms,
@@ -228,6 +259,23 @@ pub struct HistorySnapshot {
     pub days: Vec<DayBucket>,
     pub recent_events: Vec<AppleEvent>,
     pub congestion_score_per_monitored_hour: f64,
+    /// Hours elapsed since local midnight, unclamped — so a UI can say "3.2
+    /// monitored hours" next to the score instead of showing a rate with no
+    /// denominator. `congestion_score_per_monitored_hour` divides by a clamped
+    /// version of this internally (to stay finite moments after midnight); this
+    /// field reports the real elapsed time, including a true zero.
+    pub monitored_hours: f64,
+}
+
+/// What a flag operation changed, as the UI needs to see it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct FlagResult {
+    /// The event as it now stands, so the caller can replace its row without refetching.
+    pub event: AppleEvent,
+    /// An enrollment was written, so the detector actually changed. False when
+    /// the event's embedding had already been pruned — worth telling the user,
+    /// since the flag alone will not stop the sound recurring.
+    pub trained: bool,
 }
 
 /// How many events the "recent" list carries across the FFI boundary. The UI
@@ -390,6 +438,7 @@ impl AppleEngine {
                 &today,
                 monitored_hours.max(0.1),
             ),
+            monitored_hours,
         })
     }
 
@@ -414,6 +463,41 @@ impl AppleEngine {
         self.lock()?.store().setting_set(&key, &value)?;
         Ok(())
     }
+
+    /// Report a misdetection: the event stops counting here and in the PHR, and,
+    /// if its embedding was retained, the detector is trained not to call that
+    /// sound the class it fired as. Policy lives in `sinus_app::flag`; see there
+    /// for the rules.
+    pub fn report_false_positive(
+        &self,
+        event_uuid: String,
+    ) -> Result<FlagResult, AppleEngineError> {
+        self.flag(event_uuid, |store, uuid| {
+            sinus_app::flag::report_false_positive(store, uuid)
+        })
+    }
+
+    /// Record what a misdetected sound actually was. Correcting an event back to
+    /// the class the classifier originally fired is treated as an undo, not a
+    /// correction — see `sinus_app::flag::recharacterize`.
+    pub fn recharacterize(
+        &self,
+        event_uuid: String,
+        corrected: AppleEventType,
+    ) -> Result<FlagResult, AppleEngineError> {
+        let corrected: EventType = corrected.into();
+        self.flag(event_uuid, move |store, uuid| {
+            sinus_app::flag::recharacterize(store, uuid, corrected)
+        })
+    }
+
+    /// Undo a false-positive report or a correction. Any training the flag
+    /// produced is kept; only the flag on this event is reverted.
+    pub fn clear_flag(&self, event_uuid: String) -> Result<FlagResult, AppleEngineError> {
+        self.flag(event_uuid, |store, uuid| {
+            sinus_app::flag::clear_flag(store, uuid)
+        })
+    }
 }
 
 impl AppleEngine {
@@ -426,6 +510,48 @@ impl AppleEngine {
     fn reader(&self) -> Result<MutexGuard<'_, Store>, AppleEngineError> {
         self.reader.lock().map_err(|_| AppleEngineError::Engine {
             message: "engine read lock was poisoned".to_string(),
+        })
+    }
+
+    /// Shared body of the three flagging methods: resolve the uuid, run `op`,
+    /// reload the matcher's prototypes if `op` actually trained anything, then
+    /// re-read the event so the caller gets back exactly what changed.
+    ///
+    /// Everything happens under the writer lock and on the writer's connection,
+    /// including the existence check. Checking on the read connection first
+    /// would be a wasted round trip in the common case and, worse, would report
+    /// `NotFound` for an event this very engine had just written but not yet
+    /// checkpointed.
+    fn flag(
+        &self,
+        event_uuid: String,
+        op: impl FnOnce(&Store, &str) -> CoreResult<sinus_app::flag::FlagOutcome>,
+    ) -> Result<FlagResult, AppleEngineError> {
+        let mut engine = self.lock()?;
+        // Resolved here rather than left to `sinus_app::flag`, which reports a
+        // missing uuid as `Error::Config` — the blanket `From<CoreError>` would
+        // flatten that into `Engine`, which Swift cannot tell apart from a real
+        // failure. A stale list needs a different message than a broken engine.
+        if engine.store().get_event(&event_uuid)?.is_none() {
+            return Err(AppleEngineError::NotFound { uuid: event_uuid });
+        }
+        let outcome = op(engine.store(), &event_uuid)?;
+        if outcome.trained {
+            // The running matcher's prototypes are built at load time; without this
+            // reload, the user reports a false positive and the very next identical
+            // sound still fires.
+            engine.reload_enrollments()?;
+        }
+        let updated =
+            engine
+                .store()
+                .get_event(&event_uuid)?
+                .ok_or_else(|| AppleEngineError::NotFound {
+                    uuid: event_uuid.clone(),
+                })?;
+        Ok(FlagResult {
+            event: updated.into(),
+            trained: outcome.trained,
         })
     }
 }
@@ -586,19 +712,9 @@ mod tests {
     fn bridge_session_emits_and_projects_an_event() {
         let (engine, dir) = temp_engine();
         let now = Utc::now();
-        engine.start_monitoring(now.timestamp_millis(), 0).unwrap();
+        let event = emit_one_event(&engine, now);
 
-        let mut signal = sinus_core::synth::white_noise(16_000, 0.003, 1);
-        signal.extend(sinus_core::synth::sine(32_000, 16_000, 300.0, 0.6));
-        signal.extend(sinus_core::synth::white_noise(16_000, 0.003, 2));
-        let mut emitted = Vec::new();
-        for chunk in signal.chunks(777) {
-            emitted.extend(engine.push_pcm_16k(chunk.to_vec()).unwrap());
-        }
-        emitted.extend(engine.stop_monitoring().unwrap());
-
-        assert_eq!(emitted.len(), 1);
-        assert!(matches!(emitted[0].event_type, AppleEventType::Cough));
+        assert!(matches!(event.event_type, AppleEventType::Cough));
         let history = engine
             .history(7, (now + chrono::Duration::hours(1)).timestamp_millis(), 0)
             .unwrap();
@@ -612,6 +728,97 @@ mod tests {
             1
         );
         assert_eq!(history.recent_events.len(), 1);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// Drives a synthetic session that produces exactly one detected cough, and
+    /// returns it — the starting point for every test that needs a real,
+    /// persisted row rather than a hand-built one.
+    fn emit_one_event(engine: &Arc<AppleEngine>, now: DateTime<Utc>) -> AppleEvent {
+        engine.start_monitoring(now.timestamp_millis(), 0).unwrap();
+        let mut signal = sinus_core::synth::white_noise(16_000, 0.003, 1);
+        signal.extend(sinus_core::synth::sine(32_000, 16_000, 300.0, 0.6));
+        signal.extend(sinus_core::synth::white_noise(16_000, 0.003, 2));
+        let mut emitted = Vec::new();
+        for chunk in signal.chunks(777) {
+            emitted.extend(engine.push_pcm_16k(chunk.to_vec()).unwrap());
+        }
+        emitted.extend(engine.stop_monitoring().unwrap());
+        assert_eq!(emitted.len(), 1);
+        emitted.into_iter().next().unwrap()
+    }
+
+    #[test]
+    fn reporting_an_unknown_uuid_is_distinguishable_from_a_real_failure() {
+        let (engine, dir) = temp_engine();
+        assert!(matches!(
+            engine.report_false_positive("not-a-real-uuid".to_string()),
+            Err(AppleEngineError::NotFound { uuid }) if uuid == "not-a-real-uuid"
+        ));
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn recharacterize_updates_the_effective_type_and_keeps_the_audit_trail() {
+        let (engine, dir) = temp_engine();
+        let now = Utc::now();
+        let event = emit_one_event(&engine, now);
+        assert!(matches!(event.event_type, AppleEventType::Cough));
+
+        let result = engine
+            .recharacterize(event.uuid.clone(), AppleEventType::Sniffle)
+            .unwrap();
+
+        assert!(matches!(result.event.event_type, AppleEventType::Sniffle));
+        assert!(matches!(
+            result.event.original_event_type,
+            AppleEventType::Cough
+        ));
+        assert!(matches!(
+            result.event.corrected_to,
+            Some(AppleEventType::Sniffle)
+        ));
+        assert!(result.trained);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn clear_flag_after_a_report_restores_the_event() {
+        let (engine, dir) = temp_engine();
+        let now = Utc::now();
+        let event = emit_one_event(&engine, now);
+
+        let reported = engine.report_false_positive(event.uuid.clone()).unwrap();
+        assert!(reported.event.false_positive);
+
+        let restored = engine.clear_flag(event.uuid.clone()).unwrap();
+        assert!(!restored.event.false_positive);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn monitored_hours_reports_elapsed_time_since_local_midnight() {
+        let (engine, dir) = temp_engine();
+        let now = Utc::now();
+        let midnight = sinus_app::state::local_midnight_at_offset(now, 0);
+        let an_hour_after_midnight = midnight + chrono::Duration::hours(1);
+
+        let history = engine
+            .history(1, an_hour_after_midnight.timestamp_millis(), 0)
+            .unwrap();
+
+        assert!(
+            (history.monitored_hours - 1.0).abs() < 0.01,
+            "expected roughly 1.0 monitored hours, got {}",
+            history.monitored_hours
+        );
 
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);

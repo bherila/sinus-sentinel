@@ -639,6 +639,12 @@ fileprivate struct FfiConverterString: FfiConverter {
 
 public protocol AppleEngineProtocol: AnyObject, Sendable {
 
+    /**
+     * Undo a false-positive report or a correction. Any training the flag
+     * produced is kept; only the flag on this event is reverted.
+     */
+    func clearFlag(eventUuid: String) throws  -> FlagResult
+
     func getSetting(key: String) throws  -> String?
 
     func history(days: UInt32, nowEpochMs: Int64, timezoneOffsetMinutes: Int32) throws  -> HistorySnapshot
@@ -653,6 +659,21 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
     func pauseOnLowPower() throws  -> Bool
 
     func pushPcm16k(samples: [Float]) throws  -> [AppleEvent]
+
+    /**
+     * Record what a misdetected sound actually was. Correcting an event back to
+     * the class the classifier originally fired is treated as an undo, not a
+     * correction — see `sinus_app::flag::recharacterize`.
+     */
+    func recharacterize(eventUuid: String, corrected: AppleEventType) throws  -> FlagResult
+
+    /**
+     * Report a misdetection: the event stops counting here and in the PHR, and,
+     * if its embedding was retained, the detector is trained not to call that
+     * sound the class it fired as. Policy lives in `sinus_app::flag`; see there
+     * for the rules.
+     */
+    func reportFalsePositive(eventUuid: String) throws  -> FlagResult
 
     func setPauseOnLowPower(enabled: Bool) throws
 
@@ -728,6 +749,20 @@ public convenience init(config: AppleEngineConfig, model: ModelRunner)throws  {
 
 
 
+    /**
+     * Undo a false-positive report or a correction. Any training the flag
+     * produced is kept; only the flag on this event is reverted.
+     */
+open func clearFlag(eventUuid: String)throws  -> FlagResult  {
+    return try  FfiConverterTypeFlagResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_clear_flag(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(eventUuid),uniffiCallStatus
+    )
+})
+}
+
 open func getSetting(key: String)throws  -> String?  {
     return try  FfiConverterOptionString.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
@@ -779,6 +814,38 @@ open func pushPcm16k(samples: [Float])throws  -> [AppleEvent]  {
     uniffi_sinus_apple_fn_method_appleengine_push_pcm_16k(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(samples),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Record what a misdetected sound actually was. Correcting an event back to
+     * the class the classifier originally fired is treated as an undo, not a
+     * correction — see `sinus_app::flag::recharacterize`.
+     */
+open func recharacterize(eventUuid: String, corrected: AppleEventType)throws  -> FlagResult  {
+    return try  FfiConverterTypeFlagResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_recharacterize(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(eventUuid),
+        FfiConverterTypeAppleEventType_lower(corrected),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Report a misdetection: the event stops counting here and in the PHR, and,
+     * if its embedding was retained, the detector is trained not to call that
+     * sound the class it fired as. Policy lives in `sinus_app::flag`; see there
+     * for the rules.
+     */
+open func reportFalsePositive(eventUuid: String)throws  -> FlagResult  {
+    return try  FfiConverterTypeFlagResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_report_false_positive(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(eventUuid),uniffiCallStatus
     )
 })
 }
@@ -1188,9 +1255,24 @@ public func FfiConverterTypeAppleEngineConfig_lower(_ value: AppleEngineConfig) 
 }
 
 
+/**
+ * `event_type` is the effective type — what every list should render by
+ * default, and what a correction overrides. `original_event_type` and
+ * `corrected_to` are the audit trail behind it: what the classifier said,
+ * and, if the user corrected it, what they said instead. A UI wanting to
+ * render "Sniffle (was Cough)" needs both.
+ */
 public struct AppleEvent: Equatable, Hashable {
     public let uuid: String
     public let eventType: AppleEventType
+    /**
+     * What the classifier originally decided, before any correction.
+     */
+    public let originalEventType: AppleEventType
+    /**
+     * What the user corrected the event to, if they did.
+     */
+    public let correctedTo: AppleEventType?
     public let occurredAtEpochMs: Int64
     public let timezoneOffsetMinutes: Int32
     public let durationMs: Int64
@@ -1204,9 +1286,17 @@ public struct AppleEvent: Equatable, Hashable {
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(uuid: String, eventType: AppleEventType, occurredAtEpochMs: Int64, timezoneOffsetMinutes: Int32, durationMs: Int64, confidence: Float, burstCount: Int64, peakDbfs: Float?, meanDbfs: Float?, noiseFloorDbfs: Float?, modelVersion: String, falsePositive: Bool) {
+    public init(uuid: String, eventType: AppleEventType,
+        /**
+         * What the classifier originally decided, before any correction.
+         */originalEventType: AppleEventType,
+        /**
+         * What the user corrected the event to, if they did.
+         */correctedTo: AppleEventType?, occurredAtEpochMs: Int64, timezoneOffsetMinutes: Int32, durationMs: Int64, confidence: Float, burstCount: Int64, peakDbfs: Float?, meanDbfs: Float?, noiseFloorDbfs: Float?, modelVersion: String, falsePositive: Bool) {
         self.uuid = uuid
         self.eventType = eventType
+        self.originalEventType = originalEventType
+        self.correctedTo = correctedTo
         self.occurredAtEpochMs = occurredAtEpochMs
         self.timezoneOffsetMinutes = timezoneOffsetMinutes
         self.durationMs = durationMs
@@ -1237,6 +1327,8 @@ public struct FfiConverterTypeAppleEvent: FfiConverterRustBuffer {
             try AppleEvent(
                 uuid: FfiConverterString.read(from: &buf),
                 eventType: FfiConverterTypeAppleEventType.read(from: &buf),
+                originalEventType: FfiConverterTypeAppleEventType.read(from: &buf),
+                correctedTo: FfiConverterOptionTypeAppleEventType.read(from: &buf),
                 occurredAtEpochMs: FfiConverterInt64.read(from: &buf),
                 timezoneOffsetMinutes: FfiConverterInt32.read(from: &buf),
                 durationMs: FfiConverterInt64.read(from: &buf),
@@ -1253,6 +1345,8 @@ public struct FfiConverterTypeAppleEvent: FfiConverterRustBuffer {
     public static func write(_ value: AppleEvent, into buf: inout [UInt8]) {
         FfiConverterString.write(value.uuid, into: &buf)
         FfiConverterTypeAppleEventType.write(value.eventType, into: &buf)
+        FfiConverterTypeAppleEventType.write(value.originalEventType, into: &buf)
+        FfiConverterOptionTypeAppleEventType.write(value.correctedTo, into: &buf)
         FfiConverterInt64.write(value.occurredAtEpochMs, into: &buf)
         FfiConverterInt32.write(value.timezoneOffsetMinutes, into: &buf)
         FfiConverterInt64.write(value.durationMs, into: &buf)
@@ -1390,19 +1484,108 @@ public func FfiConverterTypeEventCount_lower(_ value: EventCount) -> RustBuffer 
 }
 
 
+/**
+ * What a flag operation changed, as the UI needs to see it.
+ */
+public struct FlagResult: Equatable, Hashable {
+    /**
+     * The event as it now stands, so the caller can replace its row without refetching.
+     */
+    public let event: AppleEvent
+    /**
+     * An enrollment was written, so the detector actually changed. False when
+     * the event's embedding had already been pruned — worth telling the user,
+     * since the flag alone will not stop the sound recurring.
+     */
+    public let trained: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The event as it now stands, so the caller can replace its row without refetching.
+         */event: AppleEvent,
+        /**
+         * An enrollment was written, so the detector actually changed. False when
+         * the event's embedding had already been pruned — worth telling the user,
+         * since the flag alone will not stop the sound recurring.
+         */trained: Bool) {
+        self.event = event
+        self.trained = trained
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension FlagResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeFlagResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FlagResult {
+        return
+            try FlagResult(
+                event: FfiConverterTypeAppleEvent.read(from: &buf),
+                trained: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: FlagResult, into buf: inout [UInt8]) {
+        FfiConverterTypeAppleEvent.write(value.event, into: &buf)
+        FfiConverterBool.write(value.trained, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFlagResult_lift(_ buf: RustBuffer) throws -> FlagResult {
+    return try FfiConverterTypeFlagResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeFlagResult_lower(_ value: FlagResult) -> RustBuffer {
+    return FfiConverterTypeFlagResult.lower(value)
+}
+
+
 public struct HistorySnapshot: Equatable, Hashable {
     public let today: [EventCount]
     public let days: [DayBucket]
     public let recentEvents: [AppleEvent]
     public let congestionScorePerMonitoredHour: Double
+    /**
+     * Hours elapsed since local midnight, unclamped — so a UI can say "3.2
+     * monitored hours" next to the score instead of showing a rate with no
+     * denominator. `congestion_score_per_monitored_hour` divides by a clamped
+     * version of this internally (to stay finite moments after midnight); this
+     * field reports the real elapsed time, including a true zero.
+     */
+    public let monitoredHours: Double
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
-    public init(today: [EventCount], days: [DayBucket], recentEvents: [AppleEvent], congestionScorePerMonitoredHour: Double) {
+    public init(today: [EventCount], days: [DayBucket], recentEvents: [AppleEvent], congestionScorePerMonitoredHour: Double,
+        /**
+         * Hours elapsed since local midnight, unclamped — so a UI can say "3.2
+         * monitored hours" next to the score instead of showing a rate with no
+         * denominator. `congestion_score_per_monitored_hour` divides by a clamped
+         * version of this internally (to stay finite moments after midnight); this
+         * field reports the real elapsed time, including a true zero.
+         */monitoredHours: Double) {
         self.today = today
         self.days = days
         self.recentEvents = recentEvents
         self.congestionScorePerMonitoredHour = congestionScorePerMonitoredHour
+        self.monitoredHours = monitoredHours
     }
 
 
@@ -1424,7 +1607,8 @@ public struct FfiConverterTypeHistorySnapshot: FfiConverterRustBuffer {
                 today: FfiConverterSequenceTypeEventCount.read(from: &buf),
                 days: FfiConverterSequenceTypeDayBucket.read(from: &buf),
                 recentEvents: FfiConverterSequenceTypeAppleEvent.read(from: &buf),
-                congestionScorePerMonitoredHour: FfiConverterDouble.read(from: &buf)
+                congestionScorePerMonitoredHour: FfiConverterDouble.read(from: &buf),
+                monitoredHours: FfiConverterDouble.read(from: &buf)
         )
     }
 
@@ -1433,6 +1617,7 @@ public struct FfiConverterTypeHistorySnapshot: FfiConverterRustBuffer {
         FfiConverterSequenceTypeDayBucket.write(value.days, into: &buf)
         FfiConverterSequenceTypeAppleEvent.write(value.recentEvents, into: &buf)
         FfiConverterDouble.write(value.congestionScorePerMonitoredHour, into: &buf)
+        FfiConverterDouble.write(value.monitoredHours, into: &buf)
     }
 }
 
@@ -1523,6 +1708,12 @@ enum AppleEngineError: Swift.Error, Equatable, Hashable, Foundation.LocalizedErr
      * would log every event twice, so the second one refuses to start.
      */
     case AlreadyRunning
+    /**
+     * The event uuid the UI holds no longer exists — a stale list, or a row the
+     * PHR sync removed between render and tap.
+     */
+    case NotFound(uuid: String
+    )
 
 
 
@@ -1562,6 +1753,9 @@ public struct FfiConverterTypeAppleEngineError: FfiConverterRustBuffer {
             message: try FfiConverterString.read(from: &buf)
             )
         case 4: return .AlreadyRunning
+        case 5: return .NotFound(
+            uuid: try FfiConverterString.read(from: &buf)
+            )
 
          default: throw UniffiInternalError.unexpectedEnumCase
         }
@@ -1591,6 +1785,11 @@ public struct FfiConverterTypeAppleEngineError: FfiConverterRustBuffer {
 
         case .AlreadyRunning:
             writeInt(&buf, Int32(4))
+
+
+        case let .NotFound(uuid):
+            writeInt(&buf, Int32(5))
+            FfiConverterString.write(uuid, into: &buf)
 
         }
     }
@@ -1904,6 +2103,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeAppleEventType: FfiConverterRustBuffer {
+    typealias SwiftType = AppleEventType?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAppleEventType.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAppleEventType.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceFloat: FfiConverterRustBuffer {
     typealias SwiftType = [Float]
 
@@ -2016,6 +2239,9 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_sinus_apple_checksum_method_appleengine_clear_flag() != 37731) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sinus_apple_checksum_method_appleengine_get_setting() != 50547) {
         return InitializationResult.apiChecksumMismatch
     }
@@ -2029,6 +2255,12 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_push_pcm_16k() != 19245) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_recharacterize() != 23608) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_report_false_positive() != 21202) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_set_pause_on_low_power() != 14460) {
