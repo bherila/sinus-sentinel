@@ -640,10 +640,53 @@ fileprivate struct FfiConverterString: FfiConverter {
 public protocol AppleEngineProtocol: AnyObject, Sendable {
 
     /**
+     * Suppress persistence for the duration of a take. Detections keep running —
+     * the gate, noise floor and cooldowns stay continuous — but the coughs the
+     * user deliberately performs for training must not also be logged as events.
+     */
+    func beginTeachTake() throws
+
+    /**
+     * Abandon a take in progress and resume persisting.
+     */
+    func cancelTeachTake() throws
+
+    /**
      * Undo a false-positive report or a correction. Any training the flag
      * produced is kept; only the flag on this event is reverted.
      */
     func clearFlag(eventUuid: String) throws  -> FlagResult
+
+    /**
+     * Remove all personalization, positive and negative alike. The detector
+     * falls back to the generic decision rules.
+     */
+    func deleteAllTraining() throws  -> UInt32
+
+    /**
+     * Remove every take of one class, returning the class to untrained.
+     */
+    func deleteClassTraining(eventType: AppleEventType) throws  -> UInt32
+
+    /**
+     * Remove every negative enrollment — everything the detector learned from
+     * false-positive reports and corrections — while keeping the taught takes.
+     */
+    func deleteLearnedSuppressions() throws  -> UInt32
+
+    /**
+     * Remove one take by its `TeachTake::id` — the "delete this recording" row
+     * action. Returns how many rows went, so the caller need not assume.
+     */
+    func deleteTake(id: Int64) throws  -> UInt32
+
+    /**
+     * Score and store one take of exactly `teach_take_samples()` samples, then
+     * reload the live detector's prototypes. Always resumes persistence, including
+     * on failure — `MonitoringEngine::enroll_take` clears `suppress_persistence`
+     * on both the success and error paths, so there is nothing left to reset here.
+     */
+    func enrollTake(eventType: AppleEventType, samples: [Float]) throws  -> TeachResult
 
     func getSetting(key: String) throws  -> String?
 
@@ -684,6 +727,12 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
     func startMonitoring(startedAtEpochMs: Int64, timezoneOffsetMinutes: Int32) throws
 
     func stopMonitoring() throws  -> [AppleEvent]
+
+    /**
+     * The whole Training pane. Read through the read connection, not the writer,
+     * so refreshing Settings cannot queue behind a Core ML inference.
+     */
+    func training() throws  -> TrainingSnapshot
 
 }
 open class AppleEngine: AppleEngineProtocol, @unchecked Sendable {
@@ -750,6 +799,30 @@ public convenience init(config: AppleEngineConfig, model: ModelRunner)throws  {
 
 
     /**
+     * Suppress persistence for the duration of a take. Detections keep running —
+     * the gate, noise floor and cooldowns stay continuous — but the coughs the
+     * user deliberately performs for training must not also be logged as events.
+     */
+open func beginTeachTake()throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_begin_teach_take(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+
+    /**
+     * Abandon a take in progress and resume persisting.
+     */
+open func cancelTeachTake()throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_cancel_teach_take(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+}
+}
+
+    /**
      * Undo a false-positive report or a correction. Any training the flag
      * produced is kept; only the flag on this event is reverted.
      */
@@ -759,6 +832,76 @@ open func clearFlag(eventUuid: String)throws  -> FlagResult  {
     uniffi_sinus_apple_fn_method_appleengine_clear_flag(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(eventUuid),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Remove all personalization, positive and negative alike. The detector
+     * falls back to the generic decision rules.
+     */
+open func deleteAllTraining()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_delete_all_training(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Remove every take of one class, returning the class to untrained.
+     */
+open func deleteClassTraining(eventType: AppleEventType)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_delete_class_training(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeAppleEventType_lower(eventType),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Remove every negative enrollment — everything the detector learned from
+     * false-positive reports and corrections — while keeping the taught takes.
+     */
+open func deleteLearnedSuppressions()throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_delete_learned_suppressions(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Remove one take by its `TeachTake::id` — the "delete this recording" row
+     * action. Returns how many rows went, so the caller need not assume.
+     */
+open func deleteTake(id: Int64)throws  -> UInt32  {
+    return try  FfiConverterUInt32.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_delete_take(
+            self.uniffiCloneHandle(),
+        FfiConverterInt64.lower(id),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Score and store one take of exactly `teach_take_samples()` samples, then
+     * reload the live detector's prototypes. Always resumes persistence, including
+     * on failure — `MonitoringEngine::enroll_take` clears `suppress_persistence`
+     * on both the success and error paths, so there is nothing left to reset here.
+     */
+open func enrollTake(eventType: AppleEventType, samples: [Float])throws  -> TeachResult  {
+    return try  FfiConverterTypeTeachResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_enroll_take(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeAppleEventType_lower(eventType),
+        FfiConverterSequenceFloat.lower(samples),uniffiCallStatus
     )
 })
 }
@@ -892,6 +1035,19 @@ open func stopMonitoring()throws  -> [AppleEvent]  {
     return try  FfiConverterSequenceTypeAppleEvent.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_stop_monitoring(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * The whole Training pane. Read through the read connection, not the writer,
+     * so refreshing Settings cannot queue behind a Core ML inference.
+     */
+open func training()throws  -> TrainingSnapshot  {
+    return try  FfiConverterTypeTrainingSnapshot_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_training(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
@@ -1376,6 +1532,73 @@ public func FfiConverterTypeAppleEvent_lower(_ value: AppleEvent) -> RustBuffer 
 }
 
 
+/**
+ * One class's training, in `EventType::ALL` order.
+ */
+public struct ClassTraining: Equatable, Hashable {
+    public let eventType: AppleEventType
+    public let status: TrainingStatus
+    /**
+     * Positive takes, oldest first, so the last entry is the newest.
+     */
+    public let takes: [TeachTake]
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(eventType: AppleEventType, status: TrainingStatus,
+        /**
+         * Positive takes, oldest first, so the last entry is the newest.
+         */takes: [TeachTake]) {
+        self.eventType = eventType
+        self.status = status
+        self.takes = takes
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension ClassTraining: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeClassTraining: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> ClassTraining {
+        return
+            try ClassTraining(
+                eventType: FfiConverterTypeAppleEventType.read(from: &buf),
+                status: FfiConverterTypeTrainingStatus.read(from: &buf),
+                takes: FfiConverterSequenceTypeTeachTake.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: ClassTraining, into buf: inout [UInt8]) {
+        FfiConverterTypeAppleEventType.write(value.eventType, into: &buf)
+        FfiConverterTypeTrainingStatus.write(value.status, into: &buf)
+        FfiConverterSequenceTypeTeachTake.write(value.takes, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClassTraining_lift(_ buf: RustBuffer) throws -> ClassTraining {
+    return try FfiConverterTypeClassTraining.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeClassTraining_lower(_ value: ClassTraining) -> RustBuffer {
+    return FfiConverterTypeClassTraining.lower(value)
+}
+
+
 public struct DayBucket: Equatable, Hashable {
     public let dateIso8601: String
     public let counts: [EventCount]
@@ -1688,6 +1911,271 @@ public func FfiConverterTypeModelOutput_lift(_ buf: RustBuffer) throws -> ModelO
 #endif
 public func FfiConverterTypeModelOutput_lower(_ value: ModelOutput) -> RustBuffer {
     return FfiConverterTypeModelOutput.lower(value)
+}
+
+
+/**
+ * The outcome of enrolling one take.
+ */
+public struct TeachResult: Equatable, Hashable {
+    public let eventType: AppleEventType
+    /**
+     * Total positive takes for this class, including the one just recorded.
+     */
+    public let examples: UInt32
+    /**
+     * Negative when this was the class's first take — nothing existed to score against.
+     */
+    public let similarity: Float
+    public let separation: Float
+    public let peakDbfs: Float?
+    /**
+     * Whether this take alone clears the bar `status` applies. Computed by
+     * `sinus_app::teach::TeachResult::is_good` so the two cannot disagree.
+     */
+    public let good: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(eventType: AppleEventType,
+        /**
+         * Total positive takes for this class, including the one just recorded.
+         */examples: UInt32,
+        /**
+         * Negative when this was the class's first take — nothing existed to score against.
+         */similarity: Float, separation: Float, peakDbfs: Float?,
+        /**
+         * Whether this take alone clears the bar `status` applies. Computed by
+         * `sinus_app::teach::TeachResult::is_good` so the two cannot disagree.
+         */good: Bool) {
+        self.eventType = eventType
+        self.examples = examples
+        self.similarity = similarity
+        self.separation = separation
+        self.peakDbfs = peakDbfs
+        self.good = good
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TeachResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTeachResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TeachResult {
+        return
+            try TeachResult(
+                eventType: FfiConverterTypeAppleEventType.read(from: &buf),
+                examples: FfiConverterUInt32.read(from: &buf),
+                similarity: FfiConverterFloat.read(from: &buf),
+                separation: FfiConverterFloat.read(from: &buf),
+                peakDbfs: FfiConverterOptionFloat.read(from: &buf),
+                good: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TeachResult, into buf: inout [UInt8]) {
+        FfiConverterTypeAppleEventType.write(value.eventType, into: &buf)
+        FfiConverterUInt32.write(value.examples, into: &buf)
+        FfiConverterFloat.write(value.similarity, into: &buf)
+        FfiConverterFloat.write(value.separation, into: &buf)
+        FfiConverterOptionFloat.write(value.peakDbfs, into: &buf)
+        FfiConverterBool.write(value.good, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTeachResult_lift(_ buf: RustBuffer) throws -> TeachResult {
+    return try FfiConverterTypeTeachResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTeachResult_lower(_ value: TeachResult) -> RustBuffer {
+    return FfiConverterTypeTeachResult.lower(value)
+}
+
+
+/**
+ * One recorded take, as the Training list renders it.
+ */
+public struct TeachTake: Equatable, Hashable {
+    /**
+     * Row id — the handle `delete_take` takes.
+     */
+    public let id: Int64
+    /**
+     * RFC3339, as stored.
+     */
+    public let createdAt: String
+    /**
+     * Similarity to the class's existing prototype when this take was recorded.
+     * `None` for a class's first take, which had nothing to score against.
+     */
+    public let similarity: Float?
+    /**
+     * Same-class similarity minus the closest other class. `None` alongside `similarity`.
+     */
+    public let separation: Float?
+    public let peakDbfs: Float?
+    public let modelVersion: String?
+    /**
+     * Whether the PHR has this example.
+     */
+    public let synced: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * Row id — the handle `delete_take` takes.
+         */id: Int64,
+        /**
+         * RFC3339, as stored.
+         */createdAt: String,
+        /**
+         * Similarity to the class's existing prototype when this take was recorded.
+         * `None` for a class's first take, which had nothing to score against.
+         */similarity: Float?,
+        /**
+         * Same-class similarity minus the closest other class. `None` alongside `similarity`.
+         */separation: Float?, peakDbfs: Float?, modelVersion: String?,
+        /**
+         * Whether the PHR has this example.
+         */synced: Bool) {
+        self.id = id
+        self.createdAt = createdAt
+        self.similarity = similarity
+        self.separation = separation
+        self.peakDbfs = peakDbfs
+        self.modelVersion = modelVersion
+        self.synced = synced
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TeachTake: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTeachTake: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TeachTake {
+        return
+            try TeachTake(
+                id: FfiConverterInt64.read(from: &buf),
+                createdAt: FfiConverterString.read(from: &buf),
+                similarity: FfiConverterOptionFloat.read(from: &buf),
+                separation: FfiConverterOptionFloat.read(from: &buf),
+                peakDbfs: FfiConverterOptionFloat.read(from: &buf),
+                modelVersion: FfiConverterOptionString.read(from: &buf),
+                synced: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TeachTake, into buf: inout [UInt8]) {
+        FfiConverterInt64.write(value.id, into: &buf)
+        FfiConverterString.write(value.createdAt, into: &buf)
+        FfiConverterOptionFloat.write(value.similarity, into: &buf)
+        FfiConverterOptionFloat.write(value.separation, into: &buf)
+        FfiConverterOptionFloat.write(value.peakDbfs, into: &buf)
+        FfiConverterOptionString.write(value.modelVersion, into: &buf)
+        FfiConverterBool.write(value.synced, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTeachTake_lift(_ buf: RustBuffer) throws -> TeachTake {
+    return try FfiConverterTypeTeachTake.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTeachTake_lower(_ value: TeachTake) -> RustBuffer {
+    return FfiConverterTypeTeachTake.lower(value)
+}
+
+
+/**
+ * The whole Training pane in one read.
+ */
+public struct TrainingSnapshot: Equatable, Hashable {
+    public let classes: [ClassTraining]
+    /**
+     * Learned false-positive suppressions, across all classes.
+     */
+    public let negativeCount: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(classes: [ClassTraining],
+        /**
+         * Learned false-positive suppressions, across all classes.
+         */negativeCount: UInt32) {
+        self.classes = classes
+        self.negativeCount = negativeCount
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TrainingSnapshot: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrainingSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrainingSnapshot {
+        return
+            try TrainingSnapshot(
+                classes: FfiConverterSequenceTypeClassTraining.read(from: &buf),
+                negativeCount: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TrainingSnapshot, into buf: inout [UInt8]) {
+        FfiConverterSequenceTypeClassTraining.write(value.classes, into: &buf)
+        FfiConverterUInt32.write(value.negativeCount, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrainingSnapshot_lift(_ buf: RustBuffer) throws -> TrainingSnapshot {
+    return try FfiConverterTypeTrainingSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrainingSnapshot_lower(_ value: TrainingSnapshot) -> RustBuffer {
+    return FfiConverterTypeTrainingSnapshot.lower(value)
 }
 
 
@@ -2052,6 +2540,104 @@ public func FfiConverterTypeModelError_lower(_ value: ModelError) -> RustBuffer 
     return FfiConverterTypeModelError.lower(value)
 }
 
+
+/**
+ * Where a class stands in Settings. Mirrors `sinus_app::teach::ClassStatus`.
+ */
+
+public enum TrainingStatus: Equatable, Hashable {
+
+    /**
+     * No takes recorded.
+     */
+    case untrained
+    /**
+     * Some takes, but fewer than `teach_min_takes()`; `needed` more to go.
+     */
+    case inactive(needed: UInt32
+    )
+    /**
+     * Enough takes to fire, but the most recent one scored poorly.
+     */
+    case active
+    /**
+     * Enough takes, and the latest one was clean.
+     */
+    case ready
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TrainingStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrainingStatus: FfiConverterRustBuffer {
+    typealias SwiftType = TrainingStatus
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrainingStatus {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .untrained
+
+        case 2: return .inactive(needed: try FfiConverterUInt32.read(from: &buf)
+        )
+
+        case 3: return .active
+
+        case 4: return .ready
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: TrainingStatus, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .untrained:
+            writeInt(&buf, Int32(1))
+
+
+        case let .inactive(needed):
+            writeInt(&buf, Int32(2))
+            FfiConverterUInt32.write(needed, into: &buf)
+
+
+        case .active:
+            writeInt(&buf, Int32(3))
+
+
+        case .ready:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrainingStatus_lift(_ buf: RustBuffer) throws -> TrainingStatus {
+    return try FfiConverterTypeTrainingStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrainingStatus_lower(_ value: TrainingStatus) -> RustBuffer {
+    return FfiConverterTypeTrainingStatus.lower(value)
+}
+
+
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
@@ -2177,6 +2763,31 @@ fileprivate struct FfiConverterSequenceTypeAppleEvent: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterSequenceTypeClassTraining: FfiConverterRustBuffer {
+    typealias SwiftType = [ClassTraining]
+
+    public static func write(_ value: [ClassTraining], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeClassTraining.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [ClassTraining] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [ClassTraining]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeClassTraining.read(from: &buf))
+        }
+        return seq
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterSequenceTypeDayBucket: FfiConverterRustBuffer {
     typealias SwiftType = [DayBucket]
 
@@ -2224,6 +2835,64 @@ fileprivate struct FfiConverterSequenceTypeEventCount: FfiConverterRustBuffer {
     }
 }
 
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeTeachTake: FfiConverterRustBuffer {
+    typealias SwiftType = [TeachTake]
+
+    public static func write(_ value: [TeachTake], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeTeachTake.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [TeachTake] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [TeachTake]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeTeachTake.read(from: &buf))
+        }
+        return seq
+    }
+}
+/**
+ * Samples of lead-in the shell should discard before it starts buffering a
+ * take, exported so Swift's countdown and Rust's expectations cannot drift.
+ */
+public func teachCountdownSamples() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_func_teach_countdown_samples(uniffiCallStatus
+    )
+})
+}
+/**
+ * Takes a class needs before it can fire on its own — what "2 more takes"
+ * counts down to in the UI.
+ */
+public func teachMinTakes() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_func_teach_min_takes(uniffiCallStatus
+    )
+})
+}
+/**
+ * Samples one take must contain. Swift buffers exactly this many before calling
+ * `enroll_take`.
+ */
+public func teachTakeSamples() -> UInt32  {
+    return try!  FfiConverterUInt32.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_func_teach_take_samples(uniffiCallStatus
+    )
+})
+}
+
 private enum InitializationResult {
     case ok
     case contractVersionMismatch
@@ -2239,7 +2908,37 @@ private let initializationResult: InitializationResult = {
     if bindings_contract_version != scaffolding_contract_version {
         return InitializationResult.contractVersionMismatch
     }
+    if (uniffi_sinus_apple_checksum_func_teach_countdown_samples() != 54309) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_func_teach_min_takes() != 34611) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_func_teach_take_samples() != 7616) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_begin_teach_take() != 42825) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_cancel_teach_take() != 51427) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sinus_apple_checksum_method_appleengine_clear_flag() != 37731) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_delete_all_training() != 39915) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_delete_class_training() != 24893) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_delete_learned_suppressions() != 2587) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_delete_take() != 42836) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_enroll_take() != 37991) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_get_setting() != 50547) {
@@ -2276,6 +2975,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_stop_monitoring() != 55192) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_training() != 505) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_modelrunner_model_version() != 62086) {

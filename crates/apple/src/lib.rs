@@ -267,6 +267,131 @@ pub struct HistorySnapshot {
     pub monitored_hours: f64,
 }
 
+/// Samples of lead-in the shell should discard before it starts buffering a
+/// take, exported so Swift's countdown and Rust's expectations cannot drift.
+#[uniffi::export]
+pub fn teach_countdown_samples() -> u32 {
+    sinus_app::teach::TEACH_COUNTDOWN_SAMPLES as u32
+}
+
+/// Samples one take must contain. Swift buffers exactly this many before calling
+/// `enroll_take`.
+#[uniffi::export]
+pub fn teach_take_samples() -> u32 {
+    sinus_app::teach::TEACH_TAKE_SAMPLES as u32
+}
+
+/// Takes a class needs before it can fire on its own — what "2 more takes"
+/// counts down to in the UI.
+#[uniffi::export]
+pub fn teach_min_takes() -> u32 {
+    sinus_app::teach::MIN_TAKES as u32
+}
+
+/// Where a class stands in Settings. Mirrors `sinus_app::teach::ClassStatus`.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum TrainingStatus {
+    /// No takes recorded.
+    Untrained,
+    /// Some takes, but fewer than `teach_min_takes()`; `needed` more to go.
+    Inactive { needed: u32 },
+    /// Enough takes to fire, but the most recent one scored poorly.
+    Active,
+    /// Enough takes, and the latest one was clean.
+    Ready,
+}
+
+impl From<sinus_app::teach::ClassStatus> for TrainingStatus {
+    fn from(value: sinus_app::teach::ClassStatus) -> Self {
+        match value {
+            sinus_app::teach::ClassStatus::Untrained => Self::Untrained,
+            sinus_app::teach::ClassStatus::Inactive { needed } => Self::Inactive {
+                needed: needed as u32,
+            },
+            sinus_app::teach::ClassStatus::Active => Self::Active,
+            sinus_app::teach::ClassStatus::Ready => Self::Ready,
+        }
+    }
+}
+
+/// One recorded take, as the Training list renders it.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TeachTake {
+    /// Row id — the handle `delete_take` takes.
+    pub id: i64,
+    /// RFC3339, as stored.
+    pub created_at: String,
+    /// Similarity to the class's existing prototype when this take was recorded.
+    /// `None` for a class's first take, which had nothing to score against.
+    pub similarity: Option<f32>,
+    /// Same-class similarity minus the closest other class. `None` alongside `similarity`.
+    pub separation: Option<f32>,
+    pub peak_dbfs: Option<f32>,
+    pub model_version: Option<String>,
+    /// Whether the PHR has this example.
+    pub synced: bool,
+}
+
+impl From<sinus_core::store::StoredEnrollment> for TeachTake {
+    fn from(value: sinus_core::store::StoredEnrollment) -> Self {
+        Self {
+            id: value.id,
+            created_at: value.created_at,
+            similarity: value.similarity,
+            separation: value.separation,
+            peak_dbfs: value.peak_dbfs,
+            model_version: value.model_version,
+            synced: value.synced,
+        }
+    }
+}
+
+/// One class's training, in `EventType::ALL` order.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct ClassTraining {
+    pub event_type: AppleEventType,
+    pub status: TrainingStatus,
+    /// Positive takes, oldest first, so the last entry is the newest.
+    pub takes: Vec<TeachTake>,
+}
+
+/// The whole Training pane in one read.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TrainingSnapshot {
+    pub classes: Vec<ClassTraining>,
+    /// Learned false-positive suppressions, across all classes.
+    pub negative_count: u32,
+}
+
+/// The outcome of enrolling one take.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TeachResult {
+    pub event_type: AppleEventType,
+    /// Total positive takes for this class, including the one just recorded.
+    pub examples: u32,
+    /// Negative when this was the class's first take — nothing existed to score against.
+    pub similarity: f32,
+    pub separation: f32,
+    pub peak_dbfs: Option<f32>,
+    /// Whether this take alone clears the bar `status` applies. Computed by
+    /// `sinus_app::teach::TeachResult::is_good` so the two cannot disagree.
+    pub good: bool,
+}
+
+impl From<sinus_app::teach::TeachResult> for TeachResult {
+    fn from(value: sinus_app::teach::TeachResult) -> Self {
+        let good = value.is_good();
+        Self {
+            event_type: value.class.into(),
+            examples: value.examples as u32,
+            similarity: value.similarity,
+            separation: value.separation,
+            peak_dbfs: value.peak_dbfs,
+            good,
+        }
+    }
+}
+
 /// What a flag operation changed, as the UI needs to see it.
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct FlagResult {
@@ -498,6 +623,90 @@ impl AppleEngine {
             sinus_app::flag::clear_flag(store, uuid)
         })
     }
+
+    /// The whole Training pane. Read through the read connection, not the writer,
+    /// so refreshing Settings cannot queue behind a Core ML inference.
+    pub fn training(&self) -> Result<TrainingSnapshot, AppleEngineError> {
+        let store = self.reader()?;
+        let (classes, negative_count) = sinus_app::teach::training_snapshot(&store)?;
+        Ok(TrainingSnapshot {
+            classes: classes
+                .into_iter()
+                .map(|class| ClassTraining {
+                    event_type: class.class.into(),
+                    status: class.status.into(),
+                    takes: class.takes.into_iter().map(TeachTake::from).collect(),
+                })
+                .collect(),
+            negative_count: negative_count as u32,
+        })
+    }
+
+    /// Suppress persistence for the duration of a take. Detections keep running —
+    /// the gate, noise floor and cooldowns stay continuous — but the coughs the
+    /// user deliberately performs for training must not also be logged as events.
+    pub fn begin_teach_take(&self) -> Result<(), AppleEngineError> {
+        self.lock()?.set_suppress_persistence(true);
+        Ok(())
+    }
+
+    /// Abandon a take in progress and resume persisting.
+    pub fn cancel_teach_take(&self) -> Result<(), AppleEngineError> {
+        self.lock()?.set_suppress_persistence(false);
+        Ok(())
+    }
+
+    /// Score and store one take of exactly `teach_take_samples()` samples, then
+    /// reload the live detector's prototypes. Always resumes persistence, including
+    /// on failure — `MonitoringEngine::enroll_take` clears `suppress_persistence`
+    /// on both the success and error paths, so there is nothing left to reset here.
+    pub fn enroll_take(
+        &self,
+        event_type: AppleEventType,
+        samples: Vec<f32>,
+    ) -> Result<TeachResult, AppleEngineError> {
+        // A short buffer would still produce a take — Rust just picks the loudest
+        // window out of whatever it got — so a Swift bug that hands over, say, one
+        // second instead of three would silently degrade scores instead of failing
+        // loudly. Reject anything but exactly the agreed length.
+        let expected = sinus_app::teach::TEACH_TAKE_SAMPLES;
+        if samples.len() != expected {
+            return Err(AppleEngineError::InvalidArgument {
+                message: format!(
+                    "teach take must contain exactly {expected} samples, got {}",
+                    samples.len()
+                ),
+            });
+        }
+        let result = self.lock()?.enroll_take(event_type.into(), &samples)?;
+        Ok(result.into())
+    }
+
+    /// Remove one take by its `TeachTake::id` — the "delete this recording" row
+    /// action. Returns how many rows went, so the caller need not assume.
+    pub fn delete_take(&self, id: i64) -> Result<u32, AppleEngineError> {
+        self.delete_training(sinus_app::teach::Deletion::One(id))
+    }
+
+    /// Remove every take of one class, returning the class to untrained.
+    pub fn delete_class_training(
+        &self,
+        event_type: AppleEventType,
+    ) -> Result<u32, AppleEngineError> {
+        self.delete_training(sinus_app::teach::Deletion::Class(event_type.into()))
+    }
+
+    /// Remove every negative enrollment — everything the detector learned from
+    /// false-positive reports and corrections — while keeping the taught takes.
+    pub fn delete_learned_suppressions(&self) -> Result<u32, AppleEngineError> {
+        self.delete_training(sinus_app::teach::Deletion::Negatives)
+    }
+
+    /// Remove all personalization, positive and negative alike. The detector
+    /// falls back to the generic decision rules.
+    pub fn delete_all_training(&self) -> Result<u32, AppleEngineError> {
+        self.delete_training(sinus_app::teach::Deletion::All)
+    }
 }
 
 impl AppleEngine {
@@ -553,6 +762,18 @@ impl AppleEngine {
             event: updated.into(),
             trained: outcome.trained,
         })
+    }
+
+    /// Shared body of the four delete methods: remove rows, then reload the live
+    /// detector's prototypes unconditionally. Unlike `flag`, this does not check
+    /// whether anything was actually trained on those rows first — deleting a
+    /// class's training while monitoring is running must not leave the stale
+    /// matcher in place, and a reload against an unchanged prototype set is cheap.
+    fn delete_training(&self, what: sinus_app::teach::Deletion) -> Result<u32, AppleEngineError> {
+        let mut engine = self.lock()?;
+        let removed = sinus_app::teach::delete(engine.store(), what)?;
+        engine.reload_enrollments()?;
+        Ok(removed as u32)
     }
 }
 
@@ -819,6 +1040,112 @@ mod tests {
             "expected roughly 1.0 monitored hours, got {}",
             history.monitored_hours
         );
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// A take loud enough for `loudest_patch` to select, exactly
+    /// `teach_take_samples()` long.
+    fn take_signal() -> Vec<f32> {
+        sinus_core::synth::sine(teach_take_samples() as usize, 16_000, 300.0, 0.6)
+    }
+
+    #[test]
+    fn enroll_take_rejects_the_wrong_sample_count() {
+        let (engine, dir) = temp_engine();
+        let error = engine
+            .enroll_take(AppleEventType::Hawk, vec![0.0; 100])
+            .unwrap_err();
+        let message = error.to_string();
+        assert!(
+            message.contains(&teach_take_samples().to_string()),
+            "expected message to name the expected count, got: {message}"
+        );
+        assert!(
+            message.contains("100"),
+            "expected message to name the actual count, got: {message}"
+        );
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_fresh_engine_reports_every_class_untrained() {
+        let (engine, dir) = temp_engine();
+        let training = engine.training().unwrap();
+        assert_eq!(training.negative_count, 0);
+        assert_eq!(training.classes.len(), EventType::ALL.len());
+        for class in &training.classes {
+            assert!(matches!(class.status, TrainingStatus::Untrained));
+            assert!(class.takes.is_empty());
+        }
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn enrolling_takes_moves_a_class_off_untrained() {
+        let (engine, dir) = temp_engine();
+
+        let first = engine
+            .enroll_take(AppleEventType::Hawk, take_signal())
+            .unwrap();
+        assert_eq!(first.examples, 1);
+        let second = engine
+            .enroll_take(AppleEventType::Hawk, take_signal())
+            .unwrap();
+        assert_eq!(second.examples, 2);
+        let third = engine
+            .enroll_take(AppleEventType::Hawk, take_signal())
+            .unwrap();
+        assert_eq!(third.examples, 3);
+
+        let training = engine.training().unwrap();
+        for class in &training.classes {
+            match class.event_type {
+                AppleEventType::Hawk => {
+                    assert_eq!(class.takes.len(), 3);
+                    assert!(!matches!(class.status, TrainingStatus::Untrained));
+                }
+                _ => assert!(matches!(class.status, TrainingStatus::Untrained)),
+            }
+        }
+
+        let removed = engine.delete_class_training(AppleEventType::Hawk).unwrap();
+        assert_eq!(removed, 3);
+        let training = engine.training().unwrap();
+        let hawk = training
+            .classes
+            .iter()
+            .find(|class| matches!(class.event_type, AppleEventType::Hawk))
+            .unwrap();
+        assert!(matches!(hawk.status, TrainingStatus::Untrained));
+        assert!(hawk.takes.is_empty());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_take_in_progress_suppresses_persistence_until_cancelled() {
+        let (engine, dir) = temp_engine();
+        let now = Utc::now();
+        engine.start_monitoring(now.timestamp_millis(), 0).unwrap();
+
+        engine.begin_teach_take().unwrap();
+        let mut signal = sinus_core::synth::white_noise(16_000, 0.003, 1);
+        signal.extend(sinus_core::synth::sine(32_000, 16_000, 300.0, 0.6));
+        signal.extend(sinus_core::synth::white_noise(16_000, 0.003, 2));
+        let mut emitted = Vec::new();
+        for chunk in signal.chunks(777) {
+            emitted.extend(engine.push_pcm_16k(chunk.to_vec()).unwrap());
+        }
+        assert!(emitted.is_empty());
+
+        engine.cancel_teach_take().unwrap();
+        let event = emit_one_event(&engine, now + chrono::Duration::seconds(10));
+        assert!(matches!(event.event_type, AppleEventType::Cough));
 
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
