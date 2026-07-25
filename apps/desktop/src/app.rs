@@ -8,7 +8,7 @@
 use chrono::Utc;
 use eframe::egui;
 use egui_plot::{Bar, BarChart, Legend, Plot};
-use sinus_core::store::{EnrollmentInsert, Store, StoredEnrollment};
+use sinus_core::store::{Store, StoredEnrollment};
 use sinus_core::sync::Mode;
 use sinus_core::types::{Event, EventType};
 
@@ -16,6 +16,7 @@ use crate::shared::{ModelStatus, SharedStatus, TeachState};
 use sinus_app::instance::InstanceGuard;
 use sinus_app::settings;
 use sinus_app::state::{self, local_offset_minutes, PauseState};
+use sinus_app::teach::{self, ClassStatus};
 
 /// Menu item ids.
 #[cfg_attr(test, allow(dead_code))]
@@ -167,27 +168,14 @@ impl SinusApp {
             receiver
         };
         let sensitivity = settings::sensitivity(&store);
-        let server_url = store
-            .setting_get("server_url")
-            .ok()
-            .flatten()
-            .unwrap_or_default();
+        let server_url = settings::server_url(&store);
         let pause_on_low_power = settings::pause_on_low_power(&store);
-        let patient_id = store
-            .setting_get("patient_id")
-            .ok()
-            .flatten()
+        // The form field is a `String` for editing; the typed accessor's
+        // `None` (absent/invalid) just becomes an empty field.
+        let patient_id = settings::patient_id(&store)
+            .map(|id| id.to_string())
             .unwrap_or_default();
-        let mode = store
-            .setting_get("mode")
-            .ok()
-            .flatten()
-            .map(|s| match s.as_str() {
-                "offline-first" => Mode::OfflineFirst,
-                "offline-strict" => Mode::OfflineStrict,
-                _ => Mode::AutoBatch,
-            })
-            .unwrap_or(Mode::AutoBatch);
+        let mode = settings::mode(&store);
         let device_id = settings::ensure_device_id(&store);
 
         SinusApp {
@@ -223,7 +211,7 @@ impl SinusApp {
 
     fn set_mode(&mut self, mode: Mode) {
         self.mode = mode;
-        let _ = self.store.setting_set("mode", mode.as_str());
+        let _ = settings::set_mode(&self.store, mode);
         self.shared.notify_sync();
     }
 
@@ -234,14 +222,14 @@ impl SinusApp {
     }
 
     fn apply_enrollment_action(&mut self, action: EnrollmentAction) {
-        let result = match action {
-            EnrollmentAction::One { id, .. } => self.store.delete_enrollment(id).map(|()| 1usize),
-            EnrollmentAction::Class(class) => self.store.delete_enrollments_for_class(class),
-            EnrollmentAction::Negatives => self.store.delete_negative_enrollments(),
-            EnrollmentAction::All => self.store.delete_all_enrollments(),
+        let deletion = match action {
+            EnrollmentAction::One { id, .. } => teach::Deletion::One(id),
+            EnrollmentAction::Class(class) => teach::Deletion::Class(class),
+            EnrollmentAction::Negatives => teach::Deletion::Negatives,
+            EnrollmentAction::All => teach::Deletion::All,
         };
 
-        match result {
+        match teach::delete(&self.store, deletion) {
             Ok(deleted) => {
                 let noun = match action {
                     EnrollmentAction::Negatives => "false-positive report",
@@ -263,30 +251,25 @@ impl SinusApp {
         }
     }
 
-    /// Report a misdetection: enroll the event's stored embedding as a negative
-    /// for the class that fired (so the detector stops calling that sound *that*),
-    /// then flag the event.
-    ///
-    /// The event is flagged, not deleted: a health record should keep the fact
-    /// that the classifier got something wrong. It stops counting everywhere and
-    /// the flag syncs to the PHR, where it is likewise retained rather than
-    /// erased. The embedding is deliberately kept — the user may follow up by
-    /// saying what the sound actually was.
+    /// Report a misdetection. Policy lives in `sinus_app::flag` so every shell
+    /// (this one and the SwiftUI client) applies the same rules; this wrapper
+    /// only owns the user-facing message and the UI-refresh side effects.
     fn report_false_positive(&mut self, event: &Event) {
-        let trained = self.enroll_negative(event, event.event_type, false);
-
-        if let Err(error) = self.store.mark_false_positive(&event.uuid) {
-            self.history_message = format!("Could not flag the event: {error}");
-            return;
-        }
-        if trained {
+        let outcome = match sinus_app::flag::report_false_positive(&self.store, &event.uuid) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.history_message = format!("Could not flag the event: {error}");
+                return;
+            }
+        };
+        if outcome.trained {
             self.shared.request_enrollment_reload();
         }
         self.shared.notify_history_changed();
         self.shared.request_sync_now();
 
         let class = label(event.event_type);
-        self.history_message = if trained {
+        self.history_message = if outcome.trained {
             format!(
                 "Reported the {class}: it no longer counts here or in the PHR, and the \
                  detector will stop labelling that sound {class}."
@@ -299,47 +282,23 @@ impl SinusApp {
         };
     }
 
-    /// Record what a misdetected sound actually was.
-    ///
-    /// Enrolls the embedding twice: as a negative against the class that fired,
-    /// and as a positive for the corrected one. Negatives are class-scoped, so
-    /// the wrong label is suppressed while the corrected label stays free to
-    /// fire — a class-blind negative would silence the sound entirely, which is
-    /// worse than the original mistake.
+    /// Record what a misdetected sound actually was. See `report_false_positive`
+    /// for why the rules live in `sinus_app::flag`.
     fn recharacterize(&mut self, event: &Event, corrected: EventType) {
-        // Correcting back to what the classifier originally said is an undo, not
-        // a correction. Treating it as one would enroll a negative *and* a
-        // positive for that class from the same embedding, and the veto would
-        // then suppress the very label the user just confirmed.
+        // `flag::recharacterize` treats this as an undo; take the same branch
+        // here so the undo message is written in exactly one place.
         if corrected == event.event_type {
             self.clear_flag(event);
             return;
         }
-
-        let embedding = self.store.get_event_embedding(&event.uuid).ok().flatten();
-
-        let mut trained = false;
-        if let Some(embedding) = &embedding {
-            trained = self.enroll_negative(event, event.event_type, true);
-            let positive = self.store.add_enrollment_full(EnrollmentInsert {
-                class: corrected,
-                embedding,
-                is_negative: false,
-                similarity: None,
-                separation: None,
-                peak_dbfs: event.peak_dbfs,
-                model_version: Some(&event.model_version),
-                source_event_uuid: Some(&event.uuid),
-                negative_scoped: false,
-            });
-            trained |= positive.is_ok();
-        }
-
-        if let Err(error) = self.store.recharacterize(&event.uuid, corrected) {
-            self.history_message = format!("Could not update the event: {error}");
-            return;
-        }
-        if trained {
+        let outcome = match sinus_app::flag::recharacterize(&self.store, &event.uuid, corrected) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.history_message = format!("Could not update the event: {error}");
+                return;
+            }
+        };
+        if outcome.trained {
             self.shared.request_enrollment_reload();
         }
         self.shared.notify_history_changed();
@@ -357,9 +316,10 @@ impl SinusApp {
         );
     }
 
-    /// Undo a false-positive report or a correction.
+    /// Undo a false-positive report or a correction. See
+    /// `report_false_positive` for why the rules live in `sinus_app::flag`.
     fn clear_flag(&mut self, event: &Event) {
-        if let Err(error) = self.store.clear_flag(&event.uuid) {
+        if let Err(error) = sinus_app::flag::clear_flag(&self.store, &event.uuid) {
             self.history_message = format!("Could not restore the event: {error}");
             return;
         }
@@ -369,32 +329,6 @@ impl SinusApp {
             "Restored the event here and in the PHR. Any training it produced is kept — \
              use Settings › Teach mode to remove that too."
                 .to_string();
-    }
-
-    /// Enroll this event's sound as "not `class`", if its embedding was retained.
-    ///
-    /// `scoped` decides how far the veto reaches: a plain false-positive report
-    /// is unscoped (the sound is suppressed under every label, so a borderline
-    /// sound cannot simply re-fire as a sibling class), while the negative half
-    /// of a correction is scoped, because a positive for the corrected class
-    /// carries the same embedding.
-    fn enroll_negative(&mut self, event: &Event, class: EventType, scoped: bool) -> bool {
-        let Ok(Some(embedding)) = self.store.get_event_embedding(&event.uuid) else {
-            return false;
-        };
-        self.store
-            .add_enrollment_full(EnrollmentInsert {
-                class,
-                embedding: &embedding,
-                is_negative: true,
-                similarity: None,
-                separation: None,
-                peak_dbfs: event.peak_dbfs,
-                model_version: Some(&event.model_version),
-                source_event_uuid: Some(&event.uuid),
-                negative_scoped: scoped,
-            })
-            .is_ok()
     }
 
     #[cfg(not(test))]
@@ -760,7 +694,7 @@ impl SinusApp {
                 .text_edit_singleline(&mut self.form.server_url)
                 .lost_focus()
             {
-                let _ = self.store.setting_set("server_url", &self.form.server_url);
+                let _ = settings::set_server_url(&self.store, &self.form.server_url);
                 self.shared.notify_sync();
             }
         });
@@ -772,9 +706,10 @@ impl SinusApp {
                 .lost_focus()
             {
                 let trimmed = self.form.patient_id.trim().to_string();
-                if trimmed.is_empty() || trimmed.parse::<i64>().is_ok_and(|id| id > 0) {
+                let parsed = trimmed.parse::<i64>().ok().filter(|id| *id > 0);
+                if trimmed.is_empty() || parsed.is_some() {
                     self.form.patient_id = trimmed;
-                    let _ = self.store.setting_set("patient_id", &self.form.patient_id);
+                    let _ = settings::set_patient_id(&self.store, parsed);
                     self.shared.notify_sync();
                     self.form.token_message.clear();
                 } else {
@@ -1009,9 +944,14 @@ impl SinusApp {
                 ));
             }
             (TeachState::Saved, Some(class)) => {
-                let good = feedback.examples >= 3
-                    && feedback.similarity >= 0.75
-                    && feedback.separation >= 0.05;
+                let good = teach::TeachResult {
+                    class,
+                    examples: feedback.examples,
+                    similarity: feedback.similarity,
+                    separation: feedback.separation,
+                    peak_dbfs: None,
+                }
+                .is_good();
                 let verdict = if good {
                     "good"
                 } else {
@@ -1076,22 +1016,15 @@ fn class_color(class: EventType, dark: bool) -> egui::Color32 {
     }
 }
 
+/// Renders `teach::class_status` — kept in `sinus_app` so the SwiftUI client's
+/// badge and this one cannot disagree about what "ready" means.
 fn enrollment_status(examples: &[&StoredEnrollment]) -> String {
     let count = examples.len();
-    match count {
-        0 => "not trained".to_string(),
-        1 | 2 => format!("inactive • needs {} more", 3 - count),
-        _ => {
-            let quality_is_good = examples.last().is_some_and(|latest| {
-                latest.similarity.is_some_and(|value| value >= 0.75)
-                    && latest.separation.is_some_and(|value| value >= 0.05)
-            });
-            if quality_is_good {
-                format!("ready • {count} takes")
-            } else {
-                format!("active • {count} takes • add varied takes")
-            }
-        }
+    match teach::class_status(examples) {
+        ClassStatus::Untrained => "not trained".to_string(),
+        ClassStatus::Inactive { needed } => format!("inactive • needs {needed} more"),
+        ClassStatus::Ready => format!("ready • {count} takes"),
+        ClassStatus::Active => format!("active • {count} takes • add varied takes"),
     }
 }
 

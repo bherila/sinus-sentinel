@@ -8,3 +8,6 @@ publish = false
 sinus-core.workspace = true
 chrono.workspace = true
 uuid.workspace = true
+
+[dev-dependencies]
+tiny_http.workspace = true
