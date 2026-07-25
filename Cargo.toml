@@ -1,6 +1,13 @@
 [workspace]
 resolver = "2"
-members = ["crates/core", "crates/cli", "apps/desktop"]
+members = [
+    "crates/core",
+    "crates/app",
+    "crates/apple",
+    "crates/cli",
+    "apps/desktop",
+    "tools/uniffi-bindgen-swift",
+]
 
 [workspace.package]
 edition = "2021"
@@ -9,6 +16,7 @@ publish = false
 
 [workspace.dependencies]
 sinus-core = { path = "crates/core" }
+sinus-app = { path = "crates/app" }
 
 # Shared third-party deps (pinned once, referenced with `.workspace = true`).
 serde = { version = "1", features = ["derive"] }
@@ -46,3 +54,6 @@ egui = "0.29"
 egui_plot = "0.29"
 tray-icon = "0.19"
 winit = "0.30"
+
+# Apple bindings.
+uniffi = "0.32"

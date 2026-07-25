@@ -1,0 +1,5 @@
+[bindings.swift]
+module_name = "SinusApple"
+ffi_module_name = "SinusAppleFFI"
+generate_immutable_records = true
+generate_case_iterable_conformance = true

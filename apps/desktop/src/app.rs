@@ -12,9 +12,10 @@ use sinus_core::store::{EnrollmentInsert, Store, StoredEnrollment};
 use sinus_core::sync::Mode;
 use sinus_core::types::{Event, EventType};
 
-use crate::instance::InstanceGuard;
 use crate::shared::{ModelStatus, SharedStatus, TeachState};
-use crate::state::{self, PauseState};
+use sinus_app::instance::InstanceGuard;
+use sinus_app::settings;
+use sinus_app::state::{self, local_offset_minutes, PauseState};
 
 /// Menu item ids.
 #[cfg_attr(test, allow(dead_code))]
@@ -165,22 +166,13 @@ impl SinusApp {
             }));
             receiver
         };
-        let sensitivity = store
-            .setting_get("sensitivity")
-            .ok()
-            .flatten()
-            .and_then(|s| s.parse().ok())
-            .unwrap_or(0.5);
+        let sensitivity = settings::sensitivity(&store);
         let server_url = store
             .setting_get("server_url")
             .ok()
             .flatten()
             .unwrap_or_default();
-        let pause_on_low_power = store
-            .setting_get("pause_low_power")
-            .ok()
-            .flatten()
-            .is_none_or(|value| value != "false");
+        let pause_on_low_power = settings::pause_on_low_power(&store);
         let patient_id = store
             .setting_get("patient_id")
             .ok()
@@ -196,7 +188,7 @@ impl SinusApp {
                 _ => Mode::AutoBatch,
             })
             .unwrap_or(Mode::AutoBatch);
-        let device_id = ensure_device_id(&store);
+        let device_id = settings::ensure_device_id(&store);
 
         SinusApp {
             store,
@@ -492,7 +484,14 @@ impl SinusApp {
 
     fn refresh_history_if_needed(&mut self, now: chrono::DateTime<Utc>) {
         let generation = self.shared.history_generation();
-        let day = now.date_naive();
+        // Bucket by the *local* day, and invalidate on the local rollover: a UTC
+        // day boundary would move an evening cough onto tomorrow's bar for every
+        // user west of Greenwich, and disagree with the Apple clients reading the
+        // same database.
+        let offset = local_offset_minutes();
+        let day = now
+            .with_timezone(&chrono::FixedOffset::east_opt(offset * 60).expect("valid offset"))
+            .date_naive();
         let stale = self
             .history
             .refreshed_at
@@ -501,8 +500,8 @@ impl SinusApp {
             return;
         }
 
-        self.history.today = state::today_counts(&self.store, now);
-        self.history.histogram = state::daily_histogram(&self.store, 7, now);
+        self.history.today = state::today_counts_at_offset(&self.store, now, offset);
+        self.history.histogram = state::daily_histogram_at_offset(&self.store, 7, now, offset);
         self.history.recent = self
             .store
             .recent_events(now - chrono::Duration::days(7), now)
@@ -536,7 +535,7 @@ impl SinusApp {
                 ui.label("no events yet today");
             }
         });
-        let monitored_hours = (now - now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc())
+        let monitored_hours = (now - state::local_midnight_at_offset(now, local_offset_minutes()))
             .num_minutes() as f64
             / 60.0;
         ui.label(format!(
@@ -820,9 +819,7 @@ impl SinusApp {
             .add(egui::Slider::new(&mut self.form.sensitivity, 0.0..=1.0).text("sensitivity"))
             .on_hover_text("Shared with your other machines through the PHR");
         if slider.changed() {
-            let _ = self
-                .store
-                .setting_set("sensitivity", &self.form.sensitivity.to_string());
+            let _ = settings::set_sensitivity(&self.store, self.form.sensitivity);
             // Apply it to the running detector: without this the slider would
             // only take effect on the next launch.
             self.shared.request_settings_reload();
@@ -840,14 +837,7 @@ impl SinusApp {
             .on_hover_text("Releases the microphone and resumes automatically")
             .changed()
         {
-            let _ = self.store.setting_set(
-                "pause_low_power",
-                if self.form.pause_on_low_power {
-                    "true"
-                } else {
-                    "false"
-                },
-            );
+            let _ = settings::set_pause_on_low_power(&self.store, self.form.pause_on_low_power);
             self.shared.request_settings_reload();
         }
         ui.label(
@@ -1250,15 +1240,6 @@ impl eframe::App for SinusApp {
 }
 
 /// Ensure a stable per-install device id exists in settings.
-fn ensure_device_id(store: &Store) -> String {
-    if let Ok(Some(id)) = store.setting_get("device_id") {
-        return id;
-    }
-    let id = uuid::Uuid::new_v4().to_string();
-    let _ = store.setting_set("device_id", &id);
-    id
-}
-
 /// Build the tray icon + menu (SPEC §6). Not exercised in tests.
 #[cfg(not(test))]
 fn build_tray() -> Result<tray_icon::TrayIcon, Box<dyn std::error::Error>> {

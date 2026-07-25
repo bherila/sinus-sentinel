@@ -1,10 +1,9 @@
-//! Non-UI app state (SPEC §6). Everything here is unit-tested; the egui layer is
-//! a thin renderer over it. Handles today's counts, the 7-day histogram + the
-//! congestion score, and the pause state machine.
+//! UI-independent application state (SPEC §6). Handles today's counts, the
+//! seven-day histogram, congestion score, and pause state machine.
 
 use std::collections::HashMap;
 
-use chrono::{DateTime, Duration, NaiveDate, Utc};
+use chrono::{DateTime, Duration, FixedOffset, NaiveDate, TimeZone, Utc};
 use sinus_core::store::Store;
 use sinus_core::types::EventType;
 
@@ -26,9 +25,17 @@ pub fn counts_in_range(
     counts
 }
 
-/// Counts for the UTC day containing `now`.
-pub fn today_counts(store: &Store, now: DateTime<Utc>) -> HashMap<EventType, i64> {
-    let start = now.date_naive().and_hms_opt(0, 0, 0).unwrap().and_utc();
+/// Counts for the local day containing `now` at a fixed UTC offset. Every shell
+/// passes its own offset: "today" is the user's day, not UTC's, so an evening
+/// cough west of Greenwich must not land on tomorrow's bar.
+pub fn today_counts_at_offset(
+    store: &Store,
+    now: DateTime<Utc>,
+    offset_minutes: i32,
+) -> HashMap<EventType, i64> {
+    let offset = fixed_offset(offset_minutes);
+    let date = now.with_timezone(&offset).date_naive();
+    let start = local_midnight_utc(date, offset);
     let end = start + Duration::days(1);
     counts_in_range(store, start, end)
 }
@@ -48,15 +55,21 @@ impl DayCount {
     }
 }
 
-/// The last `days` days (oldest first), each with per-class counts. The final
-/// entry is the day containing `now`.
-pub fn daily_histogram(store: &Store, days: i64, now: DateTime<Utc>) -> Vec<DayCount> {
-    let today = now.date_naive();
+/// The last `days` local days at a fixed UTC offset, oldest first, each with
+/// per-class counts. The final entry is the day containing `now`.
+pub fn daily_histogram_at_offset(
+    store: &Store,
+    days: i64,
+    now: DateTime<Utc>,
+    offset_minutes: i32,
+) -> Vec<DayCount> {
+    let offset = fixed_offset(offset_minutes);
+    let today = now.with_timezone(&offset).date_naive();
     (0..days)
         .rev()
         .map(|d| {
             let date = today - Duration::days(d);
-            let start = date.and_hms_opt(0, 0, 0).unwrap().and_utc();
+            let start = local_midnight_utc(date, offset);
             let end = start + Duration::days(1);
             DayCount {
                 date,
@@ -64,6 +77,30 @@ pub fn daily_histogram(store: &Store, days: i64, now: DateTime<Utc>) -> Vec<DayC
             }
         })
         .collect()
+}
+
+/// This machine's current UTC offset in minutes. Shells that have a richer
+/// notion of the local zone (Swift's `TimeZone.current`) pass their own instead.
+pub fn local_offset_minutes() -> i32 {
+    chrono::Local::now().offset().local_minus_utc() / 60
+}
+
+fn fixed_offset(offset_minutes: i32) -> FixedOffset {
+    FixedOffset::east_opt(offset_minutes.clamp(-1_439, 1_439) * 60)
+        .expect("clamped timezone offset is valid")
+}
+
+pub fn local_midnight_at_offset(now: DateTime<Utc>, offset_minutes: i32) -> DateTime<Utc> {
+    let offset = fixed_offset(offset_minutes);
+    local_midnight_utc(now.with_timezone(&offset).date_naive(), offset)
+}
+
+fn local_midnight_utc(date: NaiveDate, offset: FixedOffset) -> DateTime<Utc> {
+    offset
+        .from_local_datetime(&date.and_hms_opt(0, 0, 0).expect("midnight is valid"))
+        .single()
+        .expect("fixed offsets have no ambiguous local times")
+        .with_timezone(&Utc)
 }
 
 /// Daily congestion score (SPEC §2): weighted event sum normalized per monitored
@@ -151,7 +188,7 @@ mod tests {
         store.insert_event(&event(EventType::Cough, now)).unwrap();
         store.insert_event(&event(EventType::Cough, now)).unwrap();
         store.insert_event(&event(EventType::Sniffle, now)).unwrap();
-        let counts = today_counts(&store, now);
+        let counts = today_counts_at_offset(&store, now, 0);
         assert_eq!(counts[&EventType::Cough], 2);
         assert_eq!(counts[&EventType::Sniffle], 1);
     }
@@ -165,11 +202,28 @@ mod tests {
         store
             .insert_event(&event(EventType::Hawk, yesterday))
             .unwrap();
-        let hist = daily_histogram(&store, 7, now);
+        let hist = daily_histogram_at_offset(&store, 7, now, 0);
         assert_eq!(hist.len(), 7);
         assert_eq!(hist[6].total(), 1); // today
         assert_eq!(hist[5].total(), 1); // yesterday
         assert_eq!(hist[0].total(), 0); // 6 days ago
+    }
+
+    #[test]
+    fn local_day_uses_the_supplied_offset() {
+        let store = Store::open_in_memory().unwrap();
+        let now = "2026-07-24T01:00:00Z".parse::<DateTime<Utc>>().unwrap();
+        store
+            .insert_event(&event(EventType::Cough, now - Duration::hours(2)))
+            .unwrap();
+
+        assert_eq!(
+            today_counts_at_offset(&store, now, -7 * 60)
+                .get(&EventType::Cough)
+                .copied(),
+            Some(1)
+        );
+        assert!(today_counts_at_offset(&store, now, 0).is_empty());
     }
 
     #[test]

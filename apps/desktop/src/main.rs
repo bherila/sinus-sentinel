@@ -7,11 +7,9 @@
 mod app;
 #[cfg(feature = "live-audio")]
 mod capture;
-mod instance;
 #[cfg(feature = "live-audio")]
 mod power;
 mod shared;
-mod state;
 mod sync;
 
 use std::path::PathBuf;
@@ -40,9 +38,9 @@ fn main() -> eframe::Result<()> {
     if let Err(e) = std::fs::create_dir_all(&dir) {
         eprintln!("warning: could not create data dir {dir:?}: {e}");
     }
-    let instance = match instance::InstanceGuard::acquire(&dir) {
-        Ok(instance::AcquireOutcome::Primary(instance)) => instance,
-        Ok(instance::AcquireOutcome::ActivatedExisting) => {
+    let instance = match sinus_app::instance::InstanceGuard::acquire(&dir) {
+        Ok(sinus_app::instance::AcquireOutcome::Primary(instance)) => instance,
+        Ok(sinus_app::instance::AcquireOutcome::ActivatedExisting) => {
             eprintln!("single-instance: activated the running instance");
             return Ok(());
         }
