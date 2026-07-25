@@ -4,6 +4,7 @@
 //! converted 16 kHz mono PCM and owns the detector, persistence, and projections.
 
 use std::fmt;
+use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
 use std::sync::{Arc, Mutex, MutexGuard};
 
 use chrono::{DateTime, Utc};
@@ -403,6 +404,122 @@ pub struct FlagResult {
     pub trained: bool,
 }
 
+/// How aggressively this device uploads. Device-local: a laptop on metered
+/// wifi and a desktop on ethernet reasonably want different answers for the
+/// same patient. Mirrors `sinus_core::sync::Mode`.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum SyncMode {
+    AutoBatch,
+    OfflineFirst,
+    OfflineStrict,
+}
+
+impl From<sinus_core::sync::Mode> for SyncMode {
+    fn from(value: sinus_core::sync::Mode) -> Self {
+        match value {
+            sinus_core::sync::Mode::AutoBatch => Self::AutoBatch,
+            sinus_core::sync::Mode::OfflineFirst => Self::OfflineFirst,
+            sinus_core::sync::Mode::OfflineStrict => Self::OfflineStrict,
+        }
+    }
+}
+
+impl From<SyncMode> for sinus_core::sync::Mode {
+    fn from(value: SyncMode) -> Self {
+        match value {
+            SyncMode::AutoBatch => Self::AutoBatch,
+            SyncMode::OfflineFirst => Self::OfflineFirst,
+            SyncMode::OfflineStrict => Self::OfflineStrict,
+        }
+    }
+}
+
+/// A local-time window during which detections are not recorded. Both bounds
+/// are hours, 0–23. `start == end` is not a zero-length window but "no window",
+/// which is why the accessors use `Option` rather than encoding that here.
+#[derive(Debug, Clone, Copy, PartialEq, Eq, uniffi::Record)]
+pub struct QuietHours {
+    pub start_hour: u32,
+    pub end_hour: u32,
+}
+
+/// Whether capture is suspended, and until when.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum PauseKind {
+    Running,
+    /// Paused until an absolute instant; `until_epoch_ms` on the snapshot says when.
+    Timed,
+    /// Paused until the user resumes.
+    Indefinite,
+}
+
+#[derive(Debug, Clone, Copy, uniffi::Record)]
+pub struct PauseSnapshot {
+    pub kind: PauseKind,
+    /// Set only for `Timed`.
+    pub until_epoch_ms: Option<i64>,
+    /// Whether the pause is in force *now* — a timed pause whose deadline has
+    /// passed reports `Timed` with a past deadline but `paused == false`, so a
+    /// UI need not re-derive expiry.
+    pub paused: bool,
+}
+
+/// Converts stored pause state into the wire snapshot. `is_paused` and the
+/// variant are derived from the same `state` and `now`, so the two fields on
+/// `PauseSnapshot` cannot disagree with each other the way two independent FFI
+/// calls taken moments apart could.
+fn pause_snapshot(state: sinus_app::state::PauseState, now: DateTime<Utc>) -> PauseSnapshot {
+    let paused = state.is_paused(now);
+    match state {
+        sinus_app::state::PauseState::Running => PauseSnapshot {
+            kind: PauseKind::Running,
+            until_epoch_ms: None,
+            paused,
+        },
+        sinus_app::state::PauseState::PausedIndefinite => PauseSnapshot {
+            kind: PauseKind::Indefinite,
+            until_epoch_ms: None,
+            paused,
+        },
+        sinus_app::state::PauseState::PausedUntil(until) => PauseSnapshot {
+            kind: PauseKind::Timed,
+            until_epoch_ms: Some(until.timestamp_millis()),
+            paused,
+        },
+    }
+}
+
+/// Everything the PHR pane shows except the token, which never crosses this
+/// boundary — Swift owns it in the Keychain.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct PhrSettings {
+    pub server_url: String,
+    pub patient_id: Option<i64>,
+    pub mode: SyncMode,
+    /// This machine's stable identity in the PHR.
+    pub device_id: String,
+}
+
+/// Everything the menu bar renders, in one read, so a UI refresh is one FFI
+/// call rather than six.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct EngineStatus {
+    pub monitoring: bool,
+    /// The energy gate is open — a sound is arriving and is being classified.
+    /// Drives the "heard something — classifying…" indicator.
+    pub gate_open: bool,
+    /// When the gate last opened, for a UI that wants "last heard 4s ago"
+    /// rather than a flicker. `None` if it has not opened this session.
+    pub last_heard_epoch_ms: Option<i64>,
+    pub sensitivity: f32,
+    pub pause: PauseSnapshot,
+    pub quiet_hours: Option<QuietHours>,
+    /// Whether *now* falls inside the quiet-hours window.
+    pub in_quiet_hours: bool,
+    pub pause_on_low_power: bool,
+    pub model_version: String,
+}
+
 /// How many events the "recent" list carries across the FFI boundary. The UI
 /// shows a handful; fetching a whole week would copy every row on every refresh.
 const RECENT_EVENT_LIMIT: usize = 50;
@@ -416,10 +533,26 @@ pub struct AppleEngine {
     /// the model. SQLite's WAL mode is built for exactly this — concurrent
     /// readers never block on the writer.
     reader: Mutex<Store>,
+    /// Published from `push_pcm_16k` so the UI can poll the gate without touching
+    /// the writer mutex, which the audio thread can hold across a Core ML
+    /// inference. A frame-late answer is fine for an indicator; a stalled UI is not.
+    ///
+    /// The same reasoning covers `monitoring` and `model_version`: between them
+    /// these four fields are the whole of `status()` that does not come from the
+    /// read connection, which is what lets a UI poll several times a second
+    /// without ever contending with the audio thread.
+    gate_open: AtomicBool,
+    /// Epoch milliseconds when the gate was last observed open; 0 for "never".
+    last_heard_epoch_ms: AtomicI64,
+    /// Mirrors `MonitoringEngine::is_monitoring`, updated on the transitions.
+    monitoring: AtomicBool,
+    /// Fixed for the engine's lifetime — the embedder is constructed once, from
+    /// one Core ML model — so it needs no lock and no interior mutability.
+    model_version: String,
     /// Held for the engine's lifetime. Dropping it — including on a crash, since
     /// the OS owns the underlying file lock — hands this machine back to whichever
     /// shell the user opens next.
-    _instance: InstanceGuard,
+    instance: InstanceGuard,
 }
 
 #[uniffi::export]
@@ -455,7 +588,7 @@ impl AppleEngine {
             })?;
         let embedder = ForeignEmbedder {
             runner: model,
-            version,
+            version: version.clone(),
         };
         let engine = MonitoringEngine::open(
             &config.database_path,
@@ -466,7 +599,11 @@ impl AppleEngine {
         Ok(Arc::new(Self {
             inner: Mutex::new(engine),
             reader: Mutex::new(reader),
-            _instance: instance,
+            gate_open: AtomicBool::new(false),
+            last_heard_epoch_ms: AtomicI64::new(0),
+            monitoring: AtomicBool::new(false),
+            model_version: version,
+            instance,
         }))
     }
 
@@ -479,29 +616,47 @@ impl AppleEngine {
         check_timezone_offset(timezone_offset_minutes)?;
         self.lock()?
             .start_session(started_at, timezone_offset_minutes);
+        self.gate_open.store(false, Ordering::Relaxed);
+        self.monitoring.store(true, Ordering::Relaxed);
         Ok(())
     }
 
     pub fn push_pcm_16k(&self, samples: Vec<f32>) -> Result<Vec<AppleEvent>, AppleEngineError> {
-        Ok(self
-            .lock()?
-            .push_pcm_16k(&samples)?
-            .into_iter()
-            .map(AppleEvent::from)
-            .collect())
+        let mut engine = self.lock()?;
+        let events = engine.push_pcm_16k(&samples)?;
+        // Read while still holding the lock we already have, rather than taking
+        // it a second time: the audio thread calls this several times a second,
+        // and a second acquisition would be a needless contention point against
+        // any UI thread waiting on `status()`.
+        let gate_open = engine.gate_open();
+        self.gate_open.store(gate_open, Ordering::Relaxed);
+        if gate_open {
+            self.last_heard_epoch_ms
+                .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
+        }
+        Ok(events.into_iter().map(AppleEvent::from).collect())
     }
 
     pub fn stop_monitoring(&self) -> Result<Vec<AppleEvent>, AppleEngineError> {
-        Ok(self
-            .lock()?
-            .stop_session()?
-            .into_iter()
-            .map(AppleEvent::from)
-            .collect())
+        let mut engine = self.lock()?;
+        let stopped = engine.stop_session();
+        // Published from what the engine actually did, not from the fact that
+        // stop was called: a failed flush leaves the session open, and an
+        // indicator that claimed otherwise would be lying about a live mic.
+        self.monitoring
+            .store(engine.is_monitoring(), Ordering::Relaxed);
+        // `last_heard_epoch_ms` is left untouched: it is "last heard this
+        // session or before", not "last heard while monitoring", so a UI
+        // checked after the mic closes can still show how long ago the last
+        // sound arrived instead of the indicator vanishing.
+        self.gate_open.store(false, Ordering::Relaxed);
+        Ok(stopped?.into_iter().map(AppleEvent::from).collect())
     }
 
+    /// Reads the published mirror rather than the engine, so a UI asking while a
+    /// Core ML inference is in flight gets an answer instead of a stall.
     pub fn is_monitoring(&self) -> Result<bool, AppleEngineError> {
-        Ok(self.lock()?.is_monitoring())
+        Ok(self.monitoring.load(Ordering::Relaxed))
     }
 
     pub fn set_sensitivity(&self, sensitivity: f32) -> Result<(), AppleEngineError> {
@@ -706,6 +861,154 @@ impl AppleEngine {
     /// falls back to the generic decision rules.
     pub fn delete_all_training(&self) -> Result<u32, AppleEngineError> {
         self.delete_training(sinus_app::teach::Deletion::All)
+    }
+
+    /// Everything the menu bar renders, in one read, so a UI refresh is one FFI
+    /// call rather than six.
+    ///
+    /// Deliberately never takes the writer lock. This is the call a menu bar
+    /// polls several times a second, and the audio thread holds that lock across
+    /// a Core ML inference — so everything here comes either from the read
+    /// connection, which WAL lets run concurrently with the writer, or from the
+    /// atomics the audio thread publishes as it goes.
+    pub fn status(&self) -> Result<EngineStatus, AppleEngineError> {
+        let store = self.reader()?;
+        let now = Utc::now();
+        let pause = pause_snapshot(sinus_app::settings::pause_state(&store), now);
+        let quiet_hours =
+            sinus_app::settings::quiet_hours(&store).map(|(start_hour, end_hour)| QuietHours {
+                start_hour,
+                end_hour,
+            });
+        let last_heard = self.last_heard_epoch_ms.load(Ordering::Relaxed);
+        Ok(EngineStatus {
+            monitoring: self.monitoring.load(Ordering::Relaxed),
+            gate_open: self.gate_open.load(Ordering::Relaxed),
+            last_heard_epoch_ms: if last_heard == 0 {
+                None
+            } else {
+                Some(last_heard)
+            },
+            sensitivity: sinus_app::settings::sensitivity(&store),
+            pause,
+            quiet_hours,
+            in_quiet_hours: sinus_app::sync::in_quiet_hours_now(&store),
+            pause_on_low_power: sinus_app::settings::pause_on_low_power(&store),
+            model_version: self.model_version.clone(),
+        })
+    }
+
+    pub fn sensitivity(&self) -> Result<f32, AppleEngineError> {
+        let store = self.reader()?;
+        Ok(sinus_app::settings::sensitivity(&store))
+    }
+
+    pub fn quiet_hours(&self) -> Result<Option<QuietHours>, AppleEngineError> {
+        let store = self.reader()?;
+        Ok(
+            sinus_app::settings::quiet_hours(&store).map(|(start_hour, end_hour)| QuietHours {
+                start_hour,
+                end_hour,
+            }),
+        )
+    }
+
+    /// Passing `None` clears the window. Written unsynced-dirty so the next flush
+    /// carries it to the PHR — quiet hours follow the patient between machines.
+    pub fn set_quiet_hours(&self, hours: Option<QuietHours>) -> Result<(), AppleEngineError> {
+        if let Some(QuietHours {
+            start_hour,
+            end_hour,
+        }) = hours
+        {
+            for (name, hour) in [("start_hour", start_hour), ("end_hour", end_hour)] {
+                if hour > 23 {
+                    return Err(AppleEngineError::InvalidArgument {
+                        message: format!("{name} must be 0..=23, got {hour}"),
+                    });
+                }
+            }
+        }
+        sinus_app::settings::set_quiet_hours(
+            self.lock()?.store(),
+            hours.map(|window| (window.start_hour, window.end_hour)),
+        )?;
+        Ok(())
+    }
+
+    pub fn in_quiet_hours(&self) -> Result<bool, AppleEngineError> {
+        let store = self.reader()?;
+        Ok(sinus_app::sync::in_quiet_hours_now(&store))
+    }
+
+    pub fn phr_settings(&self) -> Result<PhrSettings, AppleEngineError> {
+        let store = self.reader()?;
+        Ok(PhrSettings {
+            server_url: sinus_app::settings::server_url(&store),
+            patient_id: sinus_app::settings::patient_id(&store),
+            mode: sinus_app::settings::mode(&store).into(),
+            // Read directly rather than through `ensure_device_id`, which can
+            // write: this is a read path, and by the time an engine exists the
+            // id was already minted when `MonitoringEngine::from_store` opened
+            // the writer connection.
+            device_id: store
+                .setting_get(sinus_app::settings::DEVICE_ID)?
+                .unwrap_or_default(),
+        })
+    }
+
+    pub fn set_server_url(&self, url: String) -> Result<(), AppleEngineError> {
+        sinus_app::settings::set_server_url(self.lock()?.store(), &url)?;
+        Ok(())
+    }
+
+    pub fn set_patient_id(&self, patient_id: Option<i64>) -> Result<(), AppleEngineError> {
+        sinus_app::settings::set_patient_id(self.lock()?.store(), patient_id)?;
+        Ok(())
+    }
+
+    pub fn set_sync_mode(&self, mode: SyncMode) -> Result<(), AppleEngineError> {
+        sinus_app::settings::set_mode(self.lock()?.store(), mode.into())?;
+        Ok(())
+    }
+
+    pub fn pause(&self) -> Result<PauseSnapshot, AppleEngineError> {
+        let store = self.reader()?;
+        let state = sinus_app::settings::pause_state(&store);
+        Ok(pause_snapshot(state, Utc::now()))
+    }
+
+    /// `until_epoch_ms` is `Some` only for `PauseKind::Timed`; supplying it with any
+    /// other kind, or omitting it for `Timed`, is an `InvalidArgument`.
+    pub fn set_pause(
+        &self,
+        kind: PauseKind,
+        until_epoch_ms: Option<i64>,
+    ) -> Result<(), AppleEngineError> {
+        let state = match (kind, until_epoch_ms) {
+            (PauseKind::Running, None) => sinus_app::state::PauseState::Running,
+            (PauseKind::Indefinite, None) => sinus_app::state::PauseState::PausedIndefinite,
+            (PauseKind::Timed, Some(ms)) => {
+                sinus_app::state::PauseState::PausedUntil(timestamp(ms)?)
+            }
+            _ => {
+                return Err(AppleEngineError::InvalidArgument {
+                    message:
+                        "until_epoch_ms must be set for Timed and omitted for every other kind"
+                            .to_string(),
+                })
+            }
+        };
+        sinus_app::settings::set_pause_state(self.lock()?.store(), state)?;
+        Ok(())
+    }
+
+    /// Whether another Sinus Sentinel asked this one to show itself. A second
+    /// launch cannot take the machine, so it leaves a marker and exits; polling
+    /// this is how the running app learns to raise its window instead of the user
+    /// seeing nothing happen. Consumes the request.
+    pub fn take_activation_request(&self) -> bool {
+        self.instance.take_activation_request()
     }
 }
 
@@ -1146,6 +1449,197 @@ mod tests {
         engine.cancel_teach_take().unwrap();
         let event = emit_one_event(&engine, now + chrono::Duration::seconds(10));
         assert!(matches!(event.event_type, AppleEventType::Cough));
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quiet_hours_round_trip_and_reject_bad_hours() {
+        let (engine, dir) = temp_engine();
+        assert!(engine.quiet_hours().unwrap().is_none());
+
+        engine
+            .set_quiet_hours(Some(QuietHours {
+                start_hour: 22,
+                end_hour: 7,
+            }))
+            .unwrap();
+        assert_eq!(
+            engine.quiet_hours().unwrap(),
+            Some(QuietHours {
+                start_hour: 22,
+                end_hour: 7
+            })
+        );
+
+        // `start == end` is the documented "disabled" encoding, not a
+        // zero-length window.
+        engine
+            .set_quiet_hours(Some(QuietHours {
+                start_hour: 9,
+                end_hour: 9,
+            }))
+            .unwrap();
+        assert!(engine.quiet_hours().unwrap().is_none());
+
+        let error = engine
+            .set_quiet_hours(Some(QuietHours {
+                start_hour: 24,
+                end_hour: 7,
+            }))
+            .unwrap_err();
+        assert!(matches!(error, AppleEngineError::InvalidArgument { .. }));
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn set_pause_validates_kind_and_deadline_pairing() {
+        let (engine, dir) = temp_engine();
+
+        assert!(matches!(
+            engine.set_pause(PauseKind::Timed, None),
+            Err(AppleEngineError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            engine.set_pause(PauseKind::Indefinite, Some(1)),
+            Err(AppleEngineError::InvalidArgument { .. })
+        ));
+        assert!(matches!(
+            engine.set_pause(PauseKind::Running, Some(1)),
+            Err(AppleEngineError::InvalidArgument { .. })
+        ));
+
+        let now = Utc::now();
+        let future = (now + chrono::Duration::hours(1)).timestamp_millis();
+        engine.set_pause(PauseKind::Timed, Some(future)).unwrap();
+        let snapshot = engine.pause().unwrap();
+        assert!(matches!(snapshot.kind, PauseKind::Timed));
+        assert_eq!(snapshot.until_epoch_ms, Some(future));
+        assert!(snapshot.paused);
+
+        let past = (now - chrono::Duration::hours(1)).timestamp_millis();
+        engine.set_pause(PauseKind::Timed, Some(past)).unwrap();
+        let snapshot = engine.pause().unwrap();
+        assert!(matches!(snapshot.kind, PauseKind::Timed));
+        assert!(!snapshot.paused);
+
+        engine.set_pause(PauseKind::Running, None).unwrap();
+        let snapshot = engine.pause().unwrap();
+        assert!(matches!(snapshot.kind, PauseKind::Running));
+        assert!(!snapshot.paused);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn a_pause_survives_a_relaunch() {
+        let dir = temp_dir();
+        let engine = engine_in(&dir).unwrap();
+        engine.set_pause(PauseKind::Indefinite, None).unwrap();
+        drop(engine);
+
+        // The `pause_until` row is device-local settings, not session state —
+        // this is the whole point of storing it rather than holding it in
+        // memory, so a relaunch mid-pause does not silently resume capture.
+        let engine = engine_in(&dir).unwrap();
+        let snapshot = engine.pause().unwrap();
+        assert!(matches!(snapshot.kind, PauseKind::Indefinite));
+        assert!(snapshot.paused);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn phr_settings_default_and_round_trip_through_a_relaunch() {
+        let dir = temp_dir();
+        let engine = engine_in(&dir).unwrap();
+        let defaults = engine.phr_settings().unwrap();
+        assert_eq!(defaults.server_url, "");
+        assert_eq!(defaults.patient_id, None);
+        assert!(matches!(defaults.mode, SyncMode::AutoBatch));
+        assert!(!defaults.device_id.is_empty());
+
+        engine
+            .set_server_url("https://phr.example".to_string())
+            .unwrap();
+        engine.set_patient_id(Some(42)).unwrap();
+        engine.set_sync_mode(SyncMode::OfflineFirst).unwrap();
+        drop(engine);
+
+        // A shell must not reset settings a previous launch (or the user) chose.
+        let engine = engine_in(&dir).unwrap();
+        let settings = engine.phr_settings().unwrap();
+        assert_eq!(settings.server_url, "https://phr.example");
+        assert_eq!(settings.patient_id, Some(42));
+        assert!(matches!(settings.mode, SyncMode::OfflineFirst));
+        assert_eq!(settings.device_id, defaults.device_id);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn status_on_a_fresh_engine_reports_defaults() {
+        let (engine, dir) = temp_engine();
+        let status = engine.status().unwrap();
+        assert!(!status.monitoring);
+        assert!(!status.gate_open);
+        assert_eq!(status.last_heard_epoch_ms, None);
+        assert_eq!(status.sensitivity, sinus_app::settings::DEFAULT_SENSITIVITY);
+        assert!(matches!(status.pause.kind, PauseKind::Running));
+        assert!(!status.pause.paused);
+        assert!(status.quiet_hours.is_none());
+        assert!(!status.in_quiet_hours);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn status_reports_the_gate_opening_from_a_real_session() {
+        let (engine, dir) = temp_engine();
+        let now = Utc::now();
+        emit_one_event(&engine, now);
+
+        let status = engine.status().unwrap();
+        assert!(status.last_heard_epoch_ms.is_some());
+        // The mic is closed again, but "last heard" is history, not live state.
+        assert!(!status.gate_open);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// `is_monitoring` and `status().monitoring` read a mirror of the engine's
+    /// own flag rather than the engine itself, so that a UI poll never waits on
+    /// the audio thread. A mirror can drift; this checks it does not.
+    #[test]
+    fn the_published_monitoring_flag_tracks_the_engine() {
+        let (engine, dir) = temp_engine();
+        assert!(!engine.is_monitoring().unwrap());
+
+        engine
+            .start_monitoring(Utc::now().timestamp_millis(), 0)
+            .unwrap();
+        assert!(engine.is_monitoring().unwrap());
+        assert!(engine.status().unwrap().monitoring);
+        assert_eq!(
+            engine.is_monitoring().unwrap(),
+            engine.lock().unwrap().is_monitoring()
+        );
+
+        engine.stop_monitoring().unwrap();
+        assert!(!engine.is_monitoring().unwrap());
+        assert!(!engine.status().unwrap().monitoring);
+        assert_eq!(
+            engine.is_monitoring().unwrap(),
+            engine.lock().unwrap().is_monitoring()
+        );
 
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);

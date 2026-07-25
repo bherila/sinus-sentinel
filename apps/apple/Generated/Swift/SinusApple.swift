@@ -692,7 +692,15 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
 
     func history(days: UInt32, nowEpochMs: Int64, timezoneOffsetMinutes: Int32) throws  -> HistorySnapshot
 
+    func inQuietHours() throws  -> Bool
+
+    /**
+     * Reads the published mirror rather than the engine, so a UI asking while a
+     * Core ML inference is in flight gets an answer instead of a stall.
+     */
     func isMonitoring() throws  -> Bool
+
+    func pause() throws  -> PauseSnapshot
 
     /**
      * Whether the shell should release the microphone while the OS reports Low
@@ -701,7 +709,11 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
      */
     func pauseOnLowPower() throws  -> Bool
 
+    func phrSettings() throws  -> PhrSettings
+
     func pushPcm16k(samples: [Float]) throws  -> [AppleEvent]
+
+    func quietHours() throws  -> QuietHours?
 
     /**
      * Record what a misdetected sound actually was. Correcting an event back to
@@ -718,15 +730,55 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
      */
     func reportFalsePositive(eventUuid: String) throws  -> FlagResult
 
+    func sensitivity() throws  -> Float
+
+    func setPatientId(patientId: Int64?) throws
+
+    /**
+     * `until_epoch_ms` is `Some` only for `PauseKind::Timed`; supplying it with any
+     * other kind, or omitting it for `Timed`, is an `InvalidArgument`.
+     */
+    func setPause(kind: PauseKind, untilEpochMs: Int64?) throws
+
     func setPauseOnLowPower(enabled: Bool) throws
+
+    /**
+     * Passing `None` clears the window. Written unsynced-dirty so the next flush
+     * carries it to the PHR — quiet hours follow the patient between machines.
+     */
+    func setQuietHours(hours: QuietHours?) throws
 
     func setSensitivity(sensitivity: Float) throws
 
+    func setServerUrl(url: String) throws
+
     func setSetting(key: String, value: String) throws
+
+    func setSyncMode(mode: SyncMode) throws
 
     func startMonitoring(startedAtEpochMs: Int64, timezoneOffsetMinutes: Int32) throws
 
+    /**
+     * Everything the menu bar renders, in one read, so a UI refresh is one FFI
+     * call rather than six.
+     *
+     * Deliberately never takes the writer lock. This is the call a menu bar
+     * polls several times a second, and the audio thread holds that lock across
+     * a Core ML inference — so everything here comes either from the read
+     * connection, which WAL lets run concurrently with the writer, or from the
+     * atomics the audio thread publishes as it goes.
+     */
+    func status() throws  -> EngineStatus
+
     func stopMonitoring() throws  -> [AppleEvent]
+
+    /**
+     * Whether another Sinus Sentinel asked this one to show itself. A second
+     * launch cannot take the machine, so it leaves a marker and exits; polling
+     * this is how the running app learns to raise its window instead of the user
+     * seeing nothing happen. Consumes the request.
+     */
+    func takeActivationRequest()  -> Bool
 
     /**
      * The whole Training pane. Read through the read connection, not the writer,
@@ -928,10 +980,32 @@ open func history(days: UInt32, nowEpochMs: Int64, timezoneOffsetMinutes: Int32)
 })
 }
 
+open func inQuietHours()throws  -> Bool  {
+    return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_in_quiet_hours(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Reads the published mirror rather than the engine, so a UI asking while a
+     * Core ML inference is in flight gets an answer instead of a stall.
+     */
 open func isMonitoring()throws  -> Bool  {
     return try  FfiConverterBool.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_is_monitoring(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+open func pause()throws  -> PauseSnapshot  {
+    return try  FfiConverterTypePauseSnapshot_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_pause(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
@@ -951,12 +1025,30 @@ open func pauseOnLowPower()throws  -> Bool  {
 })
 }
 
+open func phrSettings()throws  -> PhrSettings  {
+    return try  FfiConverterTypePhrSettings_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_phr_settings(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
 open func pushPcm16k(samples: [Float])throws  -> [AppleEvent]  {
     return try  FfiConverterSequenceTypeAppleEvent.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_push_pcm_16k(
             self.uniffiCloneHandle(),
         FfiConverterSequenceFloat.lower(samples),uniffiCallStatus
+    )
+})
+}
+
+open func quietHours()throws  -> QuietHours?  {
+    return try  FfiConverterOptionTypeQuietHours.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_quiet_hours(
+            self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
 }
@@ -993,6 +1085,38 @@ open func reportFalsePositive(eventUuid: String)throws  -> FlagResult  {
 })
 }
 
+open func sensitivity()throws  -> Float  {
+    return try  FfiConverterFloat.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_sensitivity(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+open func setPatientId(patientId: Int64?)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_set_patient_id(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionInt64.lower(patientId),uniffiCallStatus
+    )
+}
+}
+
+    /**
+     * `until_epoch_ms` is `Some` only for `PauseKind::Timed`; supplying it with any
+     * other kind, or omitting it for `Timed`, is an `InvalidArgument`.
+     */
+open func setPause(kind: PauseKind, untilEpochMs: Int64?)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_set_pause(
+            self.uniffiCloneHandle(),
+        FfiConverterTypePauseKind_lower(kind),
+        FfiConverterOptionInt64.lower(untilEpochMs),uniffiCallStatus
+    )
+}
+}
+
 open func setPauseOnLowPower(enabled: Bool)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_set_pause_on_low_power(
@@ -1002,11 +1126,33 @@ open func setPauseOnLowPower(enabled: Bool)throws   {try rustCallWithError(FfiCo
 }
 }
 
+    /**
+     * Passing `None` clears the window. Written unsynced-dirty so the next flush
+     * carries it to the PHR — quiet hours follow the patient between machines.
+     */
+open func setQuietHours(hours: QuietHours?)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_set_quiet_hours(
+            self.uniffiCloneHandle(),
+        FfiConverterOptionTypeQuietHours.lower(hours),uniffiCallStatus
+    )
+}
+}
+
 open func setSensitivity(sensitivity: Float)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_set_sensitivity(
             self.uniffiCloneHandle(),
         FfiConverterFloat.lower(sensitivity),uniffiCallStatus
+    )
+}
+}
+
+open func setServerUrl(url: String)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_set_server_url(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(url),uniffiCallStatus
     )
 }
 }
@@ -1021,6 +1167,15 @@ open func setSetting(key: String, value: String)throws   {try rustCallWithError(
 }
 }
 
+open func setSyncMode(mode: SyncMode)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_set_sync_mode(
+            self.uniffiCloneHandle(),
+        FfiConverterTypeSyncMode_lower(mode),uniffiCallStatus
+    )
+}
+}
+
 open func startMonitoring(startedAtEpochMs: Int64, timezoneOffsetMinutes: Int32)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_start_monitoring(
@@ -1031,10 +1186,44 @@ open func startMonitoring(startedAtEpochMs: Int64, timezoneOffsetMinutes: Int32)
 }
 }
 
+    /**
+     * Everything the menu bar renders, in one read, so a UI refresh is one FFI
+     * call rather than six.
+     *
+     * Deliberately never takes the writer lock. This is the call a menu bar
+     * polls several times a second, and the audio thread holds that lock across
+     * a Core ML inference — so everything here comes either from the read
+     * connection, which WAL lets run concurrently with the writer, or from the
+     * atomics the audio thread publishes as it goes.
+     */
+open func status()throws  -> EngineStatus  {
+    return try  FfiConverterTypeEngineStatus_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_status(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
 open func stopMonitoring()throws  -> [AppleEvent]  {
     return try  FfiConverterSequenceTypeAppleEvent.lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_stop_monitoring(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Whether another Sinus Sentinel asked this one to show itself. A second
+     * launch cannot take the machine, so it leaves a marker and exits; polling
+     * this is how the running app learns to raise its window instead of the user
+     * seeing nothing happen. Consumes the request.
+     */
+open func takeActivationRequest() -> Bool  {
+    return try!  FfiConverterBool.lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_take_activation_request(
             self.uniffiCloneHandle(),uniffiCallStatus
     )
 })
@@ -1653,6 +1842,114 @@ public func FfiConverterTypeDayBucket_lower(_ value: DayBucket) -> RustBuffer {
 }
 
 
+/**
+ * Everything the menu bar renders, in one read, so a UI refresh is one FFI
+ * call rather than six.
+ */
+public struct EngineStatus: Equatable, Hashable {
+    public let monitoring: Bool
+    /**
+     * The energy gate is open — a sound is arriving and is being classified.
+     * Drives the "heard something — classifying…" indicator.
+     */
+    public let gateOpen: Bool
+    /**
+     * When the gate last opened, for a UI that wants "last heard 4s ago"
+     * rather than a flicker. `None` if it has not opened this session.
+     */
+    public let lastHeardEpochMs: Int64?
+    public let sensitivity: Float
+    public let pause: PauseSnapshot
+    public let quietHours: QuietHours?
+    /**
+     * Whether *now* falls inside the quiet-hours window.
+     */
+    public let inQuietHours: Bool
+    public let pauseOnLowPower: Bool
+    public let modelVersion: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(monitoring: Bool,
+        /**
+         * The energy gate is open — a sound is arriving and is being classified.
+         * Drives the "heard something — classifying…" indicator.
+         */gateOpen: Bool,
+        /**
+         * When the gate last opened, for a UI that wants "last heard 4s ago"
+         * rather than a flicker. `None` if it has not opened this session.
+         */lastHeardEpochMs: Int64?, sensitivity: Float, pause: PauseSnapshot, quietHours: QuietHours?,
+        /**
+         * Whether *now* falls inside the quiet-hours window.
+         */inQuietHours: Bool, pauseOnLowPower: Bool, modelVersion: String) {
+        self.monitoring = monitoring
+        self.gateOpen = gateOpen
+        self.lastHeardEpochMs = lastHeardEpochMs
+        self.sensitivity = sensitivity
+        self.pause = pause
+        self.quietHours = quietHours
+        self.inQuietHours = inQuietHours
+        self.pauseOnLowPower = pauseOnLowPower
+        self.modelVersion = modelVersion
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension EngineStatus: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEngineStatus: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EngineStatus {
+        return
+            try EngineStatus(
+                monitoring: FfiConverterBool.read(from: &buf),
+                gateOpen: FfiConverterBool.read(from: &buf),
+                lastHeardEpochMs: FfiConverterOptionInt64.read(from: &buf),
+                sensitivity: FfiConverterFloat.read(from: &buf),
+                pause: FfiConverterTypePauseSnapshot.read(from: &buf),
+                quietHours: FfiConverterOptionTypeQuietHours.read(from: &buf),
+                inQuietHours: FfiConverterBool.read(from: &buf),
+                pauseOnLowPower: FfiConverterBool.read(from: &buf),
+                modelVersion: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: EngineStatus, into buf: inout [UInt8]) {
+        FfiConverterBool.write(value.monitoring, into: &buf)
+        FfiConverterBool.write(value.gateOpen, into: &buf)
+        FfiConverterOptionInt64.write(value.lastHeardEpochMs, into: &buf)
+        FfiConverterFloat.write(value.sensitivity, into: &buf)
+        FfiConverterTypePauseSnapshot.write(value.pause, into: &buf)
+        FfiConverterOptionTypeQuietHours.write(value.quietHours, into: &buf)
+        FfiConverterBool.write(value.inQuietHours, into: &buf)
+        FfiConverterBool.write(value.pauseOnLowPower, into: &buf)
+        FfiConverterString.write(value.modelVersion, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEngineStatus_lift(_ buf: RustBuffer) throws -> EngineStatus {
+    return try FfiConverterTypeEngineStatus.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEngineStatus_lower(_ value: EngineStatus) -> RustBuffer {
+    return FfiConverterTypeEngineStatus.lower(value)
+}
+
+
 public struct EventCount: Equatable, Hashable {
     public let eventType: AppleEventType
     public let count: UInt64
@@ -1911,6 +2208,211 @@ public func FfiConverterTypeModelOutput_lift(_ buf: RustBuffer) throws -> ModelO
 #endif
 public func FfiConverterTypeModelOutput_lower(_ value: ModelOutput) -> RustBuffer {
     return FfiConverterTypeModelOutput.lower(value)
+}
+
+
+public struct PauseSnapshot: Equatable, Hashable {
+    public let kind: PauseKind
+    /**
+     * Set only for `Timed`.
+     */
+    public let untilEpochMs: Int64?
+    /**
+     * Whether the pause is in force *now* — a timed pause whose deadline has
+     * passed reports `Timed` with a past deadline but `paused == false`, so a
+     * UI need not re-derive expiry.
+     */
+    public let paused: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(kind: PauseKind,
+        /**
+         * Set only for `Timed`.
+         */untilEpochMs: Int64?,
+        /**
+         * Whether the pause is in force *now* — a timed pause whose deadline has
+         * passed reports `Timed` with a past deadline but `paused == false`, so a
+         * UI need not re-derive expiry.
+         */paused: Bool) {
+        self.kind = kind
+        self.untilEpochMs = untilEpochMs
+        self.paused = paused
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PauseSnapshot: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePauseSnapshot: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PauseSnapshot {
+        return
+            try PauseSnapshot(
+                kind: FfiConverterTypePauseKind.read(from: &buf),
+                untilEpochMs: FfiConverterOptionInt64.read(from: &buf),
+                paused: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PauseSnapshot, into buf: inout [UInt8]) {
+        FfiConverterTypePauseKind.write(value.kind, into: &buf)
+        FfiConverterOptionInt64.write(value.untilEpochMs, into: &buf)
+        FfiConverterBool.write(value.paused, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePauseSnapshot_lift(_ buf: RustBuffer) throws -> PauseSnapshot {
+    return try FfiConverterTypePauseSnapshot.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePauseSnapshot_lower(_ value: PauseSnapshot) -> RustBuffer {
+    return FfiConverterTypePauseSnapshot.lower(value)
+}
+
+
+/**
+ * Everything the PHR pane shows except the token, which never crosses this
+ * boundary — Swift owns it in the Keychain.
+ */
+public struct PhrSettings: Equatable, Hashable {
+    public let serverUrl: String
+    public let patientId: Int64?
+    public let mode: SyncMode
+    /**
+     * This machine's stable identity in the PHR.
+     */
+    public let deviceId: String
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(serverUrl: String, patientId: Int64?, mode: SyncMode,
+        /**
+         * This machine's stable identity in the PHR.
+         */deviceId: String) {
+        self.serverUrl = serverUrl
+        self.patientId = patientId
+        self.mode = mode
+        self.deviceId = deviceId
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PhrSettings: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePhrSettings: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PhrSettings {
+        return
+            try PhrSettings(
+                serverUrl: FfiConverterString.read(from: &buf),
+                patientId: FfiConverterOptionInt64.read(from: &buf),
+                mode: FfiConverterTypeSyncMode.read(from: &buf),
+                deviceId: FfiConverterString.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: PhrSettings, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.serverUrl, into: &buf)
+        FfiConverterOptionInt64.write(value.patientId, into: &buf)
+        FfiConverterTypeSyncMode.write(value.mode, into: &buf)
+        FfiConverterString.write(value.deviceId, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePhrSettings_lift(_ buf: RustBuffer) throws -> PhrSettings {
+    return try FfiConverterTypePhrSettings.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePhrSettings_lower(_ value: PhrSettings) -> RustBuffer {
+    return FfiConverterTypePhrSettings.lower(value)
+}
+
+
+/**
+ * A local-time window during which detections are not recorded. Both bounds
+ * are hours, 0–23. `start == end` is not a zero-length window but "no window",
+ * which is why the accessors use `Option` rather than encoding that here.
+ */
+public struct QuietHours: Equatable, Hashable {
+    public let startHour: UInt32
+    public let endHour: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(startHour: UInt32, endHour: UInt32) {
+        self.startHour = startHour
+        self.endHour = endHour
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension QuietHours: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeQuietHours: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> QuietHours {
+        return
+            try QuietHours(
+                startHour: FfiConverterUInt32.read(from: &buf),
+                endHour: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: QuietHours, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.startHour, into: &buf)
+        FfiConverterUInt32.write(value.endHour, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQuietHours_lift(_ buf: RustBuffer) throws -> QuietHours {
+    return try FfiConverterTypeQuietHours.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeQuietHours_lower(_ value: QuietHours) -> RustBuffer {
+    return FfiConverterTypeQuietHours.lower(value)
 }
 
 
@@ -2542,6 +3044,166 @@ public func FfiConverterTypeModelError_lower(_ value: ModelError) -> RustBuffer 
 
 
 /**
+ * Whether capture is suspended, and until when.
+ */
+
+public enum PauseKind: Equatable, Hashable, CaseIterable {
+
+    case running
+    /**
+     * Paused until an absolute instant; `until_epoch_ms` on the snapshot says when.
+     */
+    case timed
+    /**
+     * Paused until the user resumes.
+     */
+    case indefinite
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension PauseKind: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypePauseKind: FfiConverterRustBuffer {
+    typealias SwiftType = PauseKind
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> PauseKind {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .running
+
+        case 2: return .timed
+
+        case 3: return .indefinite
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: PauseKind, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .running:
+            writeInt(&buf, Int32(1))
+
+
+        case .timed:
+            writeInt(&buf, Int32(2))
+
+
+        case .indefinite:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePauseKind_lift(_ buf: RustBuffer) throws -> PauseKind {
+    return try FfiConverterTypePauseKind.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypePauseKind_lower(_ value: PauseKind) -> RustBuffer {
+    return FfiConverterTypePauseKind.lower(value)
+}
+
+
+
+/**
+ * How aggressively this device uploads. Device-local: a laptop on metered
+ * wifi and a desktop on ethernet reasonably want different answers for the
+ * same patient. Mirrors `sinus_core::sync::Mode`.
+ */
+
+public enum SyncMode: Equatable, Hashable, CaseIterable {
+
+    case autoBatch
+    case offlineFirst
+    case offlineStrict
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension SyncMode: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeSyncMode: FfiConverterRustBuffer {
+    typealias SwiftType = SyncMode
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SyncMode {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .autoBatch
+
+        case 2: return .offlineFirst
+
+        case 3: return .offlineStrict
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: SyncMode, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .autoBatch:
+            writeInt(&buf, Int32(1))
+
+
+        case .offlineFirst:
+            writeInt(&buf, Int32(2))
+
+
+        case .offlineStrict:
+            writeInt(&buf, Int32(3))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncMode_lift(_ buf: RustBuffer) throws -> SyncMode {
+    return try FfiConverterTypeSyncMode.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeSyncMode_lower(_ value: SyncMode) -> RustBuffer {
+    return FfiConverterTypeSyncMode.lower(value)
+}
+
+
+
+/**
  * Where a class stands in Settings. Mirrors `sinus_app::teach::ClassStatus`.
  */
 
@@ -2641,6 +3303,30 @@ public func FfiConverterTypeTrainingStatus_lower(_ value: TrainingStatus) -> Rus
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionInt64: FfiConverterRustBuffer {
+    typealias SwiftType = Int64?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterInt64.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterInt64.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionFloat: FfiConverterRustBuffer {
     typealias SwiftType = Float?
 
@@ -2681,6 +3367,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
         switch try readInt(&buf) as Int8 {
         case 0: return nil
         case 1: return try FfiConverterString.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterOptionTypeQuietHours: FfiConverterRustBuffer {
+    typealias SwiftType = QuietHours?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeQuietHours.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeQuietHours.read(from: &buf)
         default: throw UniffiInternalError.unexpectedOptionalTag
         }
     }
@@ -2947,13 +3657,25 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sinus_apple_checksum_method_appleengine_history() != 43396) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sinus_apple_checksum_method_appleengine_is_monitoring() != 61257) {
+    if (uniffi_sinus_apple_checksum_method_appleengine_in_quiet_hours() != 12286) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_is_monitoring() != 25031) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_pause() != 33017) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_pause_on_low_power() != 39259) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sinus_apple_checksum_method_appleengine_phr_settings() != 64599) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sinus_apple_checksum_method_appleengine_push_pcm_16k() != 19245) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_quiet_hours() != 41646) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_recharacterize() != 23608) {
@@ -2962,19 +3684,43 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sinus_apple_checksum_method_appleengine_report_false_positive() != 21202) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sinus_apple_checksum_method_appleengine_sensitivity() != 54494) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_set_patient_id() != 27994) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_set_pause() != 2815) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sinus_apple_checksum_method_appleengine_set_pause_on_low_power() != 14460) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_set_quiet_hours() != 30878) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_set_sensitivity() != 11213) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sinus_apple_checksum_method_appleengine_set_server_url() != 54130) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sinus_apple_checksum_method_appleengine_set_setting() != 24979) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_set_sync_mode() != 49925) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_start_monitoring() != 64430) {
         return InitializationResult.apiChecksumMismatch
     }
+    if (uniffi_sinus_apple_checksum_method_appleengine_status() != 62428) {
+        return InitializationResult.apiChecksumMismatch
+    }
     if (uniffi_sinus_apple_checksum_method_appleengine_stop_monitoring() != 55192) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_take_activation_request() != 59930) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_training() != 505) {
