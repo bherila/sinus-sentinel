@@ -87,18 +87,38 @@ whatever released the last reference.
 The shell, on both platforms, and for the same reason each time: the engine
 holds no clock.
 
-Quiet hours suppress detection *logging*, not detection. `MonitoringEngine`
-keeps a `quiet` flag separate from the `suppress_persistence` a Teach take
-sets, because the two have different lifetimes — a finished take clears
-suppression, and so does stopping a session, but neither says anything about
-whether the clock has left the window. One shared flag would let a cough
-performed for training at 3am un-mute the rest of the night.
+Quiet hours release the microphone, like pause and the battery policy — SPEC
+§8.3 makes that a privacy guarantee, and a mic held open for hours to discard
+everything it hears is the one thing that guarantee exists to rule out. So
+quiet hours are not a `suppress_persistence` variant; they are a fourth input
+to the one place that decides whether the mic should be live.
 
-Swift drives it from `status()`, which the monitor already polls four times a
-second for the gate indicator, pushing `set_quiet_suppression` only when the
-answer flips. Checking the setting inside `push_pcm_16k` instead would be a
-database round trip per audio buffer to learn something that changes on the
-hour.
+*When* they apply is the interesting part. The window is a proxy for the user
+being **away** (SPEC §13 q4) — a machine left running overnight logs a
+housemate and the street, not the user's coughs. Someone awake at 3am at their
+own keyboard should still be monitored. So the rule is
+`sinus_app::sync::suppress_for_quiet_hours(in_window, idle)`: a pure function,
+shared with the tray app, because this is policy and policy lives in
+`sinus-app`. The window syncs through the PHR; "am I at *this* keyboard"
+cannot and must not.
+
+`UserIdleMonitor` supplies the idle half, mirroring
+`apps/desktop/src/power.rs::user_idle`. It returns an optional on purpose:
+`nil` means "no honest signal" and falls back to the literal window, whereas a
+zero fallback would read as "the user just touched the machine" and hold the
+mic open all night on any query failure. **iOS always returns `nil`** — the
+device is in the user's pocket, so there is no absence to detect, and deriving
+a proxy from app-active or screen-lock state would quietly redefine quiet
+hours as "whenever your screen is off". The asymmetry is deliberate.
+
+That release creates a problem worth naming: the status poll that feeds the
+gate indicator only runs *while capturing*, so once quiet hours release the
+mic it stops, and nothing would notice the user coming back. A second, slower
+timer therefore runs for as long as a session is *requested* — the opposite
+lifetime rule — at the 30 s cadence the tray app's capture worker also uses.
+The tray app's `suspension_wait` was shortened from an hour to match: idle can
+lift at any moment, and an hour-scale park would mean sitting back down at your
+desk and not being monitored until the next check.
 
 `set_pause` persists the pause and nothing else. The shell releases the
 microphone, exactly as the tray app drops its stream — the same reasoning as

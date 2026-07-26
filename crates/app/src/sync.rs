@@ -127,6 +127,37 @@ pub fn in_quiet_hours(hour: u32, start: u32, end: u32) -> bool {
     }
 }
 
+/// How long a machine must go untouched before quiet hours treat the user as
+/// absent. Long enough that reading a page without touching anything does not
+/// flip it; short enough that walking away is noticed promptly.
+///
+/// A constant rather than a setting: quiet hours already asks the user for two
+/// numbers, and a third would be a knob for a threshold nobody can calibrate
+/// without watching the effect.
+pub const IDLE_FOR_QUIET_HOURS: Duration = Duration::from_secs(5 * 60);
+
+/// Whether detections should be suppressed right now (SPEC §6, §8.3).
+///
+/// Quiet hours exist because a machine left running overnight logs a housemate,
+/// the television and the street rather than the user's own coughs. The window
+/// is a proxy for *absence*, not for the clock — so a user who is demonstrably
+/// at the keyboard inside their own quiet window is still monitored, and the
+/// window only silences the machine once they have actually gone away.
+///
+/// Pure, and shared by every shell: this is the rule, and evaluating it locally
+/// on each machine is the point. The window syncs through the PHR, but "am I at
+/// *this* keyboard" cannot and must not.
+///
+/// `idle` is time since the last user input on this machine. Platforms with no
+/// honest idle signal — iOS, where the device is in the user's pocket and there
+/// is no absence to detect — pass `None` and get the literal window.
+pub fn suppress_for_quiet_hours(in_window: bool, idle: Option<Duration>) -> bool {
+    match idle {
+        Some(idle) => in_window && idle >= IDLE_FOR_QUIET_HOURS,
+        None => in_window,
+    }
+}
+
 /// The settings the engine is built from, so a change to either rebuilds it.
 /// Without this, filling in the server URL or patient id for the first time
 /// leaves sync dead until the app is relaunched or the mode toggled.
@@ -567,6 +598,32 @@ mod tests {
         assert!(!in_quiet_hours(12, 23, 7));
         // start == end disables.
         assert!(!in_quiet_hours(5, 0, 0));
+    }
+
+    #[test]
+    fn quiet_hours_only_silence_a_machine_the_user_has_left() {
+        let away = Some(IDLE_FOR_QUIET_HOURS);
+        let here = Some(Duration::from_secs(1));
+
+        // The case the feature exists for: machine on, user asleep.
+        assert!(suppress_for_quiet_hours(true, away));
+        // Awake at 3am at your own keyboard — those coughs are yours, and the
+        // window is a proxy for absence, not an instruction to ignore you.
+        assert!(!suppress_for_quiet_hours(true, here));
+        // Outside the window nothing is suppressed, idle or not.
+        assert!(!suppress_for_quiet_hours(false, away));
+        assert!(!suppress_for_quiet_hours(false, here));
+
+        // Exactly at the threshold counts as away, so the boundary cannot leave
+        // a machine monitoring forever on an idle time that never exceeds it.
+        assert!(!suppress_for_quiet_hours(
+            true,
+            Some(IDLE_FOR_QUIET_HOURS - Duration::from_millis(1))
+        ));
+
+        // No idle signal (iOS): the literal window, as before.
+        assert!(suppress_for_quiet_hours(true, None));
+        assert!(!suppress_for_quiet_hours(false, None));
     }
 
     // --- SyncDriver integration test -----------------------------------

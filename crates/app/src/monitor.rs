@@ -49,7 +49,6 @@ pub struct MonitoringEngine<E: Embedder> {
     device_id: String,
     context: Option<EventContext>,
     suppress_persistence: bool,
-    quiet: bool,
 }
 
 impl<E: Embedder> MonitoringEngine<E> {
@@ -73,7 +72,6 @@ impl<E: Embedder> MonitoringEngine<E> {
             device_id,
             context: None,
             suppress_persistence: false,
-            quiet: false,
         })
     }
 
@@ -151,27 +149,20 @@ impl<E: Embedder> MonitoringEngine<E> {
 
     /// While set, detections are still computed — so the gate, the noise floor and
     /// the sessionizer's cooldowns stay continuous — but nothing is persisted.
-    /// Quiet hours and Teach takes both need exactly this; tearing the stream down
-    /// instead would reset the sample clock and skew later event timestamps.
+    /// A Teach take needs exactly this: the user performs the sound on purpose,
+    /// and tearing the stream down instead would reset the sample clock and skew
+    /// the timestamps of every event after it.
+    ///
+    /// Not what quiet hours use. Those release the microphone entirely
+    /// (SPEC §8.3), because the reason to be silent then is that nobody is at the
+    /// machine — and a mic held open for hours to discard everything it hears is
+    /// the one thing that privacy guarantee exists to rule out.
     pub fn set_suppress_persistence(&mut self, suppress: bool) {
         self.suppress_persistence = suppress;
     }
 
     pub fn suppress_persistence(&self) -> bool {
         self.suppress_persistence
-    }
-
-    /// Quiet hours, held separately from `suppress_persistence` even though both
-    /// gate the same write. They have different lifetimes: a Teach take clears
-    /// suppression when it ends, and a session clears it defensively, but neither
-    /// event says anything about whether the clock has left the quiet window. One
-    /// shared flag would let a take that finished at 3am un-mute the night.
-    pub fn set_quiet(&mut self, quiet: bool) {
-        self.quiet = quiet;
-    }
-
-    pub fn quiet(&self) -> bool {
-        self.quiet
     }
 
     /// Re-read the settings a PHR pull can change under us (today: sensitivity).
@@ -202,7 +193,7 @@ impl<E: Embedder> MonitoringEngine<E> {
         // The pipeline must run regardless of suppression (see push_pcm_16k) so the
         // gate, noise floor and cooldowns stay continuous; only the store write is
         // skipped here.
-        if self.suppress_persistence || self.quiet {
+        if self.suppress_persistence {
             return Ok(Vec::new());
         }
         let context = self
@@ -338,35 +329,6 @@ mod tests {
         idle_engine.set_suppress_persistence(true);
         idle_engine.stop_session().unwrap();
         assert!(!idle_engine.suppress_persistence());
-    }
-
-    #[test]
-    fn quiet_survives_what_clears_suppression() {
-        let mut engine = engine();
-        let signal = cough_signal();
-
-        engine.set_quiet(true);
-        engine.start_session(Utc::now(), 0);
-        for chunk in signal.chunks(777) {
-            engine.push_pcm_16k(chunk).unwrap();
-        }
-        // Both of the things that clear `suppress_persistence` — a finished take
-        // and a stopped session — must leave quiet hours alone, or a 3am cough
-        // performed for training would un-mute the rest of the night.
-        engine.enroll_take(EventType::Cough, &signal).ok();
-        assert!(engine.quiet());
-        engine.stop_session().unwrap();
-        assert!(engine.quiet());
-        assert_eq!(engine.store().event_count().unwrap(), 0);
-
-        engine.set_quiet(false);
-        engine.start_session(Utc::now(), 0);
-        let mut emitted = Vec::new();
-        for chunk in signal.chunks(777) {
-            emitted.extend(engine.push_pcm_16k(chunk).unwrap());
-        }
-        emitted.extend(engine.stop_session().unwrap());
-        assert_eq!(emitted.len(), 1);
     }
 
     /// A cough score that only clears the effective threshold at neutral-or-higher

@@ -106,6 +106,7 @@ swift_args=(
   "$rust_library"
   -framework AVFoundation
   -framework Charts
+  -framework CoreGraphics
   -framework CoreML
   -framework Security
   -framework SwiftUI

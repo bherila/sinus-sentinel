@@ -80,7 +80,7 @@ private struct GeneralSettingsView: View {
                             Text(Self.hourLabel(hour)).tag(hour)
                         }
                     }
-                    Text("Detections aren't recorded during this local-time window. It may wrap past midnight — for example 22:00 to 07:00. Syncs with the PHR.")
+                    Text("Once the machine has been idle a few minutes inside this local-time window, the microphone is released. Using the machine resumes monitoring immediately, even inside the window. It may wrap past midnight — for example 22:00 to 07:00. Syncs with the PHR.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 } else {

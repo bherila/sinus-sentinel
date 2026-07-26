@@ -81,7 +81,9 @@ struct PhrSettingsView: View {
                 LabeledContent("Pending work (gates flush)", value: "\(sync.status.pendingWork)")
                 LabeledContent("Last successful sync", value: sync.lastSuccessDescription)
                 if sync.status.quiet {
-                    Text("Quiet hours are suppressing sync right now.")
+                    // Reported, not enforced: `quiet` never reaches
+                    // `should_flush`, so uploads continue through the window.
+                    Text("The local hour is inside your quiet-hours window.")
                         .font(.footnote)
                         .foregroundStyle(.secondary)
                 }

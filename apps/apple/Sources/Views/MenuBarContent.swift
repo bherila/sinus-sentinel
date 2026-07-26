@@ -24,6 +24,10 @@ struct MenuBarContent: View {
             Text(pauseStatusLine)
         } else if host.monitor.suspendedForLowPower {
             Text("Paused for Low Power Mode")
+        } else if host.monitor.suppressedForQuietHours {
+            // Distinct from the two cases above: this one ends the moment the
+            // machine notices activity again, not on a deadline or a mode change.
+            Text("Quiet hours — away")
         }
         Button(host.monitor.sessionRequested ? "Stop monitoring" : "Start monitoring") {
             host.monitor.toggleMonitoring()

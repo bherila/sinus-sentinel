@@ -7,12 +7,17 @@ import SinusAppleFFI
 @MainActor
 @Observable
 final class MonitorModel {
-    /// The user asked for a session. Capture may still be suspended — battery
-    /// policy suspends the microphone without discarding that intent, so the
-    /// session resumes by itself when the device leaves Low Power Mode.
+    /// The user asked for a session. Capture may still be suspended — Low
+    /// Power Mode, pause and quiet hours all suspend the microphone without
+    /// discarding that intent, so the session resumes by itself once each
+    /// condition lifts.
     private(set) var sessionRequested = false
     private(set) var isCapturing = false
     private(set) var suspendedForLowPower = false
+    /// Distinct from `suspendedForLowPower` and from the user's `pause`: this
+    /// reason ends when the machine notices activity again, not when Low
+    /// Power Mode turns off or a pause deadline passes.
+    private(set) var suppressedForQuietHours = false
     /// Another Sinus Sentinel owns this machine. The app stays open and inert
     /// rather than pretending to monitor alongside it.
     private(set) var blockedByOtherInstance = false
@@ -24,8 +29,10 @@ final class MonitorModel {
     /// ending. Restored from the engine at `attach`, since a pause now
     /// survives relaunch.
     private(set) var pause: PauseSnapshot?
-    /// Polled while capturing, for the "heard something — classifying…"
-    /// indicator. `nil` before any read has happened.
+    /// Polled while capturing (for the "heard something — classifying…"
+    /// indicator) and, more slowly, whenever a session is requested (to
+    /// notice the quiet-hours window changing while the mic is released).
+    /// `nil` before any read has happened.
     private(set) var status: EngineStatus?
 
     var isLowPowerModeEnabled: Bool { power.isLowPower }
@@ -58,11 +65,34 @@ final class MonitorModel {
     /// running once the microphone is released.
     @ObservationIgnored
     private var pauseExpiryTimer: Timer?
-    /// The suppression value last pushed to the engine, so the status poll
-    /// (4 Hz while capturing) only calls `setQuietSuppression` when the flag
-    /// actually flips, not four times a second to say the same thing.
+    /// Runs whenever a session is requested, independent of whether capture is
+    /// currently live — the opposite lifetime rule from `statusTimer` above.
+    /// Quiet hours (like Low Power Mode and pause) can release the microphone
+    /// for hours; without a poll that keeps running through that release,
+    /// nothing would ever notice the user coming back, and monitoring would
+    /// stay off until they toggled it by hand. 30s matches the desktop
+    /// capture worker's `QUIET_POLL_INTERVAL` (`apps/desktop/src/capture.rs`)
+    /// and its shortened `suspension_wait` park. `AppleEngine.status()` never
+    /// takes the writer lock, so polling it while suspended is cheap and safe.
     @ObservationIgnored
-    private var quietSuppressionApplied: Bool?
+    private var quietHoursPollTimer: Timer?
+
+    /// How long the machine must go untouched before quiet hours treat the
+    /// user as absent. Mirrors `sinus_app::sync::IDLE_FOR_QUIET_HOURS`
+    /// (crates/app/src/sync.rs) — that constant is the authority; this is a
+    /// copy because the threshold is not exposed over the FFI.
+    private static let idleForQuietHours: TimeInterval = 5 * 60
+
+    /// Mirrors `sinus_app::sync::suppress_for_quiet_hours` (crates/app/src/sync.rs):
+    /// the window is a proxy for absence, not an instruction to ignore the
+    /// clock, so someone demonstrably at the keyboard inside their own quiet
+    /// window is still monitored. `idle == nil` (no honest signal) falls back
+    /// to the literal window.
+    private static func suppressForQuietHours(inWindow: Bool, idle: TimeInterval?) -> Bool {
+        guard inWindow else { return false }
+        guard let idle else { return true }
+        return idle >= idleForQuietHours
+    }
 
     init() {
         power.onChange = { [weak self] _ in
@@ -73,6 +103,7 @@ final class MonitorModel {
     deinit {
         statusTimer?.invalidate()
         pauseExpiryTimer?.invalidate()
+        quietHoursPollTimer?.invalidate()
     }
 
     func attach(engine: AppleEngine, audio: AudioMonitoringService) {
@@ -147,6 +178,8 @@ final class MonitorModel {
         if sessionRequested {
             sessionRequested = false
             suspendedForLowPower = false
+            suppressedForQuietHours = false
+            stopQuietHoursPolling()
             stopCapture()
             return
         }
@@ -157,19 +190,30 @@ final class MonitorModel {
             }
             sessionRequested = true
             onError(nil)
+            startQuietHoursPolling()
+            // Before the first policy decision, not after: `attach` read the
+            // status at launch, and whether the local hour is inside the quiet
+            // window will have gone stale by the time anyone presses start.
+            pollStatus()
             applyPolicy()
         }
     }
 
     /// The single place that decides whether the microphone should be live:
-    /// "the user wants a session", "the OS wants us to use less power", and
-    /// "the user paused". Called on every input that can change any of them.
+    /// "the user wants a session", "the OS wants us to use less power", "the
+    /// user paused", and "quiet hours judge the user away". Called on every
+    /// input that can change any of them.
     private func applyPolicy() {
         guard sessionRequested else { return }
         let shouldSuspendForPower = pauseOnLowPower && power.isLowPower
         suspendedForLowPower = shouldSuspendForPower
         let userPaused = pause?.paused ?? false
-        if shouldSuspendForPower || userPaused {
+        let shouldSuppressForQuietHours = Self.suppressForQuietHours(
+            inWindow: status?.inQuietHours ?? false,
+            idle: UserIdleMonitor.idle()
+        )
+        suppressedForQuietHours = shouldSuppressForQuietHours
+        if shouldSuspendForPower || userPaused || shouldSuppressForQuietHours {
             // Releasing the microphone — not merely skipping analysis — is what
             // actually lets the audio hardware and its wake-ups idle.
             stopCapture()
@@ -183,15 +227,17 @@ final class MonitorModel {
         do {
             try audio.start()
             isCapturing = true
-            // Seed the quiet-hours flag before the first poll tick, not after
-            // it: a session that begins inside the window must not log its
-            // first minutes.
+            // Seed status before the first status-timer tick so the
+            // "heard something — classifying…" indicator has fresh state from
+            // the first frame rather than a stale read from before capture
+            // began.
             pollStatus()
             startStatusPolling()
             onError(nil)
         } catch {
             sessionRequested = false
             isCapturing = false
+            stopQuietHoursPolling()
             onError(error.localizedDescription)
         }
     }
@@ -232,23 +278,27 @@ final class MonitorModel {
         statusTimer = nil
     }
 
-    private func pollStatus() {
-        guard let engine else { return }
-        let latest = try? engine.status()
-        status = latest
-        if let latest {
-            applyQuietSuppression(latest.inQuietHours)
+    /// Unlike `startStatusPolling`, this timer's lifetime is tied to
+    /// `sessionRequested`, not to `isCapturing` — see the property comment on
+    /// `quietHoursPollTimer` for why.
+    private func startQuietHoursPolling() {
+        stopQuietHoursPolling()
+        quietHoursPollTimer = Timer.scheduledTimer(withTimeInterval: 30, repeats: true) { [weak self] _ in
+            MainActor.assumeIsolated {
+                self?.pollStatus()
+                self?.applyPolicy()
+            }
         }
     }
 
-    /// Quiet hours suppress detection *logging*, not detection: the pipeline
-    /// keeps running so the gate, noise floor and cooldowns stay continuous
-    /// across the window, the same reason the tray app suppresses at its
-    /// write site instead of tearing capture down.
-    private func applyQuietSuppression(_ suppressed: Bool) {
-        guard quietSuppressionApplied != suppressed else { return }
-        quietSuppressionApplied = suppressed
-        try? engine?.setQuietSuppression(suppressed: suppressed)
+    private func stopQuietHoursPolling() {
+        quietHoursPollTimer?.invalidate()
+        quietHoursPollTimer = nil
+    }
+
+    private func pollStatus() {
+        guard let engine else { return }
+        status = try? engine.status()
     }
 
     private func schedulePauseExpiry() {
@@ -275,6 +325,8 @@ final class MonitorModel {
     private func handleCaptureFailure(_ message: String) {
         sessionRequested = false
         suspendedForLowPower = false
+        suppressedForQuietHours = false
+        stopQuietHoursPolling()
         stopCapture()
         onError(message)
     }

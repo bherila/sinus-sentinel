@@ -95,6 +95,14 @@ struct ContentView: View {
                 .orange
             )
         }
+        if host.monitor.suppressedForQuietHours {
+            return (
+                "Quiet hours",
+                "The microphone is released because you appear to be away. Monitoring resumes as soon as you use the machine again, even inside the window.",
+                "moon.zzz.fill",
+                .orange
+            )
+        }
         if host.monitor.isCapturing {
             return (
                 "Monitoring is active",
