@@ -227,10 +227,11 @@ sleep until an event or real deadline rather than polling.
 
 ## Status
 
-Alpha (`v0.2.0-alpha`). Core pipeline complete and tested end-to-end; desktop
+Alpha (`v0.4.0-alpha`). Core pipeline complete and tested end-to-end; desktop
 shell with live capture, Teach mode, false-positive training, sync, and releases
-working. Remaining: signed/notarized macOS bundle (#5), real-world accuracy
-corpus + evaluation (#4), CSV/JSON export in the UI, mobile companion (stretch).
+working. The macOS SwiftUI client is at feature parity with the tray app and the
+iPhone shell is next. Remaining: signed/notarized macOS bundle (#5), real-world
+accuracy corpus + evaluation (#4), CSV/JSON export in the UI.
 
 ## License
 
