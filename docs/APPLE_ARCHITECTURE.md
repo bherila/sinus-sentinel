@@ -82,6 +82,34 @@ the machine. `shutdown(timeout_ms)` is the bounded, deterministic stop; `Drop`
 deliberately does not block, since a 30-second flush would otherwise hang
 whatever released the last reference.
 
+## Who enforces quiet hours and pause
+
+The shell, on both platforms, and for the same reason each time: the engine
+holds no clock.
+
+Quiet hours suppress detection *logging*, not detection. `MonitoringEngine`
+keeps a `quiet` flag separate from the `suppress_persistence` a Teach take
+sets, because the two have different lifetimes — a finished take clears
+suppression, and so does stopping a session, but neither says anything about
+whether the clock has left the window. One shared flag would let a cough
+performed for training at 3am un-mute the rest of the night.
+
+Swift drives it from `status()`, which the monitor already polls four times a
+second for the gate indicator, pushing `set_quiet_suppression` only when the
+answer flips. Checking the setting inside `push_pcm_16k` instead would be a
+database round trip per audio buffer to learn something that changes on the
+hour.
+
+`set_pause` persists the pause and nothing else. The shell releases the
+microphone, exactly as the tray app drops its stream — the same reasoning as
+the battery policy, since skipping analysis alone leaves the audio hardware
+awake. Pause is therefore the third input to the one place that decides
+whether the mic should be live, alongside the user's session intent and Low
+Power Mode. A timed pause ends by wall clock with nothing to call back, so the
+shell arms a one-shot timer for its deadline; `PauseSnapshot.paused` is
+re-derived on read, so a pause that expired while the app was closed is
+already over by the time it is restored at launch.
+
 ## One app per machine
 
 Both macOS shells read `~/Library/Application Support/SinusSentinel/events.db`,
