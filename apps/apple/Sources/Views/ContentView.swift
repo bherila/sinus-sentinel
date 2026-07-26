@@ -45,7 +45,6 @@ struct ContentView: View {
                 }
 
                 recentEvents
-                batterySettings
             }
             .padding()
         }
@@ -105,24 +104,6 @@ struct ContentView: View {
             "waveform.circle",
             .primary
         )
-    }
-
-    private var batterySettings: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Battery")
-                .font(.title2.bold())
-            Toggle("Pause while Low Power Mode is on", isOn: Binding(
-                get: { host.monitor.pauseOnLowPower },
-                set: { host.monitor.setPauseOnLowPower($0) }
-            ))
-            Text(
-                host.monitor.isLowPowerModeEnabled
-                    ? "Low Power Mode is on right now."
-                    : "Releases the microphone and resumes automatically. Shared with the desktop app through the same database."
-            )
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-        }
     }
 
     @ViewBuilder

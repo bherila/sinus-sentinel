@@ -20,6 +20,8 @@
     <string>1</string>
     <key>LSMinimumSystemVersion</key>
     <string>14.0</string>
+    <key>LSUIElement</key>
+    <true/>
     <key>NSMicrophoneUsageDescription</key>
     <string>Sinus Sentinel listens during sessions you start to detect respiratory events locally. Audio is never stored or sent.</string>
     <key>NSPrincipalClass</key>

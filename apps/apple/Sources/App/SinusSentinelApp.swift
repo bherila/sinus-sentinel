@@ -1,37 +1,36 @@
 import SwiftUI
 
-#if os(macOS)
-import AppKit
-#endif
-
 @main
 struct SinusSentinelApp: App {
     @State private var host = EngineHost()
 
+    #if os(macOS)
+    @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    #endif
+
     var body: some Scene {
-        WindowGroup {
+        #if os(macOS)
+        // `Window`, not `WindowGroup`: there is one history per machine, and a
+        // group would let the user open several views of it that then have to
+        // be kept in agreement.
+        Window("Sinus Sentinel", id: WindowID.history) {
             ContentView()
                 .environment(host)
         }
 
-        #if os(macOS)
+        Settings {
+            SettingsView()
+                .environment(host)
+        }
+
         MenuBarExtra("Sinus Sentinel", systemImage: host.monitor.isCapturing ? "waveform" : "pause.circle") {
-            if host.monitor.blockedByOtherInstance {
-                Text("Another Sinus Sentinel owns this computer")
-            } else if host.monitor.suspendedForLowPower {
-                Text("Paused for Low Power Mode")
-            }
-            Button(host.monitor.sessionRequested ? "Stop monitoring" : "Start monitoring") {
-                host.monitor.toggleMonitoring()
-            }
-            .disabled(host.monitor.blockedByOtherInstance)
-            Button("Open Sinus Sentinel") {
-                NSApplication.shared.activate(ignoringOtherApps: true)
-            }
-            Divider()
-            Button("Quit") {
-                NSApplication.shared.terminate(nil)
-            }
+            MenuBarContent()
+                .environment(host)
+        }
+        #else
+        WindowGroup {
+            ContentView()
+                .environment(host)
         }
         #endif
     }
