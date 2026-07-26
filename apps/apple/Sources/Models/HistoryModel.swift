@@ -11,6 +11,9 @@ final class HistoryModel {
     private(set) var message: String?
 
     var onError: (String?) -> Void = { _ in }
+    /// Raised after a flag operation actually changes something, so the host
+    /// can request a sync without this model knowing `SyncModel` exists.
+    var onFlagged: () -> Void = {}
 
     private var engine: AppleEngine?
 
@@ -41,6 +44,7 @@ final class HistoryModel {
             message = result.trained
                 ? "Reported the \(className): it no longer counts here or in the PHR, and the detector will stop labelling that sound \(className)."
                 : "Reported the \(className): it no longer counts here or in the PHR. No embedding was stored for it, so the detector was not adjusted."
+            onFlagged()
         } catch {
             message = "Could not flag the event: \(error.localizedDescription)"
         }
@@ -61,6 +65,7 @@ final class HistoryModel {
             let was = event.originalEventType.displayName
             let now = corrected.displayName
             message = "Recorded as \(now) instead of \(was) — it now counts as \(now) here and in the PHR, and the detector will stop calling that sound \(was). Teach \(now) a few more times for it to be recognised on its own."
+            onFlagged()
         } catch {
             message = "Could not update the event: \(error.localizedDescription)"
         }
@@ -74,6 +79,7 @@ final class HistoryModel {
             _ = try engine.clearFlag(eventUuid: event.uuid)
             refresh()
             message = "Restored the event here and in the PHR. Any training it produced is kept — use Settings › Teach mode to remove that too."
+            onFlagged()
         } catch {
             message = "Could not restore the event: \(error.localizedDescription)"
         }

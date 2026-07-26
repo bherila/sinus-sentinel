@@ -7,8 +7,14 @@ struct SettingsView: View {
                 .tabItem {
                     Label("General", systemImage: "gearshape")
                 }
+            PhrSettingsView()
+                .tabItem {
+                    Label("PHR", systemImage: "heart.text.square")
+                }
         }
-        .frame(width: 420, height: 260)
+        // Settings tabs share one frame, so this is sized for the taller PHR
+        // pane (Connection + API token + Status sections), not General.
+        .frame(width: 480, height: 520)
     }
 }
 

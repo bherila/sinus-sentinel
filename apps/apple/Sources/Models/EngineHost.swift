@@ -10,15 +10,22 @@ import SinusAppleFFI
 final class EngineHost {
     let monitor: MonitorModel
     let history: HistoryModel
+    let sync: SyncModel
     var errorMessage: String?
 
     init() {
         let monitor = MonitorModel()
         let history = HistoryModel()
+        let sync = SyncModel()
         self.monitor = monitor
         self.history = history
+        self.sync = sync
         monitor.onError = { [weak self] in self?.errorMessage = $0 }
         history.onError = { [weak self] in self?.errorMessage = $0 }
+        // Closes chunk 12's gap: the tray app requests a sync after every
+        // flag, and Swift did not. A hook rather than a reference to
+        // `SyncModel`, so `HistoryModel` keeps not knowing what else exists.
+        history.onFlagged = { [weak self] in self?.sync.syncNow() }
 
         do {
             let support = try Self.applicationSupportDirectory()
@@ -36,6 +43,17 @@ final class EngineHost {
             monitor.attach(engine: engine, audio: audio)
             monitor.onHistoryChanged = { [weak history] in history?.refresh() }
             history.refresh()
+
+            do {
+                try sync.start(engine: engine, tokens: KeychainTokenProvider())
+            } catch {
+                // Offline is a legitimate steady state: monitoring and
+                // history keep working with no PHR connection, and every
+                // `SyncModel` write below no-ops without a controller — the
+                // same shape `MonitorModel`/`HistoryModel` use for a nil
+                // engine.
+                errorMessage = error.localizedDescription
+            }
         } catch AppleEngineError.AlreadyRunning {
             monitor.markBlockedByOtherInstance()
         } catch {

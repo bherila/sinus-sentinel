@@ -34,6 +34,15 @@ struct MenuBarContent: View {
         }
         .keyboardShortcut(",", modifiers: .command)
         Divider()
+        // A bare `Text`, like the status lines above — not a `Button` — so it
+        // renders as a disabled menu entry, matching the desktop tray's
+        // non-interactive "sync: …" toolbar label (`app.rs:1126-1130`).
+        Text("sync: \(host.sync.stateLabel) (\(host.sync.status.pendingEvents) pending)")
+        Button("Sync now") {
+            host.sync.syncNow()
+        }
+        .help("flush pending events to the PHR now")
+        Divider()
         Button("Quit") {
             NSApplication.shared.terminate(nil)
         }
