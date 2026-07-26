@@ -1995,7 +1995,10 @@ mod tests {
         let dir = temp_dir();
         let engine = engine_in(&dir).unwrap();
         let defaults = engine.phr_settings().unwrap();
-        assert_eq!(defaults.server_url, "");
+        // A fresh install defaults to the production PHR root rather than an
+        // empty field; `patient_id` (asserted below) is what actually gates
+        // sync for an unconfigured install, not this URL.
+        assert_eq!(defaults.server_url, sinus_app::settings::DEFAULT_SERVER_URL);
         assert_eq!(defaults.patient_id, None);
         assert!(matches!(defaults.mode, SyncMode::AutoBatch));
         assert!(!defaults.device_id.is_empty());
