@@ -149,8 +149,14 @@ impl<E: Embedder> MonitoringEngine<E> {
 
     /// While set, detections are still computed — so the gate, the noise floor and
     /// the sessionizer's cooldowns stay continuous — but nothing is persisted.
-    /// Quiet hours and Teach takes both need exactly this; tearing the stream down
-    /// instead would reset the sample clock and skew later event timestamps.
+    /// A Teach take needs exactly this: the user performs the sound on purpose,
+    /// and tearing the stream down instead would reset the sample clock and skew
+    /// the timestamps of every event after it.
+    ///
+    /// Not what quiet hours use. Those release the microphone entirely
+    /// (SPEC §8.3), because the reason to be silent then is that nobody is at the
+    /// machine — and a mic held open for hours to discard everything it hears is
+    /// the one thing that privacy guarantee exists to rule out.
     pub fn set_suppress_persistence(&mut self, suppress: bool) {
         self.suppress_persistence = suppress;
     }

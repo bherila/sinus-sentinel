@@ -1,11 +1,11 @@
 import SwiftUI
 
 struct ContentView: View {
-    @EnvironmentObject private var model: AppModel
+    @Environment(EngineHost.self) private var host
 
     var body: some View {
         NavigationStack {
-            if model.blockedByOtherInstance {
+            if host.monitor.blockedByOtherInstance {
                 alreadyRunning
             } else {
                 main
@@ -30,22 +30,15 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 24) {
                 monitoringCard
 
+                todaySection
+
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Last 7 days")
                         .font(.title2.bold())
-                    HistoryChartView(snapshot: model.snapshot)
+                    HistoryChartView(snapshot: host.history.snapshot)
                 }
 
-                if let snapshot = model.snapshot {
-                    Text(
-                        "Congestion score: \(snapshot.congestionScorePerMonitoredHour, specifier: "%.2f") per monitored hour"
-                    )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                }
-
-                recentEvents
-                batterySettings
+                RecentEventsView()
             }
             .padding()
         }
@@ -53,13 +46,13 @@ struct ContentView: View {
         .alert(
             "Sinus Sentinel",
             isPresented: Binding(
-                get: { model.errorMessage != nil },
-                set: { if !$0 { model.errorMessage = nil } }
+                get: { host.errorMessage != nil },
+                set: { if !$0 { host.errorMessage = nil } }
             )
         ) {
-            Button("OK") { model.errorMessage = nil }
+            Button("OK") { host.errorMessage = nil }
         } message: {
-            Text(model.errorMessage ?? "")
+            Text(host.errorMessage ?? "")
         }
     }
 
@@ -72,8 +65,8 @@ struct ContentView: View {
             Text(status.detail)
                 .foregroundStyle(.secondary)
 
-            Button(model.sessionRequested ? "Stop monitoring" : "Start monitoring") {
-                model.toggleMonitoring()
+            Button(host.monitor.sessionRequested ? "Stop monitoring" : "Start monitoring") {
+                host.monitor.toggleMonitoring()
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
@@ -83,7 +76,18 @@ struct ContentView: View {
     }
 
     private var status: (title: String, detail: String, symbol: String, tint: Color) {
-        if model.suspendedForLowPower {
+        // Ahead of the Low Power case: a pause and a battery suspension both
+        // release the microphone, but they end on different conditions, and a
+        // user who paused deliberately should not be told the battery did it.
+        if host.monitor.pause?.paused == true {
+            return (
+                "Paused",
+                "The microphone is released until you resume, or until the pause you set runs out. Pause and resume from the menu bar.",
+                "pause.circle.fill",
+                .orange
+            )
+        }
+        if host.monitor.suspendedForLowPower {
             return (
                 "Paused for Low Power Mode",
                 "The microphone is released while the device saves power. Monitoring resumes on its own when Low Power Mode turns off.",
@@ -91,7 +95,15 @@ struct ContentView: View {
                 .orange
             )
         }
-        if model.isCapturing {
+        if host.monitor.suppressedForQuietHours {
+            return (
+                "Quiet hours",
+                "The microphone is released because you appear to be away. Monitoring resumes as soon as you use the machine again, even inside the window.",
+                "moon.zzz.fill",
+                .orange
+            )
+        }
+        if host.monitor.isCapturing {
             return (
                 "Monitoring is active",
                 "The session continues when the iPhone locks. Audio is analyzed locally and is never stored.",
@@ -107,46 +119,39 @@ struct ContentView: View {
         )
     }
 
-    private var batterySettings: some View {
-        VStack(alignment: .leading, spacing: 8) {
-            Text("Battery")
-                .font(.title2.bold())
-            Toggle(
-                "Pause while Low Power Mode is on",
-                isOn: $model.pauseOnLowPower
-            )
-            Text(
-                model.isLowPowerModeEnabled
-                    ? "Low Power Mode is on right now."
-                    : "Releases the microphone and resumes automatically. Shared with the desktop app through the same database."
-            )
-            .font(.footnote)
-            .foregroundStyle(.secondary)
-        }
-    }
-
     @ViewBuilder
-    private var recentEvents: some View {
+    private var todaySection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Recent")
+            Text("Today")
                 .font(.title2.bold())
-            let events = model.snapshot?.recentEvents ?? []
-            if events.isEmpty {
-                Text("No recent events")
+
+            let counts = (host.history.snapshot?.today ?? []).filter { $0.count > 0 }
+            if counts.isEmpty {
+                Text("no events yet today")
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(events.prefix(10), id: \.uuid) { event in
-                    HStack {
-                        Text(event.eventType.displayName)
-                        Spacer()
-                        Text(
-                            Date(timeIntervalSince1970: Double(event.occurredAtEpochMs) / 1_000),
-                            style: .time
-                        )
-                        .foregroundStyle(.secondary)
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 120), alignment: .leading)],
+                    alignment: .leading,
+                    spacing: 6
+                ) {
+                    ForEach(counts, id: \.eventType) { count in
+                        HStack(spacing: 4) {
+                            Rectangle()
+                                .fill(count.eventType.color)
+                                .frame(width: 10, height: 10)
+                            Text("\(count.eventType.displayName): \(count.count)")
+                        }
                     }
-                    .padding(.vertical, 4)
                 }
+            }
+
+            if let snapshot = host.history.snapshot {
+                Text(
+                    "Congestion score: \(snapshot.congestionScorePerMonitoredHour, specifier: "%.2f") per monitored hour (\(snapshot.monitoredHours, specifier: "%.1f") monitored hours)"
+                )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
             }
         }
     }

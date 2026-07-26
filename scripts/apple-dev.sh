@@ -83,19 +83,30 @@ rm -rf "$app_root"
 mkdir -p "$app_root/Contents/MacOS" "$app_root/Contents/Resources"
 
 sdk_path="$(xcrun --sdk "$sdk" --show-sdk-path)"
+
+# Every app source under Sources/, recursively, in sorted order. Sources are
+# grouped into App/Models/Views/Platform, and adding a file — or a whole new
+# group — must not require editing this script.
+swift_sources=()
+while IFS= read -r file; do
+  swift_sources+=("$file")
+done < <(find "$source_root" -name '*.swift' -type f | sort)
+if [[ ${#swift_sources[@]} -eq 0 ]]; then
+  echo "no Swift sources found under $source_root" >&2
+  exit 1
+fi
+
 swift_args=(
   -sdk "$sdk_path"
   -parse-as-library
   -module-name SinusSentinel
   -I "$ffi_root"
   "$generated_root/SinusApple.swift"
-  # Every app source, in glob (sorted) order — adding a file to Sources/ must not
-  # require editing this script, and a missed entry fails as a confusing
-  # "cannot find X in scope" rather than a missing-file error.
-  "$source_root"/*.swift
+  "${swift_sources[@]}"
   "$rust_library"
   -framework AVFoundation
   -framework Charts
+  -framework CoreGraphics
   -framework CoreML
   -framework Security
   -framework SwiftUI

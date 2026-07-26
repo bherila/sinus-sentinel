@@ -137,6 +137,7 @@ pub struct SharedStatus {
     sync: Arc<AtomicU8>,
     pending: Arc<AtomicUsize>,
     quiet: Arc<AtomicBool>,
+    quiet_window: Arc<AtomicBool>,
     low_power: Arc<AtomicBool>,
     sync_now: Arc<AtomicBool>,
     quitting: Arc<AtomicBool>,
@@ -164,6 +165,7 @@ impl Default for SharedStatus {
             sync: Arc::new(AtomicU8::new(SyncStatus::Idle.to_u8())),
             pending: Arc::new(AtomicUsize::new(0)),
             quiet: Arc::new(AtomicBool::new(false)),
+            quiet_window: Arc::new(AtomicBool::new(false)),
             low_power: Arc::new(AtomicBool::new(false)),
             sync_now: Arc::new(AtomicBool::new(false)),
             quitting: Arc::new(AtomicBool::new(false)),
@@ -276,8 +278,13 @@ impl SharedStatus {
         self.pending.load(Ordering::Relaxed)
     }
 
-    /// Only the capture thread suppresses persistence during quiet hours, so this
-    /// setter is unused without `live-audio` (the UI still reads the flag).
+    /// The suppress-*now* decision (SPEC §6, §13 q4) — the single thing
+    /// `capture_suspended` consults. Only the capture worker can compute this: it
+    /// combines [`Self::quiet_window`] with its own idle read via
+    /// `sinus_app::sync::suppress_for_quiet_hours`, so this setter is unused
+    /// without `live-audio` (no capture worker exists to call it, so quiet-hours
+    /// suppression is a no-op in that build — the same gate `low_power`'s setter
+    /// has, for the same reason).
     #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
     pub fn set_quiet(&self, on: bool) {
         if self.quiet.swap(on, Ordering::Relaxed) != on {
@@ -288,6 +295,21 @@ impl SharedStatus {
 
     pub fn quiet(&self) -> bool {
         self.quiet.load(Ordering::Relaxed)
+    }
+
+    /// The sync thread's raw quiet-hours clock check — local time is inside the
+    /// configured window, before any absence signal is applied. Distinct from
+    /// [`Self::quiet`]: a machine can be inside the window with someone awake at
+    /// the keyboard, and that machine must keep listening.
+    pub fn set_quiet_window(&self, on: bool) {
+        if self.quiet_window.swap(on, Ordering::Relaxed) != on {
+            self.wake_capture();
+        }
+    }
+
+    #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
+    pub fn quiet_window(&self) -> bool {
+        self.quiet_window.load(Ordering::Relaxed)
     }
 
     #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
@@ -349,7 +371,13 @@ impl SharedStatus {
             return Duration::from_secs(60);
         }
         if self.quiet() {
-            return Duration::from_secs(60 * 60);
+            // Idle-gated suppression (SPEC §13 q4) can lift the moment someone
+            // sits back down at the keyboard; parking for the old hour-scale
+            // duration would mean returning to your desk and waiting up to an
+            // hour for monitoring to resume. A 30s wake against an otherwise-idle
+            // machine costs almost nothing next to an open microphone — the
+            // alternative is a present user who isn't monitored.
+            return Duration::from_secs(30);
         }
         match self.pause_until_ms.load(Ordering::Acquire) {
             i64::MAX => Duration::from_secs(60 * 60),
@@ -571,6 +599,33 @@ mod tests {
         assert!(shared.capture_suspended(chrono::Utc::now()));
         shared.set_quiet(false);
         assert!(!shared.capture_suspended(chrono::Utc::now()));
+    }
+
+    #[test]
+    fn quiet_park_is_short_not_hourly() {
+        // Idle-gated quiet hours can lift within moments of the user returning;
+        // an hour-scale park (like `low_power`'s) would leave a present user
+        // unmonitored until the next check.
+        let shared = SharedStatus::default();
+        shared.set_quiet(true);
+        assert_eq!(
+            shared.suspension_wait(chrono::Utc::now()),
+            Duration::from_secs(30)
+        );
+    }
+
+    #[test]
+    fn quiet_window_alone_does_not_suspend_capture() {
+        // Publishing the raw clock window is not the suppress-now decision —
+        // only the capture worker's idle-derived `set_quiet` is. A machine with
+        // someone awake at the keyboard inside the window must keep listening.
+        let shared = SharedStatus::default();
+        shared.set_quiet_window(true);
+        assert!(shared.quiet_window());
+        assert!(!shared.capture_suspended(chrono::Utc::now()));
+
+        shared.set_quiet(true);
+        assert!(shared.capture_suspended(chrono::Utc::now()));
     }
 
     #[test]

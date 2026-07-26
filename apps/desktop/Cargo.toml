@@ -36,4 +36,8 @@ tray-icon.workspace = true
 objc2-foundation = { version = "0.3.2", default-features = false, features = ["NSProcessInfo"] }
 
 [target.'cfg(target_os = "windows")'.dependencies]
-windows-sys = { version = "0.61", features = ["Win32_System_Power"] }
+windows-sys = { version = "0.61", features = [
+    "Win32_System_Power",
+    "Win32_System_SystemInformation",
+    "Win32_UI_Input_KeyboardAndMouse",
+] }

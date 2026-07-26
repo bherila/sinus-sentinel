@@ -39,6 +39,14 @@ struct HistoryChartView: View {
                     .accessibilityLabel("\(point.eventType.displayName), \(point.date)")
                     .accessibilityValue("\(point.count) events")
                 }
+                // Domain is the full taxonomy, in fixed order — not whatever
+                // subset of classes happened to occur this week. `foregroundStyle(by:)`
+                // otherwise assigns colors from the data present, so a week
+                // without sneezes would shift every other class's color.
+                .chartForegroundStyleScale(
+                    domain: AppleEventType.allCases.map(\.displayName),
+                    range: AppleEventType.allCases.map(\.color)
+                )
                 .chartLegend(position: .bottom, alignment: .leading)
             }
         }
@@ -64,6 +72,20 @@ extension AppleEventType {
         case .noseBlow: "Nose blow"
         case .hawk: "Hawk"
         case .snortSuck: "Snort / suck"
+        }
+    }
+
+    /// Bound to the class, not derived from the data — see the fixed
+    /// `chartForegroundStyleScale` domain above.
+    var color: Color {
+        switch self {
+        case .cough: .blue
+        case .throatClearing: .green
+        case .sniffle: .pink
+        case .sneeze: .orange
+        case .noseBlow: .teal
+        case .hawk: .red
+        case .snortSuck: .purple
         }
     }
 }

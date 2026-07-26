@@ -72,7 +72,10 @@ fn run_sync(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
         };
         let output = driver.tick(&mut store, input);
 
-        shared.set_quiet(output.quiet);
+        // Publishes the raw clock window only — whether that suppresses capture
+        // depends on whether the user is actually away, which only the capture
+        // worker (with a live idle read) can decide. See `SharedStatus::quiet`.
+        shared.set_quiet_window(output.quiet);
         shared.set_pending(output.pending_events);
         shared.set_sync(map_sync_state(output.state));
 

@@ -143,7 +143,12 @@ I/O path exists at all.
   second machine inherits your trained detector.
 - **Pause** (15 min / 1 h / until resumed) from the tray releases the microphone
   and stops analysis entirely, then opens a fresh capture session on resume.
-  Quiet hours do the same, and the default battery policy automatically pauses
+  Quiet hours do the same, but only once you have actually left the machine —
+  after five minutes without keyboard or mouse input. The window exists because
+  a computer left running overnight logs a housemate, the television and the
+  street rather than your own coughs; if you are awake at your desk inside it,
+  you are still monitored. iPhone has no honest idle signal, so there the whole
+  window is quiet. The default battery policy automatically pauses
   while macOS/Windows low-power mode is active (toggleable in Settings).
   A sensitivity slider
   in Settings scales all detection thresholds, takes effect immediately, and —

@@ -24,6 +24,7 @@ use sinus_core::types::Source;
 use sinus_app::monitor::prototypes_from_store;
 use sinus_app::settings;
 use sinus_app::state::local_offset_minutes;
+use sinus_app::sync::suppress_for_quiet_hours;
 use sinus_app::teach::{self, TakeBuffer};
 
 use crate::shared::{ModelStatus, SharedStatus};
@@ -133,6 +134,12 @@ pub fn spawn_capture(db_path: PathBuf, shared: SharedStatus) -> JoinHandle<()> {
 /// past this age the event is no longer surfaced for reporting.
 const EVENT_EMBEDDING_RETENTION_DAYS: i64 = 30;
 
+/// How often idle time is resampled to re-derive quiet-hours suppression
+/// (SPEC §13 q4) — matches the 30s park `SharedStatus::suspension_wait` uses
+/// while quiet, so a returning user is noticed within one poll, not the
+/// hour-scale cadence `low_power` uses.
+const QUIET_POLL_INTERVAL: std::time::Duration = std::time::Duration::from_secs(30);
+
 fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     shared.register_capture_thread();
     let store = Store::open(&db_path).map_err(|e| e.to_string())?;
@@ -170,6 +177,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     let mut gate_was_open = false;
     let mut pause_on_low_power = settings::pause_on_low_power(&store);
     let mut last_power_check: Option<std::time::Instant> = None;
+    let mut last_quiet_check: Option<std::time::Instant> = None;
     loop {
         if shared.quitting() {
             return Ok(());
@@ -184,12 +192,24 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             pipeline.set_sensitivity(settings::sensitivity(&store));
             pause_on_low_power = settings::pause_on_low_power(&store);
             last_power_check = None;
+            last_quiet_check = None;
         }
         if last_power_check
             .is_none_or(|checked| checked.elapsed() >= std::time::Duration::from_secs(60))
         {
             shared.set_low_power(pause_on_low_power && crate::power::low_power_mode_enabled());
             last_power_check = Some(std::time::Instant::now());
+        }
+        // Quiet hours suppress the *user's absence*, not the clock (SPEC §13
+        // q4): the sync thread publishes the raw window, but only this thread
+        // can read idle time, so the suppress-now decision is computed and
+        // published here rather than by the sync thread.
+        if last_quiet_check.is_none_or(|checked| checked.elapsed() >= QUIET_POLL_INTERVAL) {
+            shared.set_quiet(suppress_for_quiet_hours(
+                shared.quiet_window(),
+                crate::power::user_idle(),
+            ));
+            last_quiet_check = Some(std::time::Instant::now());
         }
 
         let now = Utc::now();
@@ -247,10 +267,11 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
         shared.set_analyzing(gate_open && !teaching);
 
         if let Ok(events) = pipeline.push(&buf[..n]) {
-            // Quiet hours suppress detection *logging* (SPEC §6): keep running the
-            // pipeline (so state/floor/cooldowns stay continuous) but drop the
-            // events at the write site instead of persisting them. The flag is
-            // published by the sync thread from the quiet-hours setting.
+            // Quiet-hour suppression already released the microphone and
+            // `continue`d above (capture_suspended) before any of this code
+            // runs, so `shared.quiet()` cannot be true here — the pipeline never
+            // keeps streaming through a suppressed window. This check is a
+            // defensive belt-and-suspenders guard, not the suppression mechanism.
             if !shared.quiet() && !teaching {
                 for detected in &events {
                     let event = pipeline.to_event(detected, &ctx);
