@@ -26,6 +26,13 @@ pub const PAUSE_LOW_POWER: &str = "pause_low_power";
 pub const MODE: &str = "mode";
 /// PHR base URL. Device-local, like `MODE`.
 pub const SERVER_URL: &str = "server_url";
+
+/// The PHR server root a fresh install points at before the user changes it.
+/// Purely a convenience default: a blank `server_url` is not a gate on sync
+/// (see `server_url`'s doc comment) — `patient_id` is what keeps a fresh,
+/// unconfigured install from attempting network calls, so pre-filling this
+/// does not by itself turn sync on.
+pub const DEFAULT_SERVER_URL: &str = "https://phr.bherila.net";
 /// The PHR patient these events belong to. Device-local, like `MODE`.
 pub const PATIENT_ID: &str = "patient_id";
 /// Quiet-hours window start, local hour 0-23. Synced with the PHR so the
@@ -114,13 +121,20 @@ pub fn set_mode(store: &Store, mode: Mode) -> Result<()> {
     store.setting_set(MODE, mode.as_str())
 }
 
-/// PHR base URL, empty when never configured.
+/// PHR base URL. Falls back to [`DEFAULT_SERVER_URL`] only when the row is
+/// entirely absent (a fresh install); an explicitly-set value always wins,
+/// including one the user has explicitly blanked out.
+///
+/// Blank is not a "sync disabled" sentinel here — `sync_config` in
+/// `crate::sync` gates on `patient_id`, not on this being non-empty — so
+/// defaulting it to a real URL does not by itself turn sync on for an
+/// unconfigured install.
 pub fn server_url(store: &Store) -> String {
     store
         .setting_get(SERVER_URL)
         .ok()
         .flatten()
-        .unwrap_or_default()
+        .unwrap_or_else(|| DEFAULT_SERVER_URL.to_string())
 }
 
 pub fn set_server_url(store: &Store, url: &str) -> Result<()> {
@@ -265,8 +279,25 @@ mod tests {
     }
 
     #[test]
-    fn server_url_defaults_empty_and_round_trips() {
+    fn server_url_defaults_to_production_phr_and_round_trips() {
         let store = Store::open_in_memory().unwrap();
+        // A fresh install (no row at all) gets the production PHR root, not an
+        // empty field the user must type in by hand.
+        assert_eq!(server_url(&store), DEFAULT_SERVER_URL);
+
+        set_server_url(&store, "https://phr.example").unwrap();
+        assert_eq!(server_url(&store), "https://phr.example");
+    }
+
+    #[test]
+    fn server_url_explicit_blank_overrides_the_default() {
+        let store = Store::open_in_memory().unwrap();
+        assert_eq!(server_url(&store), DEFAULT_SERVER_URL);
+
+        // An explicit blank is a real row (`Some("")`), distinct from the
+        // absent row a fresh install has, so it must win over the default
+        // rather than being treated as "unset".
+        set_server_url(&store, "").unwrap();
         assert_eq!(server_url(&store), "");
 
         set_server_url(&store, "https://phr.example").unwrap();
