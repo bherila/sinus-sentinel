@@ -1,11 +1,11 @@
 import SwiftUI
 
 struct ContentView: View {
-    @EnvironmentObject private var model: AppModel
+    @Environment(EngineHost.self) private var host
 
     var body: some View {
         NavigationStack {
-            if model.blockedByOtherInstance {
+            if host.monitor.blockedByOtherInstance {
                 alreadyRunning
             } else {
                 main
@@ -33,10 +33,10 @@ struct ContentView: View {
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Last 7 days")
                         .font(.title2.bold())
-                    HistoryChartView(snapshot: model.snapshot)
+                    HistoryChartView(snapshot: host.history.snapshot)
                 }
 
-                if let snapshot = model.snapshot {
+                if let snapshot = host.history.snapshot {
                     Text(
                         "Congestion score: \(snapshot.congestionScorePerMonitoredHour, specifier: "%.2f") per monitored hour"
                     )
@@ -53,13 +53,13 @@ struct ContentView: View {
         .alert(
             "Sinus Sentinel",
             isPresented: Binding(
-                get: { model.errorMessage != nil },
-                set: { if !$0 { model.errorMessage = nil } }
+                get: { host.errorMessage != nil },
+                set: { if !$0 { host.errorMessage = nil } }
             )
         ) {
-            Button("OK") { model.errorMessage = nil }
+            Button("OK") { host.errorMessage = nil }
         } message: {
-            Text(model.errorMessage ?? "")
+            Text(host.errorMessage ?? "")
         }
     }
 
@@ -72,8 +72,8 @@ struct ContentView: View {
             Text(status.detail)
                 .foregroundStyle(.secondary)
 
-            Button(model.sessionRequested ? "Stop monitoring" : "Start monitoring") {
-                model.toggleMonitoring()
+            Button(host.monitor.sessionRequested ? "Stop monitoring" : "Start monitoring") {
+                host.monitor.toggleMonitoring()
             }
             .buttonStyle(.borderedProminent)
             .controlSize(.large)
@@ -83,7 +83,7 @@ struct ContentView: View {
     }
 
     private var status: (title: String, detail: String, symbol: String, tint: Color) {
-        if model.suspendedForLowPower {
+        if host.monitor.suspendedForLowPower {
             return (
                 "Paused for Low Power Mode",
                 "The microphone is released while the device saves power. Monitoring resumes on its own when Low Power Mode turns off.",
@@ -91,7 +91,7 @@ struct ContentView: View {
                 .orange
             )
         }
-        if model.isCapturing {
+        if host.monitor.isCapturing {
             return (
                 "Monitoring is active",
                 "The session continues when the iPhone locks. Audio is analyzed locally and is never stored.",
@@ -111,12 +111,12 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Battery")
                 .font(.title2.bold())
-            Toggle(
-                "Pause while Low Power Mode is on",
-                isOn: $model.pauseOnLowPower
-            )
+            Toggle("Pause while Low Power Mode is on", isOn: Binding(
+                get: { host.monitor.pauseOnLowPower },
+                set: { host.monitor.setPauseOnLowPower($0) }
+            ))
             Text(
-                model.isLowPowerModeEnabled
+                host.monitor.isLowPowerModeEnabled
                     ? "Low Power Mode is on right now."
                     : "Releases the microphone and resumes automatically. Shared with the desktop app through the same database."
             )
@@ -130,7 +130,7 @@ struct ContentView: View {
         VStack(alignment: .leading, spacing: 8) {
             Text("Recent")
                 .font(.title2.bold())
-            let events = model.snapshot?.recentEvents ?? []
+            let events = host.history.snapshot?.recentEvents ?? []
             if events.isEmpty {
                 Text("No recent events")
                     .foregroundStyle(.secondary)

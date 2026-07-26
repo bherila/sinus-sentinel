@@ -6,25 +6,25 @@ import AppKit
 
 @main
 struct SinusSentinelApp: App {
-    @StateObject private var model = AppModel()
+    @State private var host = EngineHost()
 
     var body: some Scene {
         WindowGroup {
             ContentView()
-                .environmentObject(model)
+                .environment(host)
         }
 
         #if os(macOS)
-        MenuBarExtra("Sinus Sentinel", systemImage: model.isCapturing ? "waveform" : "pause.circle") {
-            if model.blockedByOtherInstance {
+        MenuBarExtra("Sinus Sentinel", systemImage: host.monitor.isCapturing ? "waveform" : "pause.circle") {
+            if host.monitor.blockedByOtherInstance {
                 Text("Another Sinus Sentinel owns this computer")
-            } else if model.suspendedForLowPower {
+            } else if host.monitor.suspendedForLowPower {
                 Text("Paused for Low Power Mode")
             }
-            Button(model.sessionRequested ? "Stop monitoring" : "Start monitoring") {
-                model.toggleMonitoring()
+            Button(host.monitor.sessionRequested ? "Stop monitoring" : "Start monitoring") {
+                host.monitor.toggleMonitoring()
             }
-            .disabled(model.blockedByOtherInstance)
+            .disabled(host.monitor.blockedByOtherInstance)
             Button("Open Sinus Sentinel") {
                 NSApplication.shared.activate(ignoringOtherApps: true)
             }
