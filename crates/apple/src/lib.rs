@@ -1044,6 +1044,25 @@ impl AppleEngine {
         Ok(())
     }
 
+    /// Apply quiet hours to detection logging. The window itself is a setting the
+    /// shell can already read; this is the lever that acts on it.
+    ///
+    /// Quiet hours suppress *logging*, not detection — the pipeline keeps running
+    /// so the gate, noise floor and cooldowns stay continuous across the window,
+    /// exactly as the tray app does at its own write site. Tearing the session
+    /// down instead would reset the sample clock and skew the timestamps of every
+    /// event after the window closed.
+    ///
+    /// Driven by the shell rather than checked here per push: `push_pcm_16k` runs
+    /// several times a second and this answer changes on the hour, so reading the
+    /// setting on every buffer would be a database round trip to learn nothing.
+    /// The shell already polls `status()`, whose `in_quiet_hours` is the value to
+    /// pass here.
+    pub fn set_quiet_suppression(&self, suppressed: bool) -> Result<(), AppleEngineError> {
+        self.lock()?.set_quiet(suppressed);
+        Ok(())
+    }
+
     pub fn in_quiet_hours(&self) -> Result<bool, AppleEngineError> {
         let store = self.reader()?;
         Ok(sinus_app::sync::in_quiet_hours_now(&store))
@@ -1688,6 +1707,43 @@ mod tests {
             1
         );
         assert_eq!(history.recent_events.len(), 1);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn quiet_suppression_logs_nothing_and_leaves_the_gate_running() {
+        let (engine, dir) = temp_engine();
+        let now = Utc::now();
+
+        engine.set_quiet_suppression(true).unwrap();
+        engine.start_monitoring(now.timestamp_millis(), 0).unwrap();
+        let mut signal = sinus_core::synth::white_noise(16_000, 0.003, 1);
+        signal.extend(sinus_core::synth::sine(32_000, 16_000, 300.0, 0.6));
+        signal.extend(sinus_core::synth::white_noise(16_000, 0.003, 2));
+        let mut heard = false;
+        for chunk in signal.chunks(777) {
+            assert!(engine.push_pcm_16k(chunk.to_vec()).unwrap().is_empty());
+            // The point of suppressing at the write site rather than by cutting
+            // the audio off: the gate still opens, so the indicator and the
+            // noise floor behave the same inside the window as outside it.
+            heard |= engine.status().unwrap().gate_open;
+        }
+        assert!(engine.stop_monitoring().unwrap().is_empty());
+        assert!(heard, "the gate never opened under quiet suppression");
+        assert_eq!(
+            engine
+                .history(7, now.timestamp_millis(), 0)
+                .unwrap()
+                .recent_events
+                .len(),
+            0
+        );
+
+        // And the flag is not session state: stopping did not clear it.
+        engine.set_quiet_suppression(false).unwrap();
+        assert!(!emit_one_event(&engine, now).uuid.is_empty());
 
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);

@@ -76,6 +76,17 @@ struct ContentView: View {
     }
 
     private var status: (title: String, detail: String, symbol: String, tint: Color) {
+        // Ahead of the Low Power case: a pause and a battery suspension both
+        // release the microphone, but they end on different conditions, and a
+        // user who paused deliberately should not be told the battery did it.
+        if host.monitor.pause?.paused == true {
+            return (
+                "Paused",
+                "The microphone is released until you resume, or until the pause you set runs out. Pause and resume from the menu bar.",
+                "pause.circle.fill",
+                .orange
+            )
+        }
         if host.monitor.suspendedForLowPower {
             return (
                 "Paused for Low Power Mode",

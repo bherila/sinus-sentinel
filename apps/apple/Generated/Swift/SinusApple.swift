@@ -748,6 +748,24 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
      */
     func setQuietHours(hours: QuietHours?) throws
 
+    /**
+     * Apply quiet hours to detection logging. The window itself is a setting the
+     * shell can already read; this is the lever that acts on it.
+     *
+     * Quiet hours suppress *logging*, not detection — the pipeline keeps running
+     * so the gate, noise floor and cooldowns stay continuous across the window,
+     * exactly as the tray app does at its own write site. Tearing the session
+     * down instead would reset the sample clock and skew the timestamps of every
+     * event after the window closed.
+     *
+     * Driven by the shell rather than checked here per push: `push_pcm_16k` runs
+     * several times a second and this answer changes on the hour, so reading the
+     * setting on every buffer would be a database round trip to learn nothing.
+     * The shell already polls `status()`, whose `in_quiet_hours` is the value to
+     * pass here.
+     */
+    func setQuietSuppression(suppressed: Bool) throws
+
     func setSensitivity(sensitivity: Float) throws
 
     func setServerUrl(url: String) throws
@@ -1135,6 +1153,31 @@ open func setQuietHours(hours: QuietHours?)throws   {try rustCallWithError(FfiCo
     uniffi_sinus_apple_fn_method_appleengine_set_quiet_hours(
             self.uniffiCloneHandle(),
         FfiConverterOptionTypeQuietHours.lower(hours),uniffiCallStatus
+    )
+}
+}
+
+    /**
+     * Apply quiet hours to detection logging. The window itself is a setting the
+     * shell can already read; this is the lever that acts on it.
+     *
+     * Quiet hours suppress *logging*, not detection — the pipeline keeps running
+     * so the gate, noise floor and cooldowns stay continuous across the window,
+     * exactly as the tray app does at its own write site. Tearing the session
+     * down instead would reset the sample clock and skew the timestamps of every
+     * event after the window closed.
+     *
+     * Driven by the shell rather than checked here per push: `push_pcm_16k` runs
+     * several times a second and this answer changes on the hour, so reading the
+     * setting on every buffer would be a database round trip to learn nothing.
+     * The shell already polls `status()`, whose `in_quiet_hours` is the value to
+     * pass here.
+     */
+open func setQuietSuppression(suppressed: Bool)throws   {try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_set_quiet_suppression(
+            self.uniffiCloneHandle(),
+        FfiConverterBool.lower(suppressed),uniffiCallStatus
     )
 }
 }
@@ -4719,6 +4762,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_set_quiet_hours() != 30878) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_set_quiet_suppression() != 8840) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_set_sensitivity() != 11213) {
