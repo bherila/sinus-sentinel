@@ -29,6 +29,11 @@ final class MonitorModel {
     /// exists.
     var onHistoryChanged: () -> Void = {}
     var onError: (String?) -> Void = { _ in }
+    /// Raised when capture ends for any reason. A Teach take buffering at that
+    /// moment can never fill, and it left event persistence suppressed on the
+    /// Rust side — so somebody has to abandon it rather than let the detector
+    /// quietly stop recording anything until relaunch.
+    var onCaptureStopped: () -> Void = {}
 
     private var audio: AudioMonitoringService?
     private var engine: AppleEngine?
@@ -131,6 +136,7 @@ final class MonitorModel {
     private func stopCapture() {
         guard let audio, isCapturing else { return }
         stopStatusPolling()
+        onCaptureStopped()
         do {
             _ = try audio.stop()
             isCapturing = false

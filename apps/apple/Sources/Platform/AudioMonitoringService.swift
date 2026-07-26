@@ -6,6 +6,11 @@ import Foundation
 final class AudioMonitoringService: @unchecked Sendable {
     var onEvents: (@Sendable ([AppleEvent]) -> Void)?
     var onFailure: (@Sendable (String) -> Void)?
+    /// Set while a take is buffering. Called on the processing queue with the same
+    /// converted 16 kHz samples that go to Rust — the tap keeps pushing to
+    /// `pushPcm16k` throughout a take, which is what keeps the detector's sample
+    /// clock and cooldowns continuous across it.
+    var onSamples: (@Sendable ([Float]) -> Void)?
 
     private let detector: AppleEngine
     private let audioEngine = AVAudioEngine()
@@ -14,7 +19,7 @@ final class AudioMonitoringService: @unchecked Sendable {
         qos: .userInitiated
     )
     private var converter: AVAudioConverter?
-    private var running = false
+    private(set) var isRunning = false
     /// Reused across callbacks: at 20 buffers a second, allocating a fresh
     /// converted buffer each time is pure churn on a `.userInitiated` queue that
     /// wakes up continuously while a session is active.
@@ -40,7 +45,7 @@ final class AudioMonitoringService: @unchecked Sendable {
     }
 
     func start() throws {
-        guard !running else { return }
+        guard !isRunning else { return }
 
         #if os(iOS)
         let session = AVAudioSession.sharedInstance()
@@ -82,7 +87,7 @@ final class AudioMonitoringService: @unchecked Sendable {
         audioEngine.prepare()
         do {
             try audioEngine.start()
-            running = true
+            isRunning = true
         } catch {
             input.removeTap(onBus: 0)
             _ = try? detector.stopMonitoring()
@@ -91,13 +96,13 @@ final class AudioMonitoringService: @unchecked Sendable {
     }
 
     func stop() throws -> [AppleEvent] {
-        guard running else { return [] }
+        guard isRunning else { return [] }
         audioEngine.inputNode.removeTap(onBus: 0)
         audioEngine.stop()
         processingQueue.sync {}
         converter = nil
         convertedBuffer = nil
-        running = false
+        isRunning = false
 
         #if os(iOS)
         try? AVAudioSession.sharedInstance().setActive(
@@ -149,6 +154,9 @@ final class AudioMonitoringService: @unchecked Sendable {
         let samples = Array(
             UnsafeBufferPointer(start: channel, count: Int(output.frameLength))
         )
+        // Fires before the push so a `pushPcm16k` failure can never swallow a
+        // take in progress.
+        onSamples?(samples)
         do {
             let events = try detector.pushPcm16k(samples: samples)
             if !events.isEmpty {

@@ -11,6 +11,10 @@ struct SettingsView: View {
                 .tabItem {
                     Label("PHR", systemImage: "heart.text.square")
                 }
+            TrainingSettingsView()
+                .tabItem {
+                    Label("Training", systemImage: "waveform.badge.mic")
+                }
         }
         // Settings tabs share one frame, so this is sized for the taller PHR
         // pane (Connection + API token + Status sections), not General.

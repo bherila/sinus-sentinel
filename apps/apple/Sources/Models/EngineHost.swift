@@ -11,26 +11,32 @@ final class EngineHost {
     let monitor: MonitorModel
     let history: HistoryModel
     let sync: SyncModel
+    let training: TrainingModel
     var errorMessage: String?
 
     init() {
         let monitor = MonitorModel()
         let history = HistoryModel()
         let sync = SyncModel()
+        let training = TrainingModel()
         self.monitor = monitor
         self.history = history
         self.sync = sync
+        self.training = training
         monitor.onError = { [weak self] in self?.errorMessage = $0 }
         history.onError = { [weak self] in self?.errorMessage = $0 }
+        training.onError = { [weak self] in self?.errorMessage = $0 }
         // Closes chunk 12's gap: the tray app requests a sync after every
         // flag, and Swift did not. A hook rather than a reference to
         // `SyncModel`, so `HistoryModel` keeps not knowing what else exists.
         history.onFlagged = { [weak self] in self?.sync.syncNow() }
+        training.onTrainingChanged = { [weak self] in self?.sync.syncNow() }
+        monitor.onCaptureStopped = { [weak training] in training?.cancelTake() }
 
         do {
             let support = try Self.applicationSupportDirectory()
             let database = support.appendingPathComponent("events.db")
-            let runner = Self.modelRunner()
+            let (runner, modelReady) = Self.modelRunner()
             let engine = try AppleEngine(
                 config: AppleEngineConfig(
                     databasePath: database.path,
@@ -41,6 +47,7 @@ final class EngineHost {
             let audio = AudioMonitoringService(engine: engine)
             history.attach(engine: engine)
             monitor.attach(engine: engine, audio: audio)
+            training.attach(engine: engine, audio: audio, modelReady: modelReady)
             monitor.onHistoryChanged = { [weak history] in history?.refresh() }
             history.refresh()
 
@@ -82,11 +89,14 @@ final class EngineHost {
         return directory
     }
 
-    private static func modelRunner() -> ModelRunner {
+    /// `modelReady` reports whether the compiled Core ML model was actually
+    /// found, rather than leaving Training to guess from the fallback runner's
+    /// behavior — the fallback stays exactly what it was, just now labeled.
+    private static func modelRunner() -> (runner: ModelRunner, modelReady: Bool) {
         if let compiled = Bundle.main.url(forResource: "yamnet", withExtension: "mlmodelc"),
            let runner = try? CoreMLYamnetRunner(compiledModelURL: compiled) {
-            return runner
+            return (runner, true)
         }
-        return PreviewModelRunner()
+        return (PreviewModelRunner(), false)
     }
 }
