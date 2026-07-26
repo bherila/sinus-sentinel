@@ -30,21 +30,15 @@ struct ContentView: View {
             VStack(alignment: .leading, spacing: 24) {
                 monitoringCard
 
+                todaySection
+
                 VStack(alignment: .leading, spacing: 8) {
                     Text("Last 7 days")
                         .font(.title2.bold())
                     HistoryChartView(snapshot: host.history.snapshot)
                 }
 
-                if let snapshot = host.history.snapshot {
-                    Text(
-                        "Congestion score: \(snapshot.congestionScorePerMonitoredHour, specifier: "%.2f") per monitored hour"
-                    )
-                    .font(.subheadline)
-                    .foregroundStyle(.secondary)
-                }
-
-                recentEvents
+                RecentEventsView()
             }
             .padding()
         }
@@ -107,27 +101,38 @@ struct ContentView: View {
     }
 
     @ViewBuilder
-    private var recentEvents: some View {
+    private var todaySection: some View {
         VStack(alignment: .leading, spacing: 8) {
-            Text("Recent")
+            Text("Today")
                 .font(.title2.bold())
-            let events = host.history.snapshot?.recentEvents ?? []
-            if events.isEmpty {
-                Text("No recent events")
+
+            let counts = (host.history.snapshot?.today ?? []).filter { $0.count > 0 }
+            if counts.isEmpty {
+                Text("no events yet today")
                     .foregroundStyle(.secondary)
             } else {
-                ForEach(events.prefix(10), id: \.uuid) { event in
-                    HStack {
-                        Text(event.eventType.displayName)
-                        Spacer()
-                        Text(
-                            Date(timeIntervalSince1970: Double(event.occurredAtEpochMs) / 1_000),
-                            style: .time
-                        )
-                        .foregroundStyle(.secondary)
+                LazyVGrid(
+                    columns: [GridItem(.adaptive(minimum: 120), alignment: .leading)],
+                    alignment: .leading,
+                    spacing: 6
+                ) {
+                    ForEach(counts, id: \.eventType) { count in
+                        HStack(spacing: 4) {
+                            Rectangle()
+                                .fill(count.eventType.color)
+                                .frame(width: 10, height: 10)
+                            Text("\(count.eventType.displayName): \(count.count)")
+                        }
                     }
-                    .padding(.vertical, 4)
                 }
+            }
+
+            if let snapshot = host.history.snapshot {
+                Text(
+                    "Congestion score: \(snapshot.congestionScorePerMonitoredHour, specifier: "%.2f") per monitored hour (\(snapshot.monitoredHours, specifier: "%.1f") monitored hours)"
+                )
+                .font(.subheadline)
+                .foregroundStyle(.secondary)
             }
         }
     }

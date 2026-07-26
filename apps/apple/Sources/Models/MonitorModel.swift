@@ -17,6 +17,9 @@ final class MonitorModel {
     /// rather than pretending to monitor alongside it.
     private(set) var blockedByOtherInstance = false
     private(set) var pauseOnLowPower = true
+    /// Polled while capturing, for the "heard something — classifying…"
+    /// indicator. `nil` before any read has happened.
+    private(set) var status: EngineStatus?
 
     var isLowPowerModeEnabled: Bool { power.isLowPower }
 
@@ -30,11 +33,22 @@ final class MonitorModel {
     private var audio: AudioMonitoringService?
     private var engine: AppleEngine?
     private let power = LowPowerMonitor()
+    /// Bound to capture, not to app lifetime: there is nothing to watch while
+    /// the microphone is released, and a timer that kept running while
+    /// suspended would defeat the battery policy this model exists to enforce.
+    /// `@ObservationIgnored` also keeps it a plain stored property, which
+    /// `deinit` needs to reach it outside actor isolation.
+    @ObservationIgnored
+    private var statusTimer: Timer?
 
     init() {
         power.onChange = { [weak self] _ in
             self?.applyPowerPolicy()
         }
+    }
+
+    deinit {
+        statusTimer?.invalidate()
     }
 
     func attach(engine: AppleEngine, audio: AudioMonitoringService) {
@@ -51,6 +65,7 @@ final class MonitorModel {
             }
         }
         pauseOnLowPower = (try? engine.pauseOnLowPower()) ?? true
+        pollStatus()
     }
 
     func markBlockedByOtherInstance() {
@@ -104,6 +119,7 @@ final class MonitorModel {
         do {
             try audio.start()
             isCapturing = true
+            startStatusPolling()
             onError(nil)
         } catch {
             sessionRequested = false
@@ -114,14 +130,42 @@ final class MonitorModel {
 
     private func stopCapture() {
         guard let audio, isCapturing else { return }
+        stopStatusPolling()
         do {
             _ = try audio.stop()
             isCapturing = false
+            // One last read after the session closes. Without it the UI keeps
+            // whatever the final tick saw, and a gate that happened to be open
+            // when the user hit stop would sit there claiming to be classifying
+            // a sound from a microphone that is no longer running.
+            pollStatus()
             onHistoryChanged()
         } catch {
             isCapturing = false
             onError(error.localizedDescription)
         }
+    }
+
+    private func startStatusPolling() {
+        stopStatusPolling()
+        statusTimer = Timer.scheduledTimer(withTimeInterval: 0.25, repeats: true) { [weak self] _ in
+            // Timer callbacks run on the main run loop already; a `Task { @MainActor
+            // in }` hop four times a second would be pure overhead for isolation
+            // that already holds.
+            MainActor.assumeIsolated {
+                self?.pollStatus()
+            }
+        }
+    }
+
+    private func stopStatusPolling() {
+        statusTimer?.invalidate()
+        statusTimer = nil
+    }
+
+    private func pollStatus() {
+        guard let engine else { return }
+        status = try? engine.status()
     }
 
     private func handleCaptureFailure(_ message: String) {
