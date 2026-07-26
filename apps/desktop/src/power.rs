@@ -67,7 +67,7 @@ pub fn user_idle() -> Option<std::time::Duration> {
     // subtraction) rather than promoting dwTime into the 64-bit counter, which
     // would read as an enormous idle time for any machine that has been up
     // longer than dwTime's range.
-    let now_low = GetTickCount64() as u32;
+    let now_low = unsafe { GetTickCount64() } as u32;
     let idle_ms = now_low.wrapping_sub(info.dwTime);
     Some(std::time::Duration::from_millis(idle_ms as u64))
 }
