@@ -6,6 +6,8 @@ struct SinusSentinelApp: App {
 
     #if os(macOS)
     @NSApplicationDelegateAdaptor(AppDelegate.self) private var appDelegate
+    #else
+    @Environment(\.scenePhase) private var scenePhase
     #endif
 
     var body: some Scene {
@@ -29,8 +31,23 @@ struct SinusSentinelApp: App {
         }
         #else
         WindowGroup {
-            ContentView()
+            RootTabView()
                 .environment(host)
+                .onChange(of: scenePhase) { _, newPhase in
+                    // `.inactive` is the transient state on either side of a
+                    // phone call or the app switcher — neither backgrounding
+                    // nor foregrounding actually happened, so it is ignored.
+                    switch newPhase {
+                    case .background:
+                        host.enterBackground()
+                    case .active:
+                        host.enterForeground()
+                    case .inactive:
+                        break
+                    @unknown default:
+                        break
+                    }
+                }
         }
         #endif
     }

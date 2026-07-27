@@ -1,9 +1,22 @@
-# Apple SwiftUI prototype
+# Apple SwiftUI client
 
-This directory is a native SwiftUI shell shared by macOS and iPhone. It is a
-prototype handoff: the Rust engine and generated binding contract are tested on
-Linux, while the Swift compile, microphone lifecycle, Core ML model, simulator,
-and real-device background behavior must be completed on a Mac.
+This directory is a native SwiftUI shell shared by macOS and iPhone — one
+target, two shells. The Rust engine and the generated binding contract are
+tested on Linux; the Swift compile, microphone lifecycle, Core ML model,
+simulator, and real-device background behavior have to be exercised on a Mac.
+
+macOS is menu-bar-first: a History window, a `MenuBarExtra`, and a `Settings`
+scene under ⌘,. iPhone has neither a menu bar nor a `Settings` scene, so
+`RootTabView` presents the same views as History / Train / Settings tabs, with
+pause beside Start/Stop and "Sync now" in Settings › PHR because their macOS
+homes do not exist there. Backgrounding the app with no monitoring session
+running stops the sync driver and rebuilds it on return. Everything else —
+every model and the entire Rust surface — is shared; `#if os(...)` is confined
+to `SinusSentinelApp`, `AppDelegate`, `MenuBarContent`, `RootTabView` and a few
+marked lines.
+
+The macOS shell is at feature parity with the menu-bar tray app, which is now
+the Windows client. The iPhone shell has been compiled but never run.
 
 ## One-command build and run
 
@@ -71,6 +84,10 @@ policy. See [the architecture notes](../../docs/APPLE_ARCHITECTURE.md#battery-po
 
 ## Still requires a Mac / device
 
+- run the iPhone shell for the first time — it is compiled by CI's
+  `apple-native` job but has never been launched, on a Simulator or a device;
+  a Mac with only the Command Line Tools has no `iphonesimulator` SDK and can
+  build just the macOS shell;
 - convert and validate YAMNet as a Core ML package;
 - handle audio interruptions, route changes, and media-services resets;
 - verify that an active session continues through iPhone screen lock;

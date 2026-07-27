@@ -92,6 +92,13 @@ struct PhrSettingsView: View {
                         .font(.footnote)
                         .foregroundStyle(.red)
                 }
+                #if os(iOS)
+                // macOS reaches this through the menu bar's "Sync now"
+                // (`MenuBarContent.swift`); iOS has no menu bar to reach it from.
+                Button("Sync now") {
+                    sync.syncNow()
+                }
+                #endif
             }
         }
         .formStyle(.grouped)

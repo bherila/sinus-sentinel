@@ -11,7 +11,9 @@ struct ContentView: View {
                 main
             }
         }
+        #if os(macOS)
         .frame(minWidth: 480, minHeight: 540)
+        #endif
     }
 
     private var alreadyRunning: some View {
@@ -65,11 +67,38 @@ struct ContentView: View {
             Text(status.detail)
                 .foregroundStyle(.secondary)
 
-            Button(host.monitor.sessionRequested ? "Stop monitoring" : "Start monitoring") {
-                host.monitor.toggleMonitoring()
+            HStack {
+                Button(host.monitor.sessionRequested ? "Stop monitoring" : "Start monitoring") {
+                    host.monitor.toggleMonitoring()
+                }
+                .buttonStyle(.borderedProminent)
+                .controlSize(.large)
+
+                #if os(iOS)
+                // The menu bar's Pause menu (`MenuBarContent.swift`) is
+                // unreachable on iOS, which has no menu bar — offer the same
+                // four actions here instead. `status` above already renders
+                // the paused state, so this menu carries no status text of
+                // its own.
+                Menu("Pause") {
+                    Button("Pause 15 min") {
+                        host.monitor.setPause(kind: .timed, until: Date().addingTimeInterval(15 * 60))
+                    }
+                    Button("Pause 1 hour") {
+                        host.monitor.setPause(kind: .timed, until: Date().addingTimeInterval(60 * 60))
+                    }
+                    Button("Pause until resumed") {
+                        host.monitor.setPause(kind: .indefinite, until: nil)
+                    }
+                    if host.monitor.pause?.paused == true {
+                        Button("Resume") {
+                            host.monitor.setPause(kind: .running, until: nil)
+                        }
+                    }
+                }
+                .controlSize(.large)
+                #endif
             }
-            .buttonStyle(.borderedProminent)
-            .controlSize(.large)
         }
         .padding()
         .background(.regularMaterial, in: RoundedRectangle(cornerRadius: 16))
