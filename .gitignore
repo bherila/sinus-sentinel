@@ -5,3 +5,4 @@ model/*.onnx
 apps/apple/Resources/*.mlmodelc
 __pycache__/
 *.pyc
+model/*.mlpackage
