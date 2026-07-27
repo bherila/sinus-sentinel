@@ -17,9 +17,16 @@ final class SyncModel {
     private(set) var phr: PhrSettings?
     private(set) var tokenStatus: String
     private(set) var message: String?
+    /// Set by `suspend()`, cleared by `resume()` — distinct from "no engine"
+    /// (this device never got as far as starting sync at all): `resume()`
+    /// only rebuilds the controller when this is true.
+    private(set) var isSuspended = false
 
     private var engine: AppleEngine?
     private var controller: SyncController?
+    /// Kept so `resume()` can rebuild the controller without asking
+    /// `EngineHost` to remember it on our behalf.
+    private var tokens: TokenProvider?
 
     @ObservationIgnored
     private var terminationObserver: NSObjectProtocol?
@@ -50,15 +57,8 @@ final class SyncModel {
     /// shape `MonitorModel`/`HistoryModel` use for a nil engine.
     func start(engine: AppleEngine, tokens: TokenProvider) throws {
         self.engine = engine
-        let observer = SyncStatusBridge { [weak self] status in
-            Task { @MainActor in
-                self?.status = status
-            }
-        }
-        let controller = try SyncController(engine: engine, tokens: tokens, observer: observer)
-        self.controller = controller
-        status = controller.status()
-        reload()
+        self.tokens = tokens
+        try buildController(engine: engine, tokens: tokens)
 
         #if os(macOS)
         // `Drop` on the Rust side only signals the driver thread to stop; it
@@ -77,8 +77,52 @@ final class SyncModel {
         #endif
     }
 
+    /// Builds the observer bridge and the driver thread, then seeds `status`
+    /// and `phr` from it. Shared by `start` and `resume` — the only
+    /// difference between a cold start and a resume after `suspend()` is who
+    /// is calling.
+    private func buildController(engine: AppleEngine, tokens: TokenProvider) throws {
+        let observer = SyncStatusBridge { [weak self] status in
+            Task { @MainActor in
+                self?.status = status
+            }
+        }
+        let controller = try SyncController(engine: engine, tokens: tokens, observer: observer)
+        self.controller = controller
+        status = controller.status()
+        reload()
+    }
+
     func shutdown() {
         controller?.shutdown(timeoutMs: 3000)
+    }
+
+    /// Called when the app backgrounds with no active monitoring session
+    /// keeping the process alive. The point is the driver thread, not the
+    /// database: a flush blocks on a socket for up to the HTTP client's
+    /// 30-second timeout, and a process suspended mid-flush resumes holding a
+    /// connection the network moved on from. `shutdown` is the bounded way to
+    /// stop and wait; releasing the last Swift reference afterward is what
+    /// then closes the third `Store` connection `SyncController::new` opened,
+    /// so a rebuild in `resume()` does not stack a second one beside it.
+    func suspend() {
+        controller?.shutdown(timeoutMs: 3000)
+        controller = nil
+        isSuspended = true
+    }
+
+    /// Rebuilds the controller torn down by `suspend()`. A no-op unless
+    /// actually suspended; on failure this sets `message` rather than
+    /// throwing — offline is a legitimate steady state everywhere else in
+    /// this file, and the same holds coming back from the background.
+    func resume() {
+        guard isSuspended, let engine, let tokens else { return }
+        do {
+            try buildController(engine: engine, tokens: tokens)
+            isSuspended = false
+        } catch {
+            message = "Could not resume sync: \(error.localizedDescription)"
+        }
     }
 
     func reload() {

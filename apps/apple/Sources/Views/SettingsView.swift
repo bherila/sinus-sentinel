@@ -1,6 +1,9 @@
 import SwiftUI
 import SinusAppleFFI
 
+// The `Settings` scene and this fixed frame are both macOS-only concepts;
+// iOS reaches the same panes through `RootTabView` / `IOSSettingsView`.
+#if os(macOS)
 struct SettingsView: View {
     var body: some View {
         TabView {
@@ -26,8 +29,9 @@ struct SettingsView: View {
         .frame(width: 480, height: 520)
     }
 }
+#endif
 
-private struct GeneralSettingsView: View {
+struct GeneralSettingsView: View {
     @Environment(EngineHost.self) private var host
 
     @State private var quietHoursEnabled = false
@@ -148,7 +152,7 @@ private struct GeneralSettingsView: View {
     }
 }
 
-private struct AboutSettingsView: View {
+struct AboutSettingsView: View {
     @Environment(EngineHost.self) private var host
 
     var body: some View {

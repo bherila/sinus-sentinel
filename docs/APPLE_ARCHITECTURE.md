@@ -1,4 +1,4 @@
-# Apple client architecture prototype
+# Apple client architecture
 
 ## Direction
 
@@ -10,8 +10,19 @@ lifecycle APIs. Rust remains the shared source of truth for:
 - personalized prototype matching;
 - history buckets and congestion scoring.
 
-The existing egui desktop client stays functional while Apple work proceeds.
-Windows is maintenance-only for this phase; no Windows code is removed.
+SwiftUI is the client on macOS and iPhone. **egui is the Windows client.** The
+tray app still builds and runs on macOS and is still the binary the releases
+ship, but it is no longer where macOS features are added: anything that would
+otherwise be written twice belongs in `sinus-app`, and the second copy of it in
+`apps/desktop` exists to serve Windows. Retiring the macOS egui build is a
+separate change and no Windows code is removed for it.
+
+That split is why the parity work moved policy rather than reimplementing it.
+The flag rules, Teach scoring and the sync scheduler now live in `sinus-app`;
+`apps/desktop` is a renderer over them and `crates/apple` is a marshaller. A
+rule that exists in only one of the two shells is a bug, not a platform
+difference — the deliberate platform differences are listed below and are all
+about what the OS can honestly tell us.
 
 ## Boundary
 
@@ -37,6 +48,41 @@ The Swift shell owns:
 - Swift Charts and all accessibility/presentation behavior.
 
 No raw PCM crosses into persistence or networking.
+
+## Shell shape
+
+One SwiftUI target, two shells. `#if os(macOS)` / `#if os(iOS)` appears only in
+`SinusSentinelApp`, `AppDelegate`, `MenuBarContent`, `RootTabView`, and a
+handful of marked lines where a control has no home on the other platform.
+Every model, and the whole Rust surface, is shared.
+
+macOS is menu-bar-first, matching the tray app it replaces: a `Window` (not a
+`WindowGroup` — there is one history per machine, and a group would let the user
+open several views of it that then have to be kept in agreement), a
+`MenuBarExtra`, and a `Settings` scene. `LSUIElement` puts the process in
+`.accessory` activation policy, which means no Dock icon *and no application
+menu* — so `Settings…` and its ⌘, have nowhere to attach and silently do
+nothing. `AppDelegate` therefore makes the activation policy track whether an
+ordinary window is open, raising to `.regular` immediately before showing one
+and dropping back when the last one closes. It toggles on window open/close
+only, never on activation, or the menu-bar item flickers.
+
+iOS has neither a menu bar nor a `Settings` scene, so `RootTabView` gives it a
+`TabView` of History / Train / Settings, each in its own `NavigationStack`, and
+the settings pane is a list pushing to the same General/PHR/About forms macOS
+shows as tabs. Two controls that live in the macOS menu bar have no menu bar to
+live in and are re-sited rather than dropped: pause moves next to Start/Stop in
+the History tab, and "Sync now" into Settings › PHR.
+
+The lifecycle rule is iOS-only. On `scenePhase == .background` with **no active
+monitoring session**, the shell calls `SyncController::shutdown(3000)` and
+releases the controller. A flush blocks on a socket for up to the HTTP client's
+30-second timeout, and a process suspended mid-flush resumes holding a
+connection the network has long since moved on from; `SyncDriver` is cheap to
+rebuild on `.active`. The "no active session" condition is what keeps this from
+being wrong in the one case that matters: a session declares the audio
+background mode and keeps the process running, so there is nothing to be
+suspended mid-flush and no reason to stop syncing.
 
 ## Who owns the token
 
@@ -195,7 +241,7 @@ UI refresh cannot stall behind a Core ML inference holding the engine lock.
 
 ## Monitoring through screen lock
 
-The iOS prototype declares `UIBackgroundModes = audio`, activates an
+The iOS shell declares `UIBackgroundModes = audio`, activates an
 `AVAudioSession` recording category only after the user starts monitoring, and
 deactivates it when monitoring stops. This is the intended mechanism for an
 active recording session to continue when the app backgrounds or the phone
@@ -219,12 +265,19 @@ Apple references:
 On a Mac:
 
 ```bash
-make apple-ios-run
-make apple-macos-run
+make apple-ios-run       # or apple-ios-build
+make apple-macos-run     # or apple-macos-build
 ```
 
 Both commands compile Rust first, generate bindings from that exact binary, and
 then invoke Swift. There is no stale/prebuilt library fallback.
+
+The iOS half needs a full Xcode with an iOS 17+ Simulator runtime, not just the
+Command Line Tools: without one, `xcrun --sdk iphonesimulator` cannot resolve an
+SDK and `make apple-ios-build` fails before it reaches any Swift. A Mac with
+Command Line Tools only can still build and run the macOS shell, and CI's
+`apple-native` job builds both — so an iOS-only compile error is caught there
+rather than locally.
 
 On Linux:
 

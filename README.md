@@ -34,7 +34,12 @@ exits. Launching a second copy just focuses the running one.
 
 Tray states: 🟢 listening · ⏸ paused · ⚠ model unavailable · 📴 offline-strict.
 
-### Apple SwiftUI prototype
+### The macOS and iPhone SwiftUI client
+
+SwiftUI is the client on macOS and iPhone; the tray app above is the Windows
+client and still builds on macOS. On the Mac the SwiftUI app is menu-bar-first
+like the tray app — a History window, a `MenuBarExtra`, and Settings under ⌘, —
+and on iPhone the same views become a History / Train / Settings tab bar.
 
 On a Mac with Xcode, an installed iOS 17+ Simulator, and Rustup:
 
@@ -56,14 +61,16 @@ detectors on one microphone would log every cough twice. Whichever starts first
 owns the machine and the other refuses, so quit the menu-bar app before running
 the SwiftUI one.
 
-The prototype uses an explicit monitoring-session model. On iPhone, the active
+Both shells use an explicit monitoring-session model. On iPhone, the active
 recording session declares the audio background mode so it can continue through
-screen lock; this still needs real-device and App Review validation. As on the
-desktop, monitoring releases the microphone while the OS is in Low Power Mode and
-resumes by itself afterwards — both shells read the same setting. Until a
-compiled `apps/apple/Resources/yamnet.mlmodelc` is supplied, the UI uses a
-neutral preview model and deliberately emits no detections. See
-[the Apple architecture handoff](docs/APPLE_ARCHITECTURE.md).
+screen lock; this still needs real-device and App Review validation. Backgrounding
+the app *without* a session stops the sync driver and rebuilds it on return,
+rather than leaving a socket blocked across suspension. As on the desktop,
+monitoring releases the microphone while the OS is in Low Power Mode and resumes
+by itself afterwards — both shells read the same setting. Until a compiled
+`apps/apple/Resources/yamnet.mlmodelc` is supplied, the UI uses a neutral preview
+model and deliberately emits no detections. See
+[the Apple architecture notes](docs/APPLE_ARCHITECTURE.md).
 
 ### The model file
 
@@ -229,9 +236,11 @@ sleep until an event or real deadline rather than polling.
 
 Alpha (`v0.4.0-alpha`). Core pipeline complete and tested end-to-end; desktop
 shell with live capture, Teach mode, false-positive training, sync, and releases
-working. The macOS SwiftUI client is at feature parity with the tray app and the
-iPhone shell is next. Remaining: signed/notarized macOS bundle (#5), real-world
-accuracy corpus + evaluation (#4), CSV/JSON export in the UI.
+working. The macOS SwiftUI client is at feature parity with the tray app, and the
+iPhone shell reaches the same features through a tab bar — but it has only ever
+been compiled, never run on a device or a Simulator. Remaining: real-device iOS
+validation, signed/notarized macOS bundle (#5), real-world accuracy corpus +
+evaluation (#4), CSV/JSON export in the UI.
 
 ## License
 

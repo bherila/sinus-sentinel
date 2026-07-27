@@ -68,6 +68,24 @@ final class EngineHost {
         }
     }
 
+    /// Called from `SinusSentinelApp`'s `scenePhase` observer when iOS
+    /// backgrounds the app.
+    func enterBackground() {
+        // An active session declares the audio background mode and keeps the
+        // process running, so tearing sync down under it would be wrong —
+        // only suspend when there is no live session to keep the process
+        // alive. A suspended process holding a blocked reqwest socket wakes
+        // badly, and `SyncDriver` is cheap to recreate on `enterForeground`.
+        guard !monitor.isCapturing else { return }
+        sync.suspend()
+    }
+
+    /// Called from `SinusSentinelApp`'s `scenePhase` observer when iOS
+    /// foregrounds the app.
+    func enterForeground() {
+        sync.resume()
+    }
+
     private static var platform: ApplePlatform {
         #if os(iOS)
         return .ios
