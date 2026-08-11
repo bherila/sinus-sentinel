@@ -227,11 +227,7 @@ impl<E: Embedder> MonitoringEngine<E> {
 /// `None` when the user has taught nothing yet (in which case the pipeline runs
 /// the generic decision rules alone).
 pub fn prototypes_from_store(store: &Store) -> Result<Option<PrototypeMatcher>> {
-    let enrollments: Vec<_> = store
-        .enrollments()?
-        .into_iter()
-        .map(|stored| stored.enrollment)
-        .collect();
+    let enrollments = store.classifier_enrollments()?;
     Ok((!enrollments.is_empty()).then(|| {
         PrototypeMatcher::from_enrollments(
             &enrollments,

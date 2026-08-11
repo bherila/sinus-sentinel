@@ -652,10 +652,17 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
     func cancelTeachTake() throws
 
     /**
-     * Undo a false-positive report or a correction. Any training the flag
-     * produced is kept; only the flag on this event is reverted.
+     * Undo feedback and remove every virtual classifier example derived from
+     * this event. Guided Teach takes are independent and remain untouched.
      */
-    func clearFlag(eventUuid: String) throws  -> FlagResult
+    func clearFlag(eventUuid: String) throws  -> AppleFeedbackResult
+
+    /**
+     * Confirm that the detector's current effective label was correct. This
+     * does not alter the counted event type; it only updates canonical feedback
+     * and, when an embedding is available, personalized detection.
+     */
+    func confirmEvent(eventUuid: String) throws  -> AppleFeedbackResult
 
     /**
      * Remove all personalization, positive and negative alike. The detector
@@ -720,7 +727,21 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
      * the class the classifier originally fired is treated as an undo, not a
      * correction — see `sinus_app::flag::recharacterize`.
      */
-    func recharacterize(eventUuid: String, corrected: AppleEventType) throws  -> FlagResult
+    func recharacterize(eventUuid: String, corrected: AppleEventType) throws  -> AppleFeedbackResult
+
+    /**
+     * Clear every canonical feedback document back to `none`, preserving all
+     * guided Teach takes. The bulk policy returns its own aggregate because no
+     * single updated event can represent the operation.
+     */
+    func removeAllFeedbackTraining() throws  -> AppleBulkFeedbackResult
+
+    /**
+     * Remove one feedback-derived Training unit. Feedback group ids are event
+     * UUIDs, so this deliberately routes through the same Rust-owned Undo
+     * policy as History instead of exposing either virtual classifier member.
+     */
+    func removeTrainingGroup(groupId: String) throws  -> AppleFeedbackResult
 
     /**
      * Report a misdetection: the event stops counting here and in the PHR, and,
@@ -728,7 +749,7 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
      * sound the class it fired as. Policy lives in `sinus_app::flag`; see there
      * for the rules.
      */
-    func reportFalsePositive(eventUuid: String) throws  -> FlagResult
+    func reportFalsePositive(eventUuid: String) throws  -> AppleFeedbackResult
 
     func sensitivity() throws  -> Float
 
@@ -875,13 +896,28 @@ open func cancelTeachTake()throws   {try rustCallWithError(FfiConverterTypeApple
 }
 
     /**
-     * Undo a false-positive report or a correction. Any training the flag
-     * produced is kept; only the flag on this event is reverted.
+     * Undo feedback and remove every virtual classifier example derived from
+     * this event. Guided Teach takes are independent and remain untouched.
      */
-open func clearFlag(eventUuid: String)throws  -> FlagResult  {
-    return try  FfiConverterTypeFlagResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+open func clearFlag(eventUuid: String)throws  -> AppleFeedbackResult  {
+    return try  FfiConverterTypeAppleFeedbackResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_clear_flag(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(eventUuid),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Confirm that the detector's current effective label was correct. This
+     * does not alter the counted event type; it only updates canonical feedback
+     * and, when an embedding is available, personalized detection.
+     */
+open func confirmEvent(eventUuid: String)throws  -> AppleFeedbackResult  {
+    return try  FfiConverterTypeAppleFeedbackResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_confirm_event(
             self.uniffiCloneHandle(),
         FfiConverterString.lower(eventUuid),uniffiCallStatus
     )
@@ -1058,8 +1094,8 @@ open func quietHours()throws  -> QuietHours?  {
      * the class the classifier originally fired is treated as an undo, not a
      * correction — see `sinus_app::flag::recharacterize`.
      */
-open func recharacterize(eventUuid: String, corrected: AppleEventType)throws  -> FlagResult  {
-    return try  FfiConverterTypeFlagResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+open func recharacterize(eventUuid: String, corrected: AppleEventType)throws  -> AppleFeedbackResult  {
+    return try  FfiConverterTypeAppleFeedbackResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_recharacterize(
             self.uniffiCloneHandle(),
@@ -1070,13 +1106,42 @@ open func recharacterize(eventUuid: String, corrected: AppleEventType)throws  ->
 }
 
     /**
+     * Clear every canonical feedback document back to `none`, preserving all
+     * guided Teach takes. The bulk policy returns its own aggregate because no
+     * single updated event can represent the operation.
+     */
+open func removeAllFeedbackTraining()throws  -> AppleBulkFeedbackResult  {
+    return try  FfiConverterTypeAppleBulkFeedbackResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_remove_all_feedback_training(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
+
+    /**
+     * Remove one feedback-derived Training unit. Feedback group ids are event
+     * UUIDs, so this deliberately routes through the same Rust-owned Undo
+     * policy as History instead of exposing either virtual classifier member.
+     */
+open func removeTrainingGroup(groupId: String)throws  -> AppleFeedbackResult  {
+    return try  FfiConverterTypeAppleFeedbackResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_appleengine_remove_training_group(
+            self.uniffiCloneHandle(),
+        FfiConverterString.lower(groupId),uniffiCallStatus
+    )
+})
+}
+
+    /**
      * Report a misdetection: the event stops counting here and in the PHR, and,
      * if its embedding was retained, the detector is trained not to call that
      * sound the class it fired as. Policy lives in `sinus_app::flag`; see there
      * for the rules.
      */
-open func reportFalsePositive(eventUuid: String)throws  -> FlagResult  {
-    return try  FfiConverterTypeFlagResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+open func reportFalsePositive(eventUuid: String)throws  -> AppleFeedbackResult  {
+    return try  FfiConverterTypeAppleFeedbackResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_report_false_positive(
             self.uniffiCloneHandle(),
@@ -2281,6 +2346,67 @@ public func FfiConverterTypeTokenProvider_lower(_ value: TokenProvider) -> UInt6
 
 
 /**
+ * Aggregate result for resetting every feedback-derived Training group.
+ */
+public struct AppleBulkFeedbackResult: Equatable, Hashable {
+    public let groupsChanged: UInt32
+    public let classifierChanged: Bool
+    public let syncRequired: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupsChanged: UInt32, classifierChanged: Bool, syncRequired: Bool) {
+        self.groupsChanged = groupsChanged
+        self.classifierChanged = classifierChanged
+        self.syncRequired = syncRequired
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AppleBulkFeedbackResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAppleBulkFeedbackResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AppleBulkFeedbackResult {
+        return
+            try AppleBulkFeedbackResult(
+                groupsChanged: FfiConverterUInt32.read(from: &buf),
+                classifierChanged: FfiConverterBool.read(from: &buf),
+                syncRequired: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AppleBulkFeedbackResult, into buf: inout [UInt8]) {
+        FfiConverterUInt32.write(value.groupsChanged, into: &buf)
+        FfiConverterBool.write(value.classifierChanged, into: &buf)
+        FfiConverterBool.write(value.syncRequired, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleBulkFeedbackResult_lift(_ buf: RustBuffer) throws -> AppleBulkFeedbackResult {
+    return try FfiConverterTypeAppleBulkFeedbackResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleBulkFeedbackResult_lower(_ value: AppleBulkFeedbackResult) -> RustBuffer {
+    return FfiConverterTypeAppleBulkFeedbackResult.lower(value)
+}
+
+
+/**
  * Only what the platform knows. The device identity, sensitivity and battery
  * policy all live in the database, which this machine's other Sinus Sentinel
  * shell reads too.
@@ -2467,6 +2593,147 @@ public func FfiConverterTypeAppleEvent_lift(_ buf: RustBuffer) throws -> AppleEv
 #endif
 public func FfiConverterTypeAppleEvent_lower(_ value: AppleEvent) -> RustBuffer {
     return FfiConverterTypeAppleEvent.lower(value)
+}
+
+
+/**
+ * What an event-feedback operation changed. Swift must use each independent
+ * bit directly rather than deriving reload or sync behavior from `effect`.
+ */
+public struct AppleFeedbackResult: Equatable, Hashable {
+    /**
+     * The event as it now stands, so the caller can replace its row without refetching.
+     */
+    public let event: AppleEvent
+    public let eventChanged: Bool
+    public let classifierChanged: Bool
+    public let syncRequired: Bool
+    public let effect: AppleTrainingEffect
+    public let progress: AppleTrainingProgress?
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(
+        /**
+         * The event as it now stands, so the caller can replace its row without refetching.
+         */event: AppleEvent, eventChanged: Bool, classifierChanged: Bool, syncRequired: Bool, effect: AppleTrainingEffect, progress: AppleTrainingProgress?) {
+        self.event = event
+        self.eventChanged = eventChanged
+        self.classifierChanged = classifierChanged
+        self.syncRequired = syncRequired
+        self.effect = effect
+        self.progress = progress
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AppleFeedbackResult: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAppleFeedbackResult: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AppleFeedbackResult {
+        return
+            try AppleFeedbackResult(
+                event: FfiConverterTypeAppleEvent.read(from: &buf),
+                eventChanged: FfiConverterBool.read(from: &buf),
+                classifierChanged: FfiConverterBool.read(from: &buf),
+                syncRequired: FfiConverterBool.read(from: &buf),
+                effect: FfiConverterTypeAppleTrainingEffect.read(from: &buf),
+                progress: FfiConverterOptionTypeAppleTrainingProgress.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AppleFeedbackResult, into buf: inout [UInt8]) {
+        FfiConverterTypeAppleEvent.write(value.event, into: &buf)
+        FfiConverterBool.write(value.eventChanged, into: &buf)
+        FfiConverterBool.write(value.classifierChanged, into: &buf)
+        FfiConverterBool.write(value.syncRequired, into: &buf)
+        FfiConverterTypeAppleTrainingEffect.write(value.effect, into: &buf)
+        FfiConverterOptionTypeAppleTrainingProgress.write(value.progress, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleFeedbackResult_lift(_ buf: RustBuffer) throws -> AppleFeedbackResult {
+    return try FfiConverterTypeAppleFeedbackResult.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleFeedbackResult_lower(_ value: AppleFeedbackResult) -> RustBuffer {
+    return FfiConverterTypeAppleFeedbackResult.lower(value)
+}
+
+
+/**
+ * Positive-class progress after feedback was applied.
+ */
+public struct AppleTrainingProgress: Equatable, Hashable {
+    public let eventType: AppleEventType
+    public let positiveCount: UInt32
+    public let activationThreshold: UInt32
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(eventType: AppleEventType, positiveCount: UInt32, activationThreshold: UInt32) {
+        self.eventType = eventType
+        self.positiveCount = positiveCount
+        self.activationThreshold = activationThreshold
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AppleTrainingProgress: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAppleTrainingProgress: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AppleTrainingProgress {
+        return
+            try AppleTrainingProgress(
+                eventType: FfiConverterTypeAppleEventType.read(from: &buf),
+                positiveCount: FfiConverterUInt32.read(from: &buf),
+                activationThreshold: FfiConverterUInt32.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: AppleTrainingProgress, into buf: inout [UInt8]) {
+        FfiConverterTypeAppleEventType.write(value.eventType, into: &buf)
+        FfiConverterUInt32.write(value.positiveCount, into: &buf)
+        FfiConverterUInt32.write(value.activationThreshold, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleTrainingProgress_lift(_ buf: RustBuffer) throws -> AppleTrainingProgress {
+    return try FfiConverterTypeAppleTrainingProgress.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleTrainingProgress_lower(_ value: AppleTrainingProgress) -> RustBuffer {
+    return FfiConverterTypeAppleTrainingProgress.lower(value)
 }
 
 
@@ -2778,79 +3045,6 @@ public func FfiConverterTypeEventCount_lift(_ buf: RustBuffer) throws -> EventCo
 #endif
 public func FfiConverterTypeEventCount_lower(_ value: EventCount) -> RustBuffer {
     return FfiConverterTypeEventCount.lower(value)
-}
-
-
-/**
- * What a flag operation changed, as the UI needs to see it.
- */
-public struct FlagResult: Equatable, Hashable {
-    /**
-     * The event as it now stands, so the caller can replace its row without refetching.
-     */
-    public let event: AppleEvent
-    /**
-     * An enrollment was written, so the detector actually changed. False when
-     * the event's embedding had already been pruned — worth telling the user,
-     * since the flag alone will not stop the sound recurring.
-     */
-    public let trained: Bool
-
-    // Default memberwise initializers are never public by default, so we
-    // declare one manually.
-    public init(
-        /**
-         * The event as it now stands, so the caller can replace its row without refetching.
-         */event: AppleEvent,
-        /**
-         * An enrollment was written, so the detector actually changed. False when
-         * the event's embedding had already been pruned — worth telling the user,
-         * since the flag alone will not stop the sound recurring.
-         */trained: Bool) {
-        self.event = event
-        self.trained = trained
-    }
-
-
-
-
-}
-
-#if compiler(>=6)
-extension FlagResult: Sendable {}
-#endif
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public struct FfiConverterTypeFlagResult: FfiConverterRustBuffer {
-    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> FlagResult {
-        return
-            try FlagResult(
-                event: FfiConverterTypeAppleEvent.read(from: &buf),
-                trained: FfiConverterBool.read(from: &buf)
-        )
-    }
-
-    public static func write(_ value: FlagResult, into buf: inout [UInt8]) {
-        FfiConverterTypeAppleEvent.write(value.event, into: &buf)
-        FfiConverterBool.write(value.trained, into: &buf)
-    }
-}
-
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFlagResult_lift(_ buf: RustBuffer) throws -> FlagResult {
-    return try FfiConverterTypeFlagResult.lift(buf)
-}
-
-#if swift(>=5.8)
-@_documentation(visibility: private)
-#endif
-public func FfiConverterTypeFlagResult_lower(_ value: FlagResult) -> RustBuffer {
-    return FfiConverterTypeFlagResult.lower(value)
 }
 
 
@@ -3525,6 +3719,89 @@ public func FfiConverterTypeTeachTake_lower(_ value: TeachTake) -> RustBuffer {
 
 
 /**
+ * One removable unit in Training. Feedback-derived virtual classifier members
+ * are deliberately not exposed individually: `group_id` is the event UUID and
+ * removing it clears the whole canonical feedback document's classifier effect.
+ */
+public struct TrainingGroup: Equatable, Hashable {
+    public let groupId: String
+    public let provenance: EnrollmentProvenance
+    public let eventType: AppleEventType
+    public let originalEventType: AppleEventType?
+    public let createdAt: String
+    public let peakDbfs: Float?
+    public let modelVersion: String?
+    public let synced: Bool
+
+    // Default memberwise initializers are never public by default, so we
+    // declare one manually.
+    public init(groupId: String, provenance: EnrollmentProvenance, eventType: AppleEventType, originalEventType: AppleEventType?, createdAt: String, peakDbfs: Float?, modelVersion: String?, synced: Bool) {
+        self.groupId = groupId
+        self.provenance = provenance
+        self.eventType = eventType
+        self.originalEventType = originalEventType
+        self.createdAt = createdAt
+        self.peakDbfs = peakDbfs
+        self.modelVersion = modelVersion
+        self.synced = synced
+    }
+
+
+
+
+}
+
+#if compiler(>=6)
+extension TrainingGroup: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeTrainingGroup: FfiConverterRustBuffer {
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> TrainingGroup {
+        return
+            try TrainingGroup(
+                groupId: FfiConverterString.read(from: &buf),
+                provenance: FfiConverterTypeEnrollmentProvenance.read(from: &buf),
+                eventType: FfiConverterTypeAppleEventType.read(from: &buf),
+                originalEventType: FfiConverterOptionTypeAppleEventType.read(from: &buf),
+                createdAt: FfiConverterString.read(from: &buf),
+                peakDbfs: FfiConverterOptionFloat.read(from: &buf),
+                modelVersion: FfiConverterOptionString.read(from: &buf),
+                synced: FfiConverterBool.read(from: &buf)
+        )
+    }
+
+    public static func write(_ value: TrainingGroup, into buf: inout [UInt8]) {
+        FfiConverterString.write(value.groupId, into: &buf)
+        FfiConverterTypeEnrollmentProvenance.write(value.provenance, into: &buf)
+        FfiConverterTypeAppleEventType.write(value.eventType, into: &buf)
+        FfiConverterOptionTypeAppleEventType.write(value.originalEventType, into: &buf)
+        FfiConverterString.write(value.createdAt, into: &buf)
+        FfiConverterOptionFloat.write(value.peakDbfs, into: &buf)
+        FfiConverterOptionString.write(value.modelVersion, into: &buf)
+        FfiConverterBool.write(value.synced, into: &buf)
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrainingGroup_lift(_ buf: RustBuffer) throws -> TrainingGroup {
+    return try FfiConverterTypeTrainingGroup.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeTrainingGroup_lower(_ value: TrainingGroup) -> RustBuffer {
+    return FfiConverterTypeTrainingGroup.lower(value)
+}
+
+
+/**
  * The whole Training pane in one read.
  */
 public struct TrainingSnapshot: Equatable, Hashable {
@@ -3533,15 +3810,25 @@ public struct TrainingSnapshot: Equatable, Hashable {
      * Learned false-positive suppressions, across all classes.
      */
     public let negativeCount: UInt32
+    /**
+     * User-visible training units. A correction is one group even though it
+     * derives both a scoped negative and a positive classifier example.
+     */
+    public let groups: [TrainingGroup]
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
     public init(classes: [ClassTraining],
         /**
          * Learned false-positive suppressions, across all classes.
-         */negativeCount: UInt32) {
+         */negativeCount: UInt32,
+        /**
+         * User-visible training units. A correction is one group even though it
+         * derives both a scoped negative and a positive classifier example.
+         */groups: [TrainingGroup]) {
         self.classes = classes
         self.negativeCount = negativeCount
+        self.groups = groups
     }
 
 
@@ -3561,13 +3848,15 @@ public struct FfiConverterTypeTrainingSnapshot: FfiConverterRustBuffer {
         return
             try TrainingSnapshot(
                 classes: FfiConverterSequenceTypeClassTraining.read(from: &buf),
-                negativeCount: FfiConverterUInt32.read(from: &buf)
+                negativeCount: FfiConverterUInt32.read(from: &buf),
+                groups: FfiConverterSequenceTypeTrainingGroup.read(from: &buf)
         )
     }
 
     public static func write(_ value: TrainingSnapshot, into buf: inout [UInt8]) {
         FfiConverterSequenceTypeClassTraining.write(value.classes, into: &buf)
         FfiConverterUInt32.write(value.negativeCount, into: &buf)
+        FfiConverterSequenceTypeTrainingGroup.write(value.groups, into: &buf)
     }
 }
 
@@ -3870,6 +4159,175 @@ public func FfiConverterTypeApplePlatform_lift(_ buf: RustBuffer) throws -> Appl
 #endif
 public func FfiConverterTypeApplePlatform_lower(_ value: ApplePlatform) -> RustBuffer {
     return FfiConverterTypeApplePlatform.lower(value)
+}
+
+
+
+/**
+ * How a feedback mutation affected personalized detection. These variants are
+ * intentionally independent of `classifier_changed`: replacing old feedback
+ * with an unavailable new embedding both removes classifier state and reports
+ * `Unavailable`.
+ */
+
+public enum AppleTrainingEffect: Equatable, Hashable, CaseIterable {
+
+    case applied
+    case removed
+    case unavailable
+    case unchanged
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AppleTrainingEffect: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAppleTrainingEffect: FfiConverterRustBuffer {
+    typealias SwiftType = AppleTrainingEffect
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AppleTrainingEffect {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .applied
+
+        case 2: return .removed
+
+        case 3: return .unavailable
+
+        case 4: return .unchanged
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: AppleTrainingEffect, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .applied:
+            writeInt(&buf, Int32(1))
+
+
+        case .removed:
+            writeInt(&buf, Int32(2))
+
+
+        case .unavailable:
+            writeInt(&buf, Int32(3))
+
+
+        case .unchanged:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleTrainingEffect_lift(_ buf: RustBuffer) throws -> AppleTrainingEffect {
+    return try FfiConverterTypeAppleTrainingEffect.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleTrainingEffect_lower(_ value: AppleTrainingEffect) -> RustBuffer {
+    return FfiConverterTypeAppleTrainingEffect.lower(value)
+}
+
+
+
+/**
+ * The durable origin of one user-visible training group.
+ */
+
+public enum EnrollmentProvenance: Equatable, Hashable, CaseIterable {
+
+    case guidedTake
+    case confirmedEvent
+    case correctedEvent
+    case falsePositiveSuppression
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension EnrollmentProvenance: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeEnrollmentProvenance: FfiConverterRustBuffer {
+    typealias SwiftType = EnrollmentProvenance
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> EnrollmentProvenance {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .guidedTake
+
+        case 2: return .confirmedEvent
+
+        case 3: return .correctedEvent
+
+        case 4: return .falsePositiveSuppression
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: EnrollmentProvenance, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .guidedTake:
+            writeInt(&buf, Int32(1))
+
+
+        case .confirmedEvent:
+            writeInt(&buf, Int32(2))
+
+
+        case .correctedEvent:
+            writeInt(&buf, Int32(3))
+
+
+        case .falsePositiveSuppression:
+            writeInt(&buf, Int32(4))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnrollmentProvenance_lift(_ buf: RustBuffer) throws -> EnrollmentProvenance {
+    return try FfiConverterTypeEnrollmentProvenance.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeEnrollmentProvenance_lower(_ value: EnrollmentProvenance) -> RustBuffer {
+    return FfiConverterTypeEnrollmentProvenance.lower(value)
 }
 
 
@@ -4435,6 +4893,30 @@ fileprivate struct FfiConverterOptionString: FfiConverterRustBuffer {
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterOptionTypeAppleTrainingProgress: FfiConverterRustBuffer {
+    typealias SwiftType = AppleTrainingProgress?
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        guard let value = value else {
+            writeInt(&buf, Int8(0))
+            return
+        }
+        writeInt(&buf, Int8(1))
+        FfiConverterTypeAppleTrainingProgress.write(value, into: &buf)
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> SwiftType {
+        switch try readInt(&buf) as Int8 {
+        case 0: return nil
+        case 1: return try FfiConverterTypeAppleTrainingProgress.read(from: &buf)
+        default: throw UniffiInternalError.unexpectedOptionalTag
+        }
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterOptionTypeQuietHours: FfiConverterRustBuffer {
     typealias SwiftType = QuietHours?
 
@@ -4629,6 +5111,31 @@ fileprivate struct FfiConverterSequenceTypeTeachTake: FfiConverterRustBuffer {
         return seq
     }
 }
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+fileprivate struct FfiConverterSequenceTypeTrainingGroup: FfiConverterRustBuffer {
+    typealias SwiftType = [TrainingGroup]
+
+    public static func write(_ value: [TrainingGroup], into buf: inout [UInt8]) {
+        let len = Int32(value.count)
+        writeInt(&buf, len)
+        for item in value {
+            FfiConverterTypeTrainingGroup.write(item, into: &buf)
+        }
+    }
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> [TrainingGroup] {
+        let len: Int32 = try readInt(&buf)
+        var seq = [TrainingGroup]()
+        seq.reserveCapacity(Int(len))
+        for _ in 0 ..< len {
+            seq.append(try FfiConverterTypeTrainingGroup.read(from: &buf))
+        }
+        return seq
+    }
+}
 /**
  * Samples of lead-in the shell should discard before it starts buffering a
  * take, exported so Swift's countdown and Rust's expectations cannot drift.
@@ -4693,7 +5200,10 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sinus_apple_checksum_method_appleengine_cancel_teach_take() != 51427) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sinus_apple_checksum_method_appleengine_clear_flag() != 37731) {
+    if (uniffi_sinus_apple_checksum_method_appleengine_clear_flag() != 21407) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_confirm_event() != 26917) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_delete_all_training() != 39915) {
@@ -4738,10 +5248,16 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sinus_apple_checksum_method_appleengine_quiet_hours() != 41646) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sinus_apple_checksum_method_appleengine_recharacterize() != 23608) {
+    if (uniffi_sinus_apple_checksum_method_appleengine_recharacterize() != 47651) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sinus_apple_checksum_method_appleengine_report_false_positive() != 21202) {
+    if (uniffi_sinus_apple_checksum_method_appleengine_remove_all_feedback_training() != 33179) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_remove_training_group() != 62340) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_appleengine_report_false_positive() != 32853) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_sensitivity() != 54494) {

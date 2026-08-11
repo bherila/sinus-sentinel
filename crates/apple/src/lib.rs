@@ -4,6 +4,8 @@
 //! converted 16 kHz mono PCM and owns the detector, persistence, and projections.
 
 use std::fmt;
+#[cfg(test)]
+use std::sync::atomic::AtomicU64;
 use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
@@ -473,6 +475,9 @@ pub struct TrainingSnapshot {
     pub classes: Vec<ClassTraining>,
     /// Learned false-positive suppressions, across all classes.
     pub negative_count: u32,
+    /// User-visible training units. A correction is one group even though it
+    /// derives both a scoped negative and a positive classifier example.
+    pub groups: Vec<TrainingGroup>,
 }
 
 /// The outcome of enrolling one take.
@@ -504,15 +509,118 @@ impl From<sinus_app::teach::TeachResult> for TeachResult {
     }
 }
 
-/// What a flag operation changed, as the UI needs to see it.
+/// How a feedback mutation affected personalized detection. These variants are
+/// intentionally independent of `classifier_changed`: replacing old feedback
+/// with an unavailable new embedding both removes classifier state and reports
+/// `Unavailable`.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum AppleTrainingEffect {
+    Applied,
+    Removed,
+    Unavailable,
+    Unchanged,
+}
+
+/// Positive-class progress after feedback was applied.
 #[derive(Debug, Clone, uniffi::Record)]
-pub struct FlagResult {
+pub struct AppleTrainingProgress {
+    pub event_type: AppleEventType,
+    pub positive_count: u32,
+    pub activation_threshold: u32,
+}
+
+/// What an event-feedback operation changed. Swift must use each independent
+/// bit directly rather than deriving reload or sync behavior from `effect`.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AppleFeedbackResult {
     /// The event as it now stands, so the caller can replace its row without refetching.
     pub event: AppleEvent,
-    /// An enrollment was written, so the detector actually changed. False when
-    /// the event's embedding had already been pruned — worth telling the user,
-    /// since the flag alone will not stop the sound recurring.
-    pub trained: bool,
+    pub event_changed: bool,
+    pub classifier_changed: bool,
+    pub sync_required: bool,
+    pub effect: AppleTrainingEffect,
+    pub progress: Option<AppleTrainingProgress>,
+}
+
+/// Aggregate result for resetting every feedback-derived Training group.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct AppleBulkFeedbackResult {
+    pub groups_changed: u32,
+    pub classifier_changed: bool,
+    pub sync_required: bool,
+}
+
+/// The durable origin of one user-visible training group.
+#[derive(Debug, Clone, Copy, uniffi::Enum)]
+pub enum EnrollmentProvenance {
+    GuidedTake,
+    ConfirmedEvent,
+    CorrectedEvent,
+    FalsePositiveSuppression,
+}
+
+/// One removable unit in Training. Feedback-derived virtual classifier members
+/// are deliberately not exposed individually: `group_id` is the event UUID and
+/// removing it clears the whole canonical feedback document's classifier effect.
+#[derive(Debug, Clone, uniffi::Record)]
+pub struct TrainingGroup {
+    pub group_id: String,
+    pub provenance: EnrollmentProvenance,
+    pub event_type: AppleEventType,
+    pub original_event_type: Option<AppleEventType>,
+    pub created_at: String,
+    pub peak_dbfs: Option<f32>,
+    pub model_version: Option<String>,
+    pub synced: bool,
+}
+
+impl From<sinus_app::flag::TrainingEffect> for AppleTrainingEffect {
+    fn from(value: sinus_app::flag::TrainingEffect) -> Self {
+        match value {
+            sinus_app::flag::TrainingEffect::Applied => Self::Applied,
+            sinus_app::flag::TrainingEffect::Removed => Self::Removed,
+            sinus_app::flag::TrainingEffect::Unavailable => Self::Unavailable,
+            sinus_app::flag::TrainingEffect::Unchanged => Self::Unchanged,
+        }
+    }
+}
+
+impl From<sinus_app::flag::TrainingProgress> for AppleTrainingProgress {
+    fn from(value: sinus_app::flag::TrainingProgress) -> Self {
+        Self {
+            event_type: value.class.into(),
+            positive_count: value.positive_examples,
+            activation_threshold: value.activation_threshold,
+        }
+    }
+}
+
+impl From<sinus_core::store::EnrollmentProvenance> for EnrollmentProvenance {
+    fn from(value: sinus_core::store::EnrollmentProvenance) -> Self {
+        match value {
+            sinus_core::store::EnrollmentProvenance::GuidedTake => Self::GuidedTake,
+            sinus_core::store::EnrollmentProvenance::ConfirmedEvent => Self::ConfirmedEvent,
+            sinus_core::store::EnrollmentProvenance::CorrectedEvent => Self::CorrectedEvent,
+            sinus_core::store::EnrollmentProvenance::FalsePositiveSuppression => {
+                Self::FalsePositiveSuppression
+            }
+        }
+    }
+}
+
+impl From<sinus_core::store::TrainingGroup> for TrainingGroup {
+    fn from(value: sinus_core::store::TrainingGroup) -> Self {
+        Self {
+            group_id: value.group_id,
+            provenance: value.provenance.into(),
+            event_type: value.class.into(),
+            original_event_type: value.original_class.map(Into::into),
+            created_at: value.created_at,
+            peak_dbfs: value.peak_dbfs,
+            model_version: value.model_version,
+            synced: value.synced,
+        }
+    }
 }
 
 /// How aggressively this device uploads. Device-local: a laptop on metered
@@ -683,6 +791,10 @@ pub struct AppleEngine {
     /// Kept so `SyncController::new` uploads under the right `Source` — an
     /// iPhone must not report as `desktop-mac`.
     platform: ApplePlatform,
+    /// Lets bridge tests prove that insertion, replacement and removal all
+    /// traverse the live-reload branch without exposing test state over UniFFI.
+    #[cfg(test)]
+    feedback_reload_count: AtomicU64,
 }
 
 #[uniffi::export]
@@ -743,6 +855,8 @@ impl AppleEngine {
             instance,
             database_path,
             platform: config.platform,
+            #[cfg(test)]
+            feedback_reload_count: AtomicU64::new(0),
         }))
     }
 
@@ -904,10 +1018,20 @@ impl AppleEngine {
     pub fn report_false_positive(
         &self,
         event_uuid: String,
-    ) -> Result<FlagResult, AppleEngineError> {
+    ) -> Result<AppleFeedbackResult, AppleEngineError> {
         self.flag(event_uuid, |store, uuid| {
             sinus_app::flag::report_false_positive(store, uuid)
         })
+    }
+
+    /// Confirm that the detector's current effective label was correct. This
+    /// does not alter the counted event type; it only updates canonical feedback
+    /// and, when an embedding is available, personalized detection.
+    pub fn confirm_event(
+        &self,
+        event_uuid: String,
+    ) -> Result<AppleFeedbackResult, AppleEngineError> {
+        self.flag(event_uuid, sinus_app::flag::confirm_event)
     }
 
     /// Record what a misdetected sound actually was. Correcting an event back to
@@ -917,18 +1041,48 @@ impl AppleEngine {
         &self,
         event_uuid: String,
         corrected: AppleEventType,
-    ) -> Result<FlagResult, AppleEngineError> {
+    ) -> Result<AppleFeedbackResult, AppleEngineError> {
         let corrected: EventType = corrected.into();
         self.flag(event_uuid, move |store, uuid| {
             sinus_app::flag::recharacterize(store, uuid, corrected)
         })
     }
 
-    /// Undo a false-positive report or a correction. Any training the flag
-    /// produced is kept; only the flag on this event is reverted.
-    pub fn clear_flag(&self, event_uuid: String) -> Result<FlagResult, AppleEngineError> {
+    /// Undo feedback and remove every virtual classifier example derived from
+    /// this event. Guided Teach takes are independent and remain untouched.
+    pub fn clear_flag(&self, event_uuid: String) -> Result<AppleFeedbackResult, AppleEngineError> {
         self.flag(event_uuid, |store, uuid| {
             sinus_app::flag::clear_flag(store, uuid)
+        })
+    }
+
+    /// Remove one feedback-derived Training unit. Feedback group ids are event
+    /// UUIDs, so this deliberately routes through the same Rust-owned Undo
+    /// policy as History instead of exposing either virtual classifier member.
+    pub fn remove_training_group(
+        &self,
+        group_id: String,
+    ) -> Result<AppleFeedbackResult, AppleEngineError> {
+        self.clear_flag(group_id)
+    }
+
+    /// Clear every canonical feedback document back to `none`, preserving all
+    /// guided Teach takes. The bulk policy returns its own aggregate because no
+    /// single updated event can represent the operation.
+    pub fn remove_all_feedback_training(
+        &self,
+    ) -> Result<AppleBulkFeedbackResult, AppleEngineError> {
+        let mut engine = self.lock()?;
+        let outcome = sinus_app::flag::clear_all_feedback(engine.store())?;
+        if outcome.classifier_changed {
+            engine.reload_enrollments()?;
+            #[cfg(test)]
+            self.feedback_reload_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(AppleBulkFeedbackResult {
+            groups_changed: outcome.groups_changed as u32,
+            classifier_changed: outcome.classifier_changed,
+            sync_required: outcome.sync_required,
         })
     }
 
@@ -937,6 +1091,11 @@ impl AppleEngine {
     pub fn training(&self) -> Result<TrainingSnapshot, AppleEngineError> {
         let store = self.reader()?;
         let (classes, negative_count) = sinus_app::teach::training_snapshot(&store)?;
+        let groups = store
+            .training_groups()?
+            .into_iter()
+            .map(TrainingGroup::from)
+            .collect();
         Ok(TrainingSnapshot {
             classes: classes
                 .into_iter()
@@ -947,6 +1106,7 @@ impl AppleEngine {
                 })
                 .collect(),
             negative_count: negative_count as u32,
+            groups,
         })
     }
 
@@ -1184,8 +1344,8 @@ impl AppleEngine {
         })
     }
 
-    /// Shared body of the three flagging methods: resolve the uuid, run `op`,
-    /// reload the matcher's prototypes if `op` actually trained anything, then
+    /// Shared body of the feedback methods: resolve the uuid, run `op`, reload
+    /// the matcher's prototypes whenever the classifier view changed, then
     /// re-read the event so the caller gets back exactly what changed.
     ///
     /// Everything happens under the writer lock and on the writer's connection,
@@ -1196,8 +1356,8 @@ impl AppleEngine {
     fn flag(
         &self,
         event_uuid: String,
-        op: impl FnOnce(&Store, &str) -> CoreResult<sinus_app::flag::FlagOutcome>,
-    ) -> Result<FlagResult, AppleEngineError> {
+        op: impl FnOnce(&Store, &str) -> CoreResult<sinus_app::flag::FeedbackOutcome>,
+    ) -> Result<AppleFeedbackResult, AppleEngineError> {
         let mut engine = self.lock()?;
         // Resolved here rather than left to `sinus_app::flag`, which reports a
         // missing uuid as `Error::Config` — the blanket `From<CoreError>` would
@@ -1207,11 +1367,13 @@ impl AppleEngine {
             return Err(AppleEngineError::NotFound { uuid: event_uuid });
         }
         let outcome = op(engine.store(), &event_uuid)?;
-        if outcome.trained {
-            // The running matcher's prototypes are built at load time; without this
-            // reload, the user reports a false positive and the very next identical
-            // sound still fires.
+        if outcome.classifier_changed {
+            // The running matcher's prototypes are built at load time. Insert,
+            // replacement and removal all make that cached view stale; in
+            // particular Undo must remove a veto before the next sound arrives.
             engine.reload_enrollments()?;
+            #[cfg(test)]
+            self.feedback_reload_count.fetch_add(1, Ordering::Relaxed);
         }
         let updated =
             engine
@@ -1220,9 +1382,13 @@ impl AppleEngine {
                 .ok_or_else(|| AppleEngineError::NotFound {
                     uuid: event_uuid.clone(),
                 })?;
-        Ok(FlagResult {
+        Ok(AppleFeedbackResult {
             event: updated.into(),
-            trained: outcome.trained,
+            event_changed: outcome.event_changed,
+            classifier_changed: outcome.classifier_changed,
+            sync_required: outcome.sync_required,
+            effect: outcome.training_effect.into(),
+            progress: outcome.progress.map(Into::into),
         })
     }
 
@@ -1825,7 +1991,20 @@ mod tests {
             result.event.corrected_to,
             Some(AppleEventType::Sniffle)
         ));
-        assert!(result.trained);
+        assert!(result.event_changed);
+        assert!(result.classifier_changed);
+        assert!(result.sync_required);
+        assert!(matches!(result.effect, AppleTrainingEffect::Applied));
+        assert!(matches!(
+            result.progress,
+            Some(AppleTrainingProgress {
+                event_type: AppleEventType::Sniffle,
+                positive_count: 1,
+                activation_threshold,
+            })
+                if activation_threshold
+                    == sinus_core::classify::proto::MIN_POSITIVE_EXAMPLES as u32
+        ));
 
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
@@ -1842,6 +2021,82 @@ mod tests {
 
         let restored = engine.clear_flag(event.uuid.clone()).unwrap();
         assert!(!restored.event.false_positive);
+        assert!(restored.event_changed);
+        assert!(restored.classifier_changed);
+        assert!(restored.sync_required);
+        assert!(matches!(restored.effect, AppleTrainingEffect::Removed));
+        assert!(restored.progress.is_none());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn feedback_insert_replacement_and_removal_each_reload_the_live_matcher() {
+        let (engine, dir) = temp_engine();
+        let event = emit_one_event(&engine, Utc::now());
+
+        let confirmed = engine.confirm_event(event.uuid.clone()).unwrap();
+        assert!(confirmed.classifier_changed);
+        assert!(matches!(confirmed.effect, AppleTrainingEffect::Applied));
+        assert_eq!(engine.feedback_reload_count.load(Ordering::Relaxed), 1);
+
+        let repeated = engine.confirm_event(event.uuid.clone()).unwrap();
+        assert!(!repeated.event_changed);
+        assert!(!repeated.classifier_changed);
+        assert!(!repeated.sync_required);
+        assert!(matches!(repeated.effect, AppleTrainingEffect::Unchanged));
+        assert_eq!(engine.feedback_reload_count.load(Ordering::Relaxed), 1);
+
+        let corrected = engine
+            .recharacterize(event.uuid.clone(), AppleEventType::Sniffle)
+            .unwrap();
+        assert!(corrected.classifier_changed);
+        assert!(matches!(corrected.effect, AppleTrainingEffect::Applied));
+        assert_eq!(engine.feedback_reload_count.load(Ordering::Relaxed), 2);
+
+        let removed = engine.clear_flag(event.uuid.clone()).unwrap();
+        assert!(removed.classifier_changed);
+        assert!(matches!(removed.effect, AppleTrainingEffect::Removed));
+        assert_eq!(engine.feedback_reload_count.load(Ordering::Relaxed), 3);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn training_groups_feedback_as_one_provenance_unit() {
+        let (engine, dir) = temp_engine();
+        let event = emit_one_event(&engine, Utc::now());
+
+        engine
+            .recharacterize(event.uuid.clone(), AppleEventType::Sniffle)
+            .unwrap();
+        let training = engine.training().unwrap();
+        assert_eq!(training.groups.len(), 1);
+        let group = &training.groups[0];
+        assert_eq!(group.group_id, event.uuid);
+        assert!(matches!(
+            group.provenance,
+            EnrollmentProvenance::CorrectedEvent
+        ));
+        assert!(matches!(group.event_type, AppleEventType::Sniffle));
+        assert!(matches!(
+            group.original_event_type,
+            Some(AppleEventType::Cough)
+        ));
+
+        let removed = engine.remove_training_group(event.uuid.clone()).unwrap();
+        assert!(removed.classifier_changed);
+        assert!(matches!(removed.effect, AppleTrainingEffect::Removed));
+        assert!(engine.training().unwrap().groups.is_empty());
+
+        engine.confirm_event(event.uuid.clone()).unwrap();
+        let cleared = engine.remove_all_feedback_training().unwrap();
+        assert_eq!(cleared.groups_changed, 1);
+        assert!(cleared.classifier_changed);
+        assert!(cleared.sync_required);
+        assert!(engine.training().unwrap().groups.is_empty());
 
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);

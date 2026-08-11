@@ -41,7 +41,7 @@ final class HistoryModel {
             let result = try engine.reportFalsePositive(eventUuid: event.uuid)
             refresh()
             let className = result.event.originalEventType.displayName
-            message = result.trained
+            message = result.classifierChanged
                 ? "Reported the \(className): it no longer counts here or in the PHR, and the detector will stop labelling that sound \(className)."
                 : "Reported the \(className): it no longer counts here or in the PHR. No embedding was stored for it, so the detector was not adjusted."
             onFlagged()

@@ -6,7 +6,7 @@
 //! the other) even though both read the same store.
 
 use sinus_core::classify::embed::Embedder;
-use sinus_core::classify::proto::{Enrollment, PrototypeMatcher};
+use sinus_core::classify::proto::PrototypeMatcher;
 use sinus_core::error::{Error, Result};
 use sinus_core::mel::loudest_patch;
 use sinus_core::pipeline::StreamingPipeline;
@@ -134,7 +134,11 @@ pub fn enroll_take<E: Embedder>(
         negative_scoped: false,
     })?;
 
-    let examples = store.enrollment_counts()?.get(&class).copied().unwrap_or(0) as usize;
+    let examples = store
+        .classifier_enrollment_counts()?
+        .get(&class)
+        .copied()
+        .unwrap_or(0) as usize;
 
     Ok(TeachResult {
         class,
@@ -149,11 +153,7 @@ pub fn enroll_take<E: Embedder>(
 /// every non-deleted enrollment in the store. `(-1.0, 0.0)` when no positive
 /// example of `class` is enrolled yet — there is nothing to compare against.
 pub fn score_embedding(store: &Store, class: EventType, embedding: &[f32]) -> Result<(f32, f32)> {
-    let all_enrollments: Vec<Enrollment> = store
-        .enrollments()?
-        .into_iter()
-        .map(|stored| stored.enrollment)
-        .collect();
+    let all_enrollments = store.classifier_enrollments()?;
     let has_same_class = all_enrollments
         .iter()
         .any(|example| example.class == class && !example.is_negative);
@@ -213,7 +213,10 @@ pub enum ClassStatus {
 /// the per-class badge and `training_snapshot` so the two cannot disagree
 /// about what counts as the newest take.
 pub fn class_status(takes: &[&StoredEnrollment]) -> ClassStatus {
-    let count = takes.len();
+    class_status_with_count(takes.len(), takes)
+}
+
+fn class_status_with_count(count: usize, guided_takes: &[&StoredEnrollment]) -> ClassStatus {
     if count == 0 {
         return ClassStatus::Untrained;
     }
@@ -222,7 +225,7 @@ pub fn class_status(takes: &[&StoredEnrollment]) -> ClassStatus {
             needed: MIN_TAKES - count,
         };
     }
-    let latest_good = takes.last().is_some_and(|latest| {
+    let latest_good = guided_takes.last().is_some_and(|latest| {
         latest
             .similarity
             .is_some_and(|value| value >= GOOD_SIMILARITY)
@@ -247,6 +250,8 @@ pub struct ClassTraining {
 /// status, plus the count of learned false-positive suppressions.
 pub fn training_snapshot(store: &Store) -> Result<(Vec<ClassTraining>, usize)> {
     let enrollments = store.enrollments()?;
+    let classifier_enrollments = store.classifier_enrollments()?;
+    let positive_counts = store.classifier_enrollment_counts()?;
     let mut classes = Vec::with_capacity(EventType::ALL.len());
     for class in EventType::ALL {
         let takes: Vec<StoredEnrollment> = enrollments
@@ -254,16 +259,19 @@ pub fn training_snapshot(store: &Store) -> Result<(Vec<ClassTraining>, usize)> {
             .filter(|stored| stored.enrollment.class == class && !stored.enrollment.is_negative)
             .cloned()
             .collect();
-        let status = class_status(&takes.iter().collect::<Vec<_>>());
+        let status = class_status_with_count(
+            positive_counts.get(&class).copied().unwrap_or(0) as usize,
+            &takes.iter().collect::<Vec<_>>(),
+        );
         classes.push(ClassTraining {
             class,
             status,
             takes,
         });
     }
-    let negative_count = enrollments
+    let negative_count = classifier_enrollments
         .iter()
-        .filter(|stored| stored.enrollment.is_negative)
+        .filter(|enrollment| enrollment.is_negative)
         .count();
     Ok((classes, negative_count))
 }
@@ -285,8 +293,17 @@ pub fn delete(store: &Store, what: Deletion) -> Result<usize> {
             Ok(1)
         }
         Deletion::Class(class) => store.delete_enrollments_for_class(class),
-        Deletion::Negatives => store.delete_negative_enrollments(),
-        Deletion::All => store.delete_all_enrollments(),
+        // Event feedback is one canonical unit. The legacy "forget reports"
+        // action must remove the whole unit rather than leaving a correction's
+        // positive half behind after deleting only its negative half.
+        Deletion::Negatives => {
+            let feedback = crate::flag::clear_all_feedback(store)?;
+            Ok(feedback.groups_changed + store.delete_negative_enrollments()?)
+        }
+        Deletion::All => {
+            let feedback = crate::flag::clear_all_feedback(store)?;
+            Ok(feedback.groups_changed + store.delete_all_enrollments()?)
+        }
     }
 }
 
