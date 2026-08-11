@@ -2367,6 +2367,10 @@ public struct AppleEvent: Equatable, Hashable {
     public let noiseFloorDbfs: Float?
     public let modelVersion: String
     public let falsePositive: Bool
+    /**
+     * True only when the PHR has the event and its latest flag/correction.
+     */
+    public let synced: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2376,7 +2380,10 @@ public struct AppleEvent: Equatable, Hashable {
          */originalEventType: AppleEventType,
         /**
          * What the user corrected the event to, if they did.
-         */correctedTo: AppleEventType?, occurredAtEpochMs: Int64, timezoneOffsetMinutes: Int32, durationMs: Int64, confidence: Float, burstCount: Int64, peakDbfs: Float?, meanDbfs: Float?, noiseFloorDbfs: Float?, modelVersion: String, falsePositive: Bool) {
+         */correctedTo: AppleEventType?, occurredAtEpochMs: Int64, timezoneOffsetMinutes: Int32, durationMs: Int64, confidence: Float, burstCount: Int64, peakDbfs: Float?, meanDbfs: Float?, noiseFloorDbfs: Float?, modelVersion: String, falsePositive: Bool,
+        /**
+         * True only when the PHR has the event and its latest flag/correction.
+         */synced: Bool) {
         self.uuid = uuid
         self.eventType = eventType
         self.originalEventType = originalEventType
@@ -2391,6 +2398,7 @@ public struct AppleEvent: Equatable, Hashable {
         self.noiseFloorDbfs = noiseFloorDbfs
         self.modelVersion = modelVersion
         self.falsePositive = falsePositive
+        self.synced = synced
     }
 
 
@@ -2422,7 +2430,8 @@ public struct FfiConverterTypeAppleEvent: FfiConverterRustBuffer {
                 meanDbfs: FfiConverterOptionFloat.read(from: &buf),
                 noiseFloorDbfs: FfiConverterOptionFloat.read(from: &buf),
                 modelVersion: FfiConverterString.read(from: &buf),
-                falsePositive: FfiConverterBool.read(from: &buf)
+                falsePositive: FfiConverterBool.read(from: &buf),
+                synced: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -2441,6 +2450,7 @@ public struct FfiConverterTypeAppleEvent: FfiConverterRustBuffer {
         FfiConverterOptionFloat.write(value.noiseFloorDbfs, into: &buf)
         FfiConverterString.write(value.modelVersion, into: &buf)
         FfiConverterBool.write(value.falsePositive, into: &buf)
+        FfiConverterBool.write(value.synced, into: &buf)
     }
 }
 

@@ -22,6 +22,10 @@ final class SyncModel {
     /// only rebuilds the controller when this is true.
     private(set) var isSuspended = false
 
+    /// Raised after each driver tick so projections containing per-row sync
+    /// state can replace pending indicators with confirmed ones.
+    var onStatusChanged: () -> Void = {}
+
     private var engine: AppleEngine?
     private var controller: SyncController?
     /// Kept so `resume()` can rebuild the controller without asking
@@ -84,7 +88,9 @@ final class SyncModel {
     private func buildController(engine: AppleEngine, tokens: TokenProvider) throws {
         let observer = SyncStatusBridge { [weak self] status in
             Task { @MainActor in
-                self?.status = status
+                guard let self else { return }
+                self.status = status
+                self.onStatusChanged()
             }
         }
         let controller = try SyncController(engine: engine, tokens: tokens, observer: observer)

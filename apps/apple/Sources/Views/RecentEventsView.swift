@@ -5,8 +5,11 @@ import SwiftUI
 struct RecentEventsView: View {
     @Environment(EngineHost.self) private var host
 
-    private var events: [AppleEvent] {
-        host.history.snapshot?.recentEvents ?? []
+    private func events(at date: Date) -> [AppleEvent] {
+        let cutoff = Int64(date.addingTimeInterval(-5 * 60).timeIntervalSince1970 * 1_000)
+        return (host.history.snapshot?.recentEvents ?? []).filter {
+            $0.occurredAtEpochMs >= cutoff
+        }
     }
 
     var body: some View {
@@ -19,12 +22,20 @@ struct RecentEventsView: View {
                     .foregroundStyle(.blue)
             }
 
-            if events.isEmpty {
-                Text("No recent events")
-                    .foregroundStyle(.secondary)
-            } else {
-                ForEach(events, id: \.uuid) { event in
-                    RecentEventRow(event: event)
+            TimelineView(.periodic(from: .now, by: 1)) { context in
+                let currentEvents = events(at: context.date)
+                if currentEvents.isEmpty {
+                    Text("No events in the last 5 minutes")
+                        .foregroundStyle(.secondary)
+                } else {
+                    ScrollView {
+                        LazyVStack(spacing: 0) {
+                            ForEach(currentEvents, id: \.uuid) { event in
+                                RecentEventRow(event: event)
+                            }
+                        }
+                    }
+                    .frame(height: min(CGFloat(currentEvents.count) * 48, 260))
                 }
             }
 
@@ -94,6 +105,16 @@ private struct RecentEventRow: View {
                 .opacity(event.falsePositive ? 0.6 : 1.0)
 
             Spacer()
+
+            Image(systemName: event.synced ? "cloud.fill" : "arrow.triangle.2.circlepath")
+                .foregroundStyle(event.synced ? .green : .secondary)
+                .frame(width: 18)
+                .help(
+                    event.synced
+                        ? "Uploaded to the PHR"
+                        : "Waiting to upload the event or its latest change"
+                )
+                .accessibilityLabel(event.synced ? "Uploaded" : "Upload pending")
 
             if !event.falsePositive {
                 Menu {

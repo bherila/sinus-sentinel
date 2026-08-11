@@ -142,6 +142,15 @@ pub struct PendingFlag {
     pub updated_at: String,
 }
 
+/// An event together with whether the PHR has both the event itself and the
+/// latest user edit to it. Keeping this projection beside the SQLite query
+/// avoids making UI shells infer sync truth from aggregate queue counts.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventWithSyncStatus {
+    pub event: Event,
+    pub synced: bool,
+}
+
 /// After this many server rejections an event stops being re-sent and is left for
 /// the history UI to surface (SPEC §4.3). Rejections are permanent verdicts, not
 /// transient failures, so re-sending forever is pointless.
@@ -635,6 +644,46 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<Event>> {
         self.events_in_range_inner(from, to, true, Some(limit))
+    }
+
+    /// The newest events plus their current PHR sync status. An event is only
+    /// current when its initial upload completed and, if it was subsequently
+    /// flagged or recharacterized, that latest mutation completed too.
+    pub fn recent_events_with_sync_status_limited(
+        &self,
+        from: DateTime<Utc>,
+        to: DateTime<Utc>,
+        limit: usize,
+    ) -> Result<Vec<EventWithSyncStatus>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT *,
+                    uploaded_at IS NOT NULL
+                    AND (
+                        flag_updated_at IS NULL
+                        OR (flag_synced_at IS NOT NULL AND flag_synced_at >= flag_updated_at)
+                    ) AS sync_current
+             FROM events
+             WHERE occurred_at >= ?1 AND occurred_at < ?2 AND deleted = 0
+             ORDER BY occurred_at DESC
+             LIMIT ?3",
+        )?;
+        let rows = stmt.query_map(
+            params![from.to_rfc3339(), to.to_rfc3339(), limit as i64],
+            |row| {
+                let Some(event) = Self::row_to_event(row)? else {
+                    return Ok(None);
+                };
+                Ok(Some(EventWithSyncStatus {
+                    event,
+                    synced: row.get::<_, i64>("sync_current")? != 0,
+                }))
+            },
+        )?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
     }
 
     fn events_in_range_inner(
@@ -1337,6 +1386,43 @@ mod tests {
         // Undo restores it to the counted set.
         store.clear_flag("fp").unwrap();
         assert_eq!(store.events_in_range(from, to).unwrap().len(), 3);
+    }
+
+    #[test]
+    fn recent_sync_status_waits_for_upload_and_latest_flag() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_event(&sample_event("event")).unwrap();
+        let from = Utc::now() - chrono::Duration::days(1);
+        let to = Utc::now() + chrono::Duration::days(1);
+
+        let recent = store
+            .recent_events_with_sync_status_limited(from, to, 10)
+            .unwrap();
+        assert!(!recent[0].synced, "a new event is still pending upload");
+
+        store
+            .mark_uploaded(&["event".to_string()], Utc::now())
+            .unwrap();
+        let recent = store
+            .recent_events_with_sync_status_limited(from, to, 10)
+            .unwrap();
+        assert!(recent[0].synced, "the initial upload is current");
+
+        store.recharacterize("event", EventType::NoseBlow).unwrap();
+        let pending = store.pending_flags(10).unwrap();
+        let recent = store
+            .recent_events_with_sync_status_limited(from, to, 10)
+            .unwrap();
+        assert!(
+            !recent[0].synced,
+            "a reclassification makes the row pending again"
+        );
+
+        store.mark_flags_synced(&pending).unwrap();
+        let recent = store
+            .recent_events_with_sync_status_limited(from, to, 10)
+            .unwrap();
+        assert!(recent[0].synced, "the latest edit reached the PHR");
     }
 
     #[test]

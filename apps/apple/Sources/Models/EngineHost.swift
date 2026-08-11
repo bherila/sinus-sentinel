@@ -30,6 +30,7 @@ final class EngineHost {
         // flag, and Swift did not. A hook rather than a reference to
         // `SyncModel`, so `HistoryModel` keeps not knowing what else exists.
         history.onFlagged = { [weak self] in self?.sync.syncNow() }
+        sync.onStatusChanged = { [weak history] in history?.refresh() }
         training.onTrainingChanged = { [weak self] in self?.sync.syncNow() }
         monitor.onCaptureStopped = { [weak training] in training?.cancelTake() }
 

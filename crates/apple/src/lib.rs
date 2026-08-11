@@ -315,10 +315,21 @@ pub struct AppleEvent {
     pub noise_floor_dbfs: Option<f32>,
     pub model_version: String,
     pub false_positive: bool,
+    /// True only when the PHR has the event and its latest flag/correction.
+    pub synced: bool,
 }
 
 impl From<Event> for AppleEvent {
     fn from(value: Event) -> Self {
+        // Direct conversions are newly-created or freshly-mutated events. The
+        // history projection is the only path that has enough SQLite metadata
+        // to prove the latest state reached the PHR.
+        Self::from_event_and_sync_status(value, false)
+    }
+}
+
+impl AppleEvent {
+    fn from_event_and_sync_status(value: Event, synced: bool) -> Self {
         let event_type = value.effective_type().into();
         let original_event_type = value.event_type.into();
         let corrected_to = value.corrected_to.map(Into::into);
@@ -337,6 +348,7 @@ impl From<Event> for AppleEvent {
             noise_floor_dbfs: value.noise_floor_dbfs,
             model_version: value.model_version,
             false_positive: value.false_positive_at.is_some(),
+            synced,
         }
     }
 }
@@ -622,6 +634,7 @@ pub struct EngineStatus {
 /// How many events the "recent" list carries across the FFI boundary. The UI
 /// shows a handful; fetching a whole week would copy every row on every refresh.
 const RECENT_EVENT_LIMIT: usize = 50;
+const RECENT_EVENT_WINDOW: chrono::Duration = chrono::Duration::minutes(5);
 
 #[derive(uniffi::Object)]
 pub struct AppleEngine {
@@ -799,13 +812,13 @@ impl AppleEngine {
             timezone_offset_minutes,
         );
         let recent_events = store
-            .recent_events_limited(
-                now - chrono::Duration::days(days as i64),
+            .recent_events_with_sync_status_limited(
+                now - RECENT_EVENT_WINDOW,
                 now,
                 RECENT_EVENT_LIMIT,
             )?
             .into_iter()
-            .map(AppleEvent::from)
+            .map(|stored| AppleEvent::from_event_and_sync_status(stored.event, stored.synced))
             .collect();
         let monitored_hours = (now
             - sinus_app::state::local_midnight_at_offset(now, timezone_offset_minutes))
@@ -1676,7 +1689,11 @@ mod tests {
 
         assert!(matches!(event.event_type, AppleEventType::Cough));
         let history = engine
-            .history(7, (now + chrono::Duration::hours(1)).timestamp_millis(), 0)
+            .history(
+                7,
+                (now + chrono::Duration::minutes(1)).timestamp_millis(),
+                0,
+            )
             .unwrap();
         assert_eq!(
             history
@@ -1688,6 +1705,35 @@ mod tests {
             1
         );
         assert_eq!(history.recent_events.len(), 1);
+        assert!(!history.recent_events[0].synced);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn history_recent_list_only_keeps_the_last_five_minutes() {
+        let (engine, dir) = temp_engine();
+        let occurred_at = Utc::now();
+        emit_one_event(&engine, occurred_at);
+
+        let inside = engine
+            .history(
+                7,
+                (occurred_at + chrono::Duration::minutes(4)).timestamp_millis(),
+                0,
+            )
+            .unwrap();
+        assert_eq!(inside.recent_events.len(), 1);
+
+        let expired = engine
+            .history(
+                7,
+                (occurred_at + chrono::Duration::minutes(6)).timestamp_millis(),
+                0,
+            )
+            .unwrap();
+        assert!(expired.recent_events.is_empty());
 
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
