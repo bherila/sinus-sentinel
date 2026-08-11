@@ -734,7 +734,7 @@ mod tests {
     }
 
     #[test]
-    fn frequent_bursts_do_not_become_the_room() {
+    fn repeated_foreground_bursts_do_not_become_ambient() {
         let cfg = GateConfig::default();
         let mut gate = Gate::new(cfg.clone());
         let hop = cfg.hop_samples();
@@ -764,7 +764,7 @@ mod tests {
     }
 
     #[test]
-    fn ambient_floor_recovers_quickly_without_rebounding_after_a_fan_stops() {
+    fn ambient_floor_recovers_after_sustained_background_stops() {
         let cfg = GateConfig::default();
         let mut gate = Gate::new(cfg.clone());
         let hop = cfg.hop_samples();
