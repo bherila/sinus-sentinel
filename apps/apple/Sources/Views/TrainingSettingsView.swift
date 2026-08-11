@@ -12,7 +12,8 @@ struct TrainingSettingsView: View {
     private enum PendingDeletion: Equatable {
         case one(id: Int64, eventType: AppleEventType)
         case classAll(AppleEventType)
-        case negatives
+        case group(TrainingGroup)
+        case allFeedback
         case all
     }
 
@@ -69,19 +70,37 @@ struct TrainingSettingsView: View {
                 }
             }
 
-            if let snapshot, snapshot.negativeCount > 0 {
-                Section {
-                    HStack {
-                        Text(
-                            "\(snapshot.negativeCount) reported false positive\(snapshot.negativeCount == 1 ? " is" : "s are") teaching the detector what to ignore."
-                        )
-                        Spacer()
-                        Button("Forget reports") {
-                            pendingDeletion = .negatives
+            // Guided takes are already listed per class above; this section is
+            // only for training that feedback on a Recent event — not a
+            // deliberate Teach-mode recording — produced.
+            let feedbackGroups = (snapshot?.groups ?? []).filter { $0.provenance != .guidedTake }
+
+            Section("From your feedback") {
+                if feedbackGroups.isEmpty {
+                    Text("No feedback yet — confirming, correcting, or reporting an event in Recent adds training here.")
+                        .font(.footnote)
+                        .foregroundStyle(.secondary)
+                } else {
+                    ForEach(feedbackGroups, id: \.groupId) { group in
+                        HStack {
+                            Text("\(feedbackDescription(group)) • \(formattedTakeTime(group.createdAt))")
+                            Spacer()
+                            syncIndicator(group.synced)
+                            Button("Remove") {
+                                pendingDeletion = .group(group)
+                            }
+                            .disabled(busy)
                         }
-                        .disabled(busy)
+                        .font(.footnote)
                     }
                 }
+            }
+
+            Section {
+                Button("Remove all feedback training") {
+                    pendingDeletion = .allFeedback
+                }
+                .disabled(busy || feedbackGroups.isEmpty)
             }
 
             Section {
@@ -143,7 +162,7 @@ struct TrainingSettingsView: View {
 
     private func hasAnyTraining(_ snapshot: TrainingSnapshot?) -> Bool {
         guard let snapshot else { return false }
-        return snapshot.classes.contains { !$0.takes.isEmpty } || snapshot.negativeCount > 0
+        return snapshot.classes.contains { !$0.takes.isEmpty } || !snapshot.groups.isEmpty
     }
 
     private func statusText(_ status: TrainingStatus, count: Int) -> String {
@@ -161,8 +180,10 @@ struct TrainingSettingsView: View {
             "Remove this \(eventType.displayName) take?"
         case .classAll(let eventType):
             "Reset every \(eventType.displayName) take?"
-        case .negatives:
-            "Forget every reported false positive? Previously suppressed sounds may be detected again."
+        case .group(let group):
+            "Remove this \(group.eventType.displayName) feedback training?"
+        case .allFeedback:
+            "Remove all feedback-derived training? Previously confirmed, corrected, or reported sounds may be detected differently again."
         case .all:
             "Reset every saved Teach-mode take?"
         }
@@ -174,11 +195,43 @@ struct TrainingSettingsView: View {
             training.deleteTake(id: id)
         case .classAll(let eventType):
             training.deleteClass(eventType)
-        case .negatives:
-            training.deleteLearnedSuppressions()
+        case .group(let group):
+            training.removeTrainingGroup(group)
+        case .allFeedback:
+            training.removeAllFeedbackTraining()
         case .all:
             training.deleteAllTraining()
         }
+    }
+
+    /// Guided takes never reach this — the per-class list above already
+    /// shows them — so every case here is feedback recorded from a Recent
+    /// event rather than a deliberate Teach-mode recording.
+    private func feedbackDescription(_ group: TrainingGroup) -> String {
+        switch group.provenance {
+        case .guidedTake:
+            "Guided take"
+        case .confirmedEvent:
+            "Confirmed \(group.eventType.displayName.lowercased())"
+        case .correctedEvent:
+            if let original = group.originalEventType {
+                "Corrected to \(group.eventType.displayName.lowercased()) (was \(original.displayName.lowercased()))"
+            } else {
+                "Corrected to \(group.eventType.displayName.lowercased())"
+            }
+        case .falsePositiveSuppression:
+            "Not-an-event report for \(group.eventType.displayName.lowercased())"
+        }
+    }
+
+    /// Mirrors the sync glyph `RecentEventsView` renders per event, so the
+    /// same cloud/pending distinction reads the same way in both places.
+    @ViewBuilder
+    private func syncIndicator(_ synced: Bool) -> some View {
+        Image(systemName: synced ? "cloud.fill" : "arrow.triangle.2.circlepath")
+            .foregroundStyle(synced ? .green : .secondary)
+            .help(synced ? "Uploaded to the PHR" : "Waiting to upload the event or its latest change")
+            .accessibilityLabel(synced ? "Uploaded" : "Upload pending")
     }
 
     private func formattedTakeTime(_ createdAt: String) -> String {
