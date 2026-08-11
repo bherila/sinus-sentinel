@@ -761,7 +761,8 @@ mod tests {
             0.05,
         );
         let pipeline = Pipeline::new(PipelineConfig::default(), embedder).with_prototypes(matcher);
-        let signal = synth::sine(16_000 * 2, 16_000, 500.0, 0.8);
+        let mut signal = synth::white_noise(16_000, 0.003, 101);
+        signal.extend(synth::sine(16_000 * 2, 16_000, 500.0, 0.8));
         let result = pipeline.process(&signal).unwrap();
         assert!(!result.events.is_empty());
         assert!(result
@@ -796,7 +797,8 @@ mod tests {
             0.05,
         );
         let pipeline = Pipeline::new(PipelineConfig::default(), embedder).with_prototypes(matcher);
-        let signal = synth::sine(16_000 * 2, 16_000, 500.0, 0.8);
+        let mut signal = synth::white_noise(16_000, 0.003, 102);
+        signal.extend(synth::sine(16_000 * 2, 16_000, 500.0, 0.8));
         let result = pipeline.process(&signal).unwrap();
         assert!(result.events.is_empty());
     }
@@ -816,7 +818,8 @@ mod tests {
             },
             version: "test".to_string(),
         };
-        let signal = synth::sine(16_000 * 2, 16_000, 500.0, 0.8);
+        let mut signal = synth::white_noise(16_000, 0.003, 103);
+        signal.extend(synth::sine(16_000 * 2, 16_000, 500.0, 0.8));
 
         // Without the negative the native path fires…
         let baseline = Pipeline::new(PipelineConfig::default(), embedder())
