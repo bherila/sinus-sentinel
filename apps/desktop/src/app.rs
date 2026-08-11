@@ -83,6 +83,20 @@ impl TrayState {
     }
 }
 
+/// The tray decision, free of `App`'s eframe plumbing so tests can pin the
+/// priority order without constructing an `eframe::CreationContext`.
+fn tray_state(mode: Mode, paused: bool, shared: &SharedStatus) -> TrayState {
+    // A missing model (fail-soft fallback in the capture thread) is a warning
+    // state (SPEC §6 tray "⚠"), shown ahead of the plain listening glyph.
+    match mode {
+        Mode::OfflineStrict => TrayState::Offline,
+        _ if paused || shared.low_power() || shared.quiet() => TrayState::Paused,
+        _ if shared.model() == ModelStatus::Missing => TrayState::Warning,
+        _ if shared.calibrating() => TrayState::Calibrating,
+        _ => TrayState::Listening,
+    }
+}
+
 /// A pending action from the recent-events list, applied after the row loop so
 /// the store is not mutated while it is being iterated.
 enum HistoryAction {
@@ -431,17 +445,7 @@ impl SinusApp {
     fn current_tray_state(&mut self) -> TrayState {
         let now = Utc::now();
         self.pause = self.pause.normalized(now);
-        // A missing model (fail-soft fallback in the capture thread) is a warning
-        // state (SPEC §6 tray "⚠"), shown ahead of the plain listening glyph.
-        match self.mode {
-            Mode::OfflineStrict => TrayState::Offline,
-            _ if self.pause.is_paused(now) || self.shared.low_power() || self.shared.quiet() => {
-                TrayState::Paused
-            }
-            _ if self.shared.model() == ModelStatus::Missing => TrayState::Warning,
-            _ if self.shared.calibrating() => TrayState::Calibrating,
-            _ => TrayState::Listening,
-        }
+        tray_state(self.mode, self.pause.is_paused(now), &self.shared)
     }
 
     #[cfg(not(test))]
@@ -1289,4 +1293,52 @@ fn status_icon(rgb: [u8; 3]) -> tray_icon::Icon {
         }
     }
     tray_icon::Icon::from_rgba(rgba, size as u32, size as u32).expect("valid rgba icon")
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    #[test]
+    fn calibrating_is_shown_while_otherwise_listening() {
+        let shared = SharedStatus::default();
+        shared.set_calibrating(true);
+        assert_eq!(
+            tray_state(Mode::AutoBatch, false, &shared),
+            TrayState::Calibrating
+        );
+        shared.set_calibrating(false);
+        assert_eq!(
+            tray_state(Mode::AutoBatch, false, &shared),
+            TrayState::Listening
+        );
+    }
+
+    #[test]
+    fn calibration_never_masks_a_higher_priority_state() {
+        // The blind interval matters only if the app would otherwise look
+        // active; offline, paused, and a missing model all already say the app
+        // is not listening normally, so they keep precedence.
+        let shared = SharedStatus::default();
+        shared.set_calibrating(true);
+        assert_eq!(
+            tray_state(Mode::OfflineStrict, false, &shared),
+            TrayState::Offline
+        );
+        assert_eq!(
+            tray_state(Mode::AutoBatch, true, &shared),
+            TrayState::Paused
+        );
+        shared.set_low_power(true);
+        assert_eq!(
+            tray_state(Mode::AutoBatch, false, &shared),
+            TrayState::Paused
+        );
+        shared.set_low_power(false);
+        shared.set_model(ModelStatus::Missing);
+        assert_eq!(
+            tray_state(Mode::AutoBatch, false, &shared),
+            TrayState::Warning
+        );
+    }
 }
