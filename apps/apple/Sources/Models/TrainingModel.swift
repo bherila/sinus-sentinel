@@ -31,11 +31,11 @@ final class TrainingModel {
     /// next pull.
     var onTrainingChanged: () -> Void = {}
 
-    private var engine: AppleEngine?
+    private var engine: TrainingEngineProtocol?
     private var audio: AudioMonitoringService?
     private var recorder: TakeRecorder?
 
-    func attach(engine: AppleEngine, audio: AudioMonitoringService, modelReady: Bool) {
+    func attach(engine: TrainingEngineProtocol, audio: AudioMonitoringService, modelReady: Bool) {
         self.engine = engine
         self.audio = audio
         self.modelReady = modelReady
@@ -159,7 +159,40 @@ final class TrainingModel {
         onTrainingChanged()
     }
 
-    private func finishTake(engine: AppleEngine, eventType: AppleEventType, samples: [Float]) {
+    /// Remove one Training group — the per-row action. Unlike the legacy
+    /// delete* functions above, the result says whether a sync is actually
+    /// needed, so this does not call `onTrainingChanged()` unconditionally.
+    func removeTrainingGroup(_ group: TrainingGroup) {
+        guard let engine else { return }
+        do {
+            let result = try engine.removeTrainingGroup(groupId: group.groupId)
+            message = FeedbackMessageFormatter.groupRemovalMessage(result: result)
+            refresh()
+            if result.syncRequired {
+                onTrainingChanged()
+            }
+        } catch {
+            message = "Could not update training: \(error.localizedDescription)"
+        }
+    }
+
+    /// Clear every canonical feedback document, keeping guided Teach takes.
+    /// See `removeTrainingGroup` for why the sync hook is conditional here.
+    func removeAllFeedbackTraining() {
+        guard let engine else { return }
+        do {
+            let result = try engine.removeAllFeedbackTraining()
+            message = FeedbackMessageFormatter.bulkRemovalMessage(result: result)
+            refresh()
+            if result.syncRequired {
+                onTrainingChanged()
+            }
+        } catch {
+            message = "Could not update training: \(error.localizedDescription)"
+        }
+    }
+
+    private func finishTake(engine: TrainingEngineProtocol, eventType: AppleEventType, samples: [Float]) {
         audio?.onSamples = nil
         recorder = nil
 
@@ -177,7 +210,10 @@ final class TrainingModel {
         }
     }
 
-    private func handleSaved(_ result: TeachResult) {
+    /// Not `private`: tests drive it directly rather than through the whole
+    /// `recordTake` → `TakeRecorder` → `finishTake` pipeline, which needs a
+    /// live microphone.
+    func handleSaved(_ result: TeachResult) {
         phase = .saved
         recordingClass = result.eventType
         let className = result.eventType.displayName
@@ -188,6 +224,10 @@ final class TrainingModel {
             message = "Saved \(className) sample #\(result.examples) — repeat similarity \(String(format: "%.2f", result.similarity)), class separation \(String(format: "%+.2f", result.separation)): \(verdict)."
         }
         refresh()
+        // A new take is a durable outbound change — the PHR does not have it
+        // yet, and, unlike a delete, there is no future pull that would
+        // reintroduce it locally if the sync never happens.
+        onTrainingChanged()
     }
 
     private func handleFailed(eventType: AppleEventType, error: Error) {

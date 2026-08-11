@@ -6,18 +6,21 @@ import SinusAppleFFI
 @Observable
 final class HistoryModel {
     private(set) var snapshot: HistorySnapshot?
-    /// Result of the last report/recharacterize/undo, for the History window to
-    /// render under the list — mirrors `app.rs`'s `history_message`.
+    /// Result of the last report/confirm/recharacterize/undo, for the History
+    /// window to render under the list — mirrors `app.rs`'s `history_message`.
     private(set) var message: String?
 
     var onError: (String?) -> Void = { _ in }
-    /// Raised after a flag operation actually changes something, so the host
-    /// can request a sync without this model knowing `SyncModel` exists.
-    var onFlagged: () -> Void = {}
+    /// Raised only when a feedback operation actually requires a sync, so the
+    /// host can request one without this model knowing `SyncModel` exists.
+    /// Distinct from `eventChanged`/`classifierChanged`: a confirm with no
+    /// embedding, for instance, changes nothing that needs to leave the
+    /// device, so this must not fire for it.
+    var onSyncRequired: () -> Void = {}
 
-    private var engine: AppleEngine?
+    private var engine: HistoryEngineProtocol?
 
-    func attach(engine: AppleEngine) {
+    func attach(engine: HistoryEngineProtocol) {
         self.engine = engine
     }
 
@@ -39,20 +42,32 @@ final class HistoryModel {
         guard let engine else { return }
         do {
             let result = try engine.reportFalsePositive(eventUuid: event.uuid)
-            refresh()
-            let className = result.event.originalEventType.displayName
-            message = result.classifierChanged
-                ? "Reported the \(className): it no longer counts here or in the PHR, and the detector will stop labelling that sound \(className)."
-                : "Reported the \(className): it no longer counts here or in the PHR. No embedding was stored for it, so the detector was not adjusted."
-            onFlagged()
+            apply(result, action: .report, originalClass: event.eventType.displayName, targetClass: nil)
+        } catch AppleEngineError.NotFound(_) {
+            reportStale()
         } catch {
             message = "Could not flag the event: \(error.localizedDescription)"
         }
     }
 
-    /// Record what a misdetected sound actually was. Choosing the classifier's
-    /// original answer is an undo, not a correction — routed to `clearFlag`
-    /// exactly as `app.rs:290-293` does, so the undo message is written once.
+    /// Confirm that the detector's current effective label was correct.
+    func confirm(_ event: AppleEvent) {
+        guard let engine else { return }
+        do {
+            let result = try engine.confirmEvent(eventUuid: event.uuid)
+            apply(result, action: .confirm, originalClass: event.eventType.displayName, targetClass: nil)
+        } catch AppleEngineError.NotFound(_) {
+            reportStale()
+        } catch {
+            message = "Could not confirm the event: \(error.localizedDescription)"
+        }
+    }
+
+    /// Record what a misdetected sound actually was. Choosing the class the
+    /// detector originally recorded is an undo, not a correction — the same
+    /// rule `sinus_app::flag::recharacterize` applies — and routing it to
+    /// `clearFlag` here, as `app.rs:315-320` does, keeps the undo message
+    /// written once instead of a "Corrected to…" that actually restored.
     func recharacterize(_ event: AppleEvent, to corrected: AppleEventType) {
         if corrected == event.originalEventType {
             clearFlag(event)
@@ -60,12 +75,10 @@ final class HistoryModel {
         }
         guard let engine else { return }
         do {
-            _ = try engine.recharacterize(eventUuid: event.uuid, corrected: corrected)
-            refresh()
-            let was = event.originalEventType.displayName
-            let now = corrected.displayName
-            message = "Recorded as \(now) instead of \(was) — it now counts as \(now) here and in the PHR, and the detector will stop calling that sound \(was). Teach \(now) a few more times for it to be recognised on its own."
-            onFlagged()
+            let result = try engine.recharacterize(eventUuid: event.uuid, corrected: corrected)
+            apply(result, action: .correct, originalClass: event.eventType.displayName, targetClass: corrected.displayName)
+        } catch AppleEngineError.NotFound(_) {
+            reportStale()
         } catch {
             message = "Could not update the event: \(error.localizedDescription)"
         }
@@ -76,13 +89,41 @@ final class HistoryModel {
     func clearFlag(_ event: AppleEvent) {
         guard let engine else { return }
         do {
-            _ = try engine.clearFlag(eventUuid: event.uuid)
-            refresh()
-            message = "Restored the event here and in the PHR. Any training it produced is kept — use Settings › Teach mode to remove that too."
-            onFlagged()
+            let result = try engine.clearFlag(eventUuid: event.uuid)
+            apply(result, action: .undo, originalClass: event.eventType.displayName, targetClass: nil)
+        } catch AppleEngineError.NotFound(_) {
+            reportStale()
         } catch {
             message = "Could not restore the event: \(error.localizedDescription)"
         }
+    }
+
+    /// Common tail of every feedback action: format the message, refresh the
+    /// list only when the row actually changed, and ask for a sync only when
+    /// one is actually required. `classifierChanged` needs nothing here —
+    /// matcher reload is Rust-internal.
+    private func apply(_ result: AppleFeedbackResult, action: FeedbackAction, originalClass: String, targetClass: String?) {
+        message = FeedbackMessageFormatter.message(
+            action: action,
+            result: result,
+            originalClass: originalClass,
+            targetClass: targetClass
+        )
+        if result.eventChanged {
+            refresh()
+        }
+        if result.syncRequired {
+            onSyncRequired()
+        }
+    }
+
+    /// The uuid a feedback call was given no longer resolves to a row — a
+    /// stale list, or a row the PHR sync removed between render and tap.
+    /// Refresh anyway so that stale row disappears instead of sitting there
+    /// looking actionable.
+    private func reportStale() {
+        message = "That event is no longer on this device."
+        refresh()
     }
 
     private static var nowMilliseconds: Int64 {

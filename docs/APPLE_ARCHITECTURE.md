@@ -267,17 +267,21 @@ On a Mac:
 ```bash
 make apple-ios-run       # or apple-ios-build
 make apple-macos-run     # or apple-macos-build
+make apple-test          # no-XCTest model-layer tests, apps/apple/Tests/
 ```
 
-Both commands compile Rust first, generate bindings from that exact binary, and
-then invoke Swift. There is no stale/prebuilt library fallback.
+Both build commands compile Rust first, generate bindings from that exact
+binary, and then invoke Swift. There is no stale/prebuilt library fallback.
+`apple-test` does the same, then compiles `apps/apple/Tests/` — a curated
+subset of `Sources/Models/` plus a plain `swiftc`-driven top-level-code binary,
+no Xcode project or XCTest bundle required — and runs it.
 
 The iOS half needs a full Xcode with an iOS 17+ Simulator runtime, not just the
 Command Line Tools: without one, `xcrun --sdk iphonesimulator` cannot resolve an
 SDK and `make apple-ios-build` fails before it reaches any Swift. A Mac with
 Command Line Tools only can still build and run the macOS shell, and CI's
-`apple-native` job builds both — so an iOS-only compile error is caught there
-rather than locally.
+`apple-native` job builds both, plus `apple-test` — so an iOS-only compile
+error is caught there rather than locally.
 
 On Linux:
 

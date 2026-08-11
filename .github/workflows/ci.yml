@@ -67,6 +67,7 @@ jobs:
       - uses: Swatinem/rust-cache@v2
       - run: make apple-ios-build
       - run: make apple-macos-build
+      - run: make apple-test
 
   # cpal live capture + the egui/tray desktop shell need a display/audio stack
   # that the Linux runner lacks, so build them only on macOS and Windows.

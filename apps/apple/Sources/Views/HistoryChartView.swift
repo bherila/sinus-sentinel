@@ -63,18 +63,6 @@ private struct HistoryPoint: Identifiable {
 }
 
 extension AppleEventType {
-    var displayName: String {
-        switch self {
-        case .cough: "Cough"
-        case .throatClearing: "Throat clearing"
-        case .sniffle: "Sniffle"
-        case .sneeze: "Sneeze"
-        case .noseBlow: "Nose blow"
-        case .hawk: "Hawk"
-        case .snortSuck: "Snort / suck"
-        }
-    }
-
     /// Bound to the class, not derived from the data — see the fixed
     /// `chartForegroundStyleScale` domain above.
     var color: Color {

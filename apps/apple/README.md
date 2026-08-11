@@ -50,6 +50,12 @@ make apple-macos-run
 Generated files under `Generated/` are committed so the API is reviewable and
 Linux CI can fail if Rust metadata and Swift bindings drift.
 
+Model-layer tests (no XCTest, no Simulator) are:
+
+```bash
+make apple-test
+```
+
 ## Model
 
 The Swift `ModelRunner` trait is called only when Rust's energy gate marks a
@@ -94,4 +100,6 @@ policy. See [the architecture notes](../../docs/APPLE_ARCHITECTURE.md#battery-po
 - measure real battery draw on a physical iPhone and Apple-silicon Mac, including
   the Low Power Mode transition;
 - validate the declared background-audio use with App Review requirements;
-- add signing, provisioning, XCTest/UI tests, and distributable XCFrameworks.
+- add signing, provisioning, UI tests, and distributable XCFrameworks. Model-layer
+  tests already exist and need neither an Xcode project nor an XCTest bundle —
+  see `make apple-test`.
