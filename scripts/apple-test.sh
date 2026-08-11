@@ -47,6 +47,7 @@ model_sources=(
   "$source_root/Models/FeedbackMessageFormatter.swift"
   "$source_root/Models/ConnectionCheckMessage.swift"
   "$source_root/Models/ServerUrlNormalizer.swift"
+  "$source_root/Models/DevicePairing.swift"
   "$source_root/Models/EventTypeDisplay.swift"
   "$source_root/Models/HistoryEngineProtocol.swift"
   "$source_root/Models/HistoryModel.swift"
