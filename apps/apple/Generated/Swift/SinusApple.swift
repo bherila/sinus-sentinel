@@ -737,11 +737,14 @@ public protocol AppleEngineProtocol: AnyObject, Sendable {
     func removeAllFeedbackTraining() throws  -> AppleBulkFeedbackResult
 
     /**
-     * Remove one feedback-derived Training unit. Feedback group ids are event
-     * UUIDs, so this deliberately routes through the same Rust-owned Undo
-     * policy as History instead of exposing either virtual classifier member.
+     * Remove one Training group by the id `training_groups` gave it:
+     * `guided:{id}` for a physical Teach take, or an event uuid for canonical
+     * feedback. Policy for telling the two apart lives in
+     * `sinus_app::flag::remove_training_group` rather than here, so this is
+     * the same Rust-owned mapping every shell gets instead of exposing either
+     * virtual classifier member to Swift.
      */
-    func removeTrainingGroup(groupId: String) throws  -> AppleFeedbackResult
+    func removeTrainingGroup(groupId: String) throws  -> AppleBulkFeedbackResult
 
     /**
      * Report a misdetection: the event stops counting here and in the PHR, and,
@@ -1120,12 +1123,15 @@ open func removeAllFeedbackTraining()throws  -> AppleBulkFeedbackResult  {
 }
 
     /**
-     * Remove one feedback-derived Training unit. Feedback group ids are event
-     * UUIDs, so this deliberately routes through the same Rust-owned Undo
-     * policy as History instead of exposing either virtual classifier member.
+     * Remove one Training group by the id `training_groups` gave it:
+     * `guided:{id}` for a physical Teach take, or an event uuid for canonical
+     * feedback. Policy for telling the two apart lives in
+     * `sinus_app::flag::remove_training_group` rather than here, so this is
+     * the same Rust-owned mapping every shell gets instead of exposing either
+     * virtual classifier member to Swift.
      */
-open func removeTrainingGroup(groupId: String)throws  -> AppleFeedbackResult  {
-    return try  FfiConverterTypeAppleFeedbackResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
+open func removeTrainingGroup(groupId: String)throws  -> AppleBulkFeedbackResult  {
+    return try  FfiConverterTypeAppleBulkFeedbackResult_lift(try rustCallWithError(FfiConverterTypeAppleEngineError_lift) {
         uniffiCallStatus in
     uniffi_sinus_apple_fn_method_appleengine_remove_training_group(
             self.uniffiCloneHandle(),
@@ -2497,6 +2503,12 @@ public struct AppleEvent: Equatable, Hashable {
      * True only when the PHR has the event and its latest flag/correction.
      */
     public let synced: Bool
+    /**
+     * True once the user has explicitly confirmed the detector's current
+     * effective label. Distinguishes a confirmed event from an untouched one
+     * so a UI can render a confirmed badge and offer Undo on either.
+     */
+    public let confirmed: Bool
 
     // Default memberwise initializers are never public by default, so we
     // declare one manually.
@@ -2509,7 +2521,12 @@ public struct AppleEvent: Equatable, Hashable {
          */correctedTo: AppleEventType?, occurredAtEpochMs: Int64, timezoneOffsetMinutes: Int32, durationMs: Int64, confidence: Float, burstCount: Int64, peakDbfs: Float?, meanDbfs: Float?, noiseFloorDbfs: Float?, modelVersion: String, falsePositive: Bool,
         /**
          * True only when the PHR has the event and its latest flag/correction.
-         */synced: Bool) {
+         */synced: Bool,
+        /**
+         * True once the user has explicitly confirmed the detector's current
+         * effective label. Distinguishes a confirmed event from an untouched one
+         * so a UI can render a confirmed badge and offer Undo on either.
+         */confirmed: Bool) {
         self.uuid = uuid
         self.eventType = eventType
         self.originalEventType = originalEventType
@@ -2525,6 +2542,7 @@ public struct AppleEvent: Equatable, Hashable {
         self.modelVersion = modelVersion
         self.falsePositive = falsePositive
         self.synced = synced
+        self.confirmed = confirmed
     }
 
 
@@ -2557,7 +2575,8 @@ public struct FfiConverterTypeAppleEvent: FfiConverterRustBuffer {
                 noiseFloorDbfs: FfiConverterOptionFloat.read(from: &buf),
                 modelVersion: FfiConverterString.read(from: &buf),
                 falsePositive: FfiConverterBool.read(from: &buf),
-                synced: FfiConverterBool.read(from: &buf)
+                synced: FfiConverterBool.read(from: &buf),
+                confirmed: FfiConverterBool.read(from: &buf)
         )
     }
 
@@ -2577,6 +2596,7 @@ public struct FfiConverterTypeAppleEvent: FfiConverterRustBuffer {
         FfiConverterString.write(value.modelVersion, into: &buf)
         FfiConverterBool.write(value.falsePositive, into: &buf)
         FfiConverterBool.write(value.synced, into: &buf)
+        FfiConverterBool.write(value.confirmed, into: &buf)
     }
 }
 
@@ -5254,7 +5274,7 @@ private let initializationResult: InitializationResult = {
     if (uniffi_sinus_apple_checksum_method_appleengine_remove_all_feedback_training() != 33179) {
         return InitializationResult.apiChecksumMismatch
     }
-    if (uniffi_sinus_apple_checksum_method_appleengine_remove_training_group() != 62340) {
+    if (uniffi_sinus_apple_checksum_method_appleengine_remove_training_group() != 23961) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_appleengine_report_false_positive() != 32853) {

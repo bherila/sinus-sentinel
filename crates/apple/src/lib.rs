@@ -319,19 +319,25 @@ pub struct AppleEvent {
     pub false_positive: bool,
     /// True only when the PHR has the event and its latest flag/correction.
     pub synced: bool,
+    /// True once the user has explicitly confirmed the detector's current
+    /// effective label. Distinguishes a confirmed event from an untouched one
+    /// so a UI can render a confirmed badge and offer Undo on either.
+    pub confirmed: bool,
 }
 
 impl From<Event> for AppleEvent {
     fn from(value: Event) -> Self {
-        // Direct conversions are newly-created or freshly-mutated events. The
+        // Direct conversions are newly-created events, which cannot yet carry
+        // feedback, and freshly-mutated ones, whose callers compute `confirmed`
+        // themselves and go through `from_event_and_sync_status` directly. The
         // history projection is the only path that has enough SQLite metadata
         // to prove the latest state reached the PHR.
-        Self::from_event_and_sync_status(value, false)
+        Self::from_event_and_sync_status(value, false, false)
     }
 }
 
 impl AppleEvent {
-    fn from_event_and_sync_status(value: Event, synced: bool) -> Self {
+    fn from_event_and_sync_status(value: Event, synced: bool, confirmed: bool) -> Self {
         let event_type = value.effective_type().into();
         let original_event_type = value.event_type.into();
         let corrected_to = value.corrected_to.map(Into::into);
@@ -351,6 +357,7 @@ impl AppleEvent {
             model_version: value.model_version,
             false_positive: value.false_positive_at.is_some(),
             synced,
+            confirmed,
         }
     }
 }
@@ -964,7 +971,13 @@ impl AppleEngine {
                 RECENT_EVENT_LIMIT,
             )?
             .into_iter()
-            .map(|stored| AppleEvent::from_event_and_sync_status(stored.event, stored.synced))
+            .map(|stored| {
+                AppleEvent::from_event_and_sync_status(
+                    stored.event,
+                    stored.synced,
+                    stored.confirmed,
+                )
+            })
             .collect();
         let monitored_hours = (now
             - sinus_app::state::local_midnight_at_offset(now, timezone_offset_minutes))
@@ -1056,14 +1069,31 @@ impl AppleEngine {
         })
     }
 
-    /// Remove one feedback-derived Training unit. Feedback group ids are event
-    /// UUIDs, so this deliberately routes through the same Rust-owned Undo
-    /// policy as History instead of exposing either virtual classifier member.
+    /// Remove one Training group by the id `training_groups` gave it:
+    /// `guided:{id}` for a physical Teach take, or an event uuid for canonical
+    /// feedback. Policy for telling the two apart lives in
+    /// `sinus_app::flag::remove_training_group` rather than here, so this is
+    /// the same Rust-owned mapping every shell gets instead of exposing either
+    /// virtual classifier member to Swift.
     pub fn remove_training_group(
         &self,
         group_id: String,
-    ) -> Result<AppleFeedbackResult, AppleEngineError> {
-        self.clear_flag(group_id)
+    ) -> Result<AppleBulkFeedbackResult, AppleEngineError> {
+        let mut engine = self.lock()?;
+        let outcome = sinus_app::flag::remove_training_group(engine.store(), &group_id)?
+            .ok_or_else(|| AppleEngineError::NotFound {
+                uuid: group_id.clone(),
+            })?;
+        if outcome.classifier_changed {
+            engine.reload_enrollments()?;
+            #[cfg(test)]
+            self.feedback_reload_count.fetch_add(1, Ordering::Relaxed);
+        }
+        Ok(AppleBulkFeedbackResult {
+            groups_changed: outcome.groups_changed as u32,
+            classifier_changed: outcome.classifier_changed,
+            sync_required: outcome.sync_required,
+        })
     }
 
     /// Clear every canonical feedback document back to `none`, preserving all
@@ -1382,8 +1412,18 @@ impl AppleEngine {
                 .ok_or_else(|| AppleEngineError::NotFound {
                     uuid: event_uuid.clone(),
                 })?;
+        // `From<Event>` always reports `confirmed: false` — it has no feedback
+        // table to read. This is the one caller that both has a live feedback
+        // document to check and needs the real answer, since a UI reacting to
+        // `confirm_event`'s own result must see the confirmation it just made.
+        let confirmed = engine
+            .store()
+            .event_feedback(&event_uuid)?
+            .is_some_and(|feedback| {
+                feedback.state == sinus_core::store::EventFeedbackState::Confirmed
+            });
         Ok(AppleFeedbackResult {
-            event: updated.into(),
+            event: AppleEvent::from_event_and_sync_status(updated, false, confirmed),
             event_changed: outcome.event_changed,
             classifier_changed: outcome.classifier_changed,
             sync_required: outcome.sync_required,
@@ -2032,6 +2072,38 @@ mod tests {
     }
 
     #[test]
+    fn confirm_event_marks_the_event_confirmed_until_undone() {
+        let (engine, dir) = temp_engine();
+        let now = Utc::now();
+        let event = emit_one_event(&engine, now);
+
+        let confirmed = engine.confirm_event(event.uuid.clone()).unwrap();
+        assert!(confirmed.event.confirmed);
+        let history = engine
+            .history(
+                7,
+                (now + chrono::Duration::minutes(1)).timestamp_millis(),
+                0,
+            )
+            .unwrap();
+        assert!(history.recent_events[0].confirmed);
+
+        let undone = engine.clear_flag(event.uuid.clone()).unwrap();
+        assert!(!undone.event.confirmed);
+        let history = engine
+            .history(
+                7,
+                (now + chrono::Duration::minutes(1)).timestamp_millis(),
+                0,
+            )
+            .unwrap();
+        assert!(!history.recent_events[0].confirmed);
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
     fn feedback_insert_replacement_and_removal_each_reload_the_live_matcher() {
         let (engine, dir) = temp_engine();
         let event = emit_one_event(&engine, Utc::now());
@@ -2087,8 +2159,9 @@ mod tests {
         ));
 
         let removed = engine.remove_training_group(event.uuid.clone()).unwrap();
+        assert_eq!(removed.groups_changed, 1);
         assert!(removed.classifier_changed);
-        assert!(matches!(removed.effect, AppleTrainingEffect::Removed));
+        assert!(removed.sync_required);
         assert!(engine.training().unwrap().groups.is_empty());
 
         engine.confirm_event(event.uuid.clone()).unwrap();
@@ -2097,6 +2170,56 @@ mod tests {
         assert!(cleared.classifier_changed);
         assert!(cleared.sync_required);
         assert!(engine.training().unwrap().groups.is_empty());
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_training_group_deletes_the_guided_take_it_names() {
+        let (engine, dir) = temp_engine();
+        engine
+            .enroll_take(
+                AppleEventType::Hawk,
+                vec![0.2; sinus_app::teach::TEACH_TAKE_SAMPLES],
+            )
+            .unwrap();
+        let training = engine.training().unwrap();
+        assert_eq!(training.groups.len(), 1);
+        let group_id = training.groups[0].group_id.clone();
+        assert!(group_id.starts_with("guided:"));
+        let reloads_before = engine.feedback_reload_count.load(Ordering::Relaxed);
+
+        let removed = engine.remove_training_group(group_id).unwrap();
+        assert_eq!(removed.groups_changed, 1);
+        assert!(removed.classifier_changed);
+        assert!(
+            !removed.sync_required,
+            "the take was never synced, so there is no tombstone to push"
+        );
+        assert!(engine.training().unwrap().groups.is_empty());
+        assert_eq!(
+            engine.feedback_reload_count.load(Ordering::Relaxed),
+            reloads_before + 1,
+            "the live matcher must drop the deleted take's prototype"
+        );
+
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn remove_training_group_rejects_an_id_it_never_advertised() {
+        let (engine, dir) = temp_engine();
+
+        assert!(matches!(
+            engine.remove_training_group("guided:999999".to_string()),
+            Err(AppleEngineError::NotFound { uuid }) if uuid == "guided:999999"
+        ));
+        assert!(matches!(
+            engine.remove_training_group("not-a-real-uuid".to_string()),
+            Err(AppleEngineError::NotFound { uuid }) if uuid == "not-a-real-uuid"
+        ));
 
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
