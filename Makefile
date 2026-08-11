@@ -1,4 +1,4 @@
-.PHONY: apple-ios-run apple-ios-build apple-macos-run apple-macos-build apple-bindings-check
+.PHONY: apple-ios-run apple-ios-build apple-macos-run apple-macos-build apple-bindings-check apple-test
 
 # Builds the Rust dependency, regenerates Swift bindings, compiles an app bundle,
 # boots/selects an iOS Simulator, installs the app, and launches it.
@@ -14,6 +14,12 @@ apple-macos-run:
 
 apple-macos-build:
 	./scripts/apple-dev.sh macos build
+
+# Builds the same Rust dependency, then compiles and runs the no-XCTest Swift
+# test binary under apps/apple/Tests/ — model-layer coverage that does not
+# need a Simulator or a signed app bundle.
+apple-test:
+	./scripts/apple-test.sh
 
 # Regenerate the committed bindings from the cdylib and normalize them. Runs on
 # Linux (CI's drift gate) and on a Mac (where the same command must reproduce

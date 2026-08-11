@@ -177,6 +177,58 @@ pub fn clear_all_feedback(store: &Store) -> Result<BulkFeedbackOutcome> {
     })
 }
 
+/// Prefix `Store::training_groups` puts on a guided Teach take's group id —
+/// the only place that mints one — so it can be told apart from a bare event
+/// uuid without a schema lookup.
+const GUIDED_TAKE_PREFIX: &str = "guided:";
+
+/// Remove one Training group by the id `Store::training_groups` gave it.
+///
+/// That id has exactly two shapes: `guided:{enrollment id}` names a physical
+/// Teach take, and anything else is an event uuid whose canonical feedback
+/// should be cleared — the same Undo path History uses. Dispatching on the
+/// shape here, rather than in every shell, keeps the mapping a single
+/// Rust-owned fact.
+///
+/// `None` means `group_id` names neither a live guided take nor a known
+/// event — a stale Training list, or a row removed between render and tap —
+/// so the caller can report a distinguishable "gone" rather than a generic
+/// failure.
+pub fn remove_training_group(store: &Store, group_id: &str) -> Result<Option<BulkFeedbackOutcome>> {
+    match group_id.strip_prefix(GUIDED_TAKE_PREFIX) {
+        Some(raw_id) => match raw_id.parse::<i64>() {
+            Ok(id) => remove_guided_take(store, id),
+            Err(_) => Ok(None),
+        },
+        None => {
+            if store.get_event(group_id)?.is_none() {
+                return Ok(None);
+            }
+            let outcome = clear_flag(store, group_id)?;
+            Ok(Some(BulkFeedbackOutcome {
+                groups_changed: usize::from(outcome.event_changed),
+                classifier_changed: outcome.classifier_changed,
+                sync_required: outcome.sync_required,
+            }))
+        }
+    }
+}
+
+/// Every live guided take is a physical, non-negative enrollment row, so
+/// removing one always changes the matcher's prototype set — unlike the
+/// canonical-feedback branch, there is no "unchanged" case to distinguish.
+fn remove_guided_take(store: &Store, id: i64) -> Result<Option<BulkFeedbackOutcome>> {
+    if !store.guided_take_exists(id)? {
+        return Ok(None);
+    }
+    let deletion = store.delete_enrollment(id)?;
+    Ok(Some(BulkFeedbackOutcome {
+        groups_changed: usize::from(deletion.removed),
+        classifier_changed: deletion.removed,
+        sync_required: deletion.sync_required,
+    }))
+}
+
 #[cfg(test)]
 mod tests {
     use super::*;
@@ -476,5 +528,56 @@ mod tests {
         let store = Store::open_in_memory().unwrap();
         let error = report_false_positive(&store, "not-a-real-uuid").unwrap_err();
         assert!(error.to_string().contains("not-a-real-uuid"));
+    }
+
+    #[test]
+    fn remove_training_group_deletes_the_guided_take_it_names() {
+        let store = Store::open_in_memory().unwrap();
+        let id = store
+            .add_enrollment(EventType::Hawk, &[0.1, 0.2, 0.3], false)
+            .unwrap();
+
+        let outcome = remove_training_group(&store, &format!("guided:{id}"))
+            .unwrap()
+            .expect("a live guided take must be found");
+        assert_eq!(outcome.groups_changed, 1);
+        assert!(outcome.classifier_changed);
+        assert!(!outcome.sync_required, "the take was never synced");
+        assert!(store.enrollments().unwrap().is_empty());
+    }
+
+    #[test]
+    fn remove_training_group_routes_an_event_uuid_through_clear_flag() {
+        let store = Store::open_in_memory().unwrap();
+        let event = stored_event(&store, EventType::Cough, true);
+        confirm_event(&store, &event.uuid).unwrap();
+
+        let outcome = remove_training_group(&store, &event.uuid)
+            .unwrap()
+            .expect("a group backed by an active feedback document must be found");
+        assert_eq!(outcome.groups_changed, 1);
+        assert!(outcome.classifier_changed);
+        assert_eq!(
+            store.event_feedback(&event.uuid).unwrap().unwrap().state,
+            EventFeedbackState::None
+        );
+    }
+
+    #[test]
+    fn remove_training_group_reports_none_for_every_unknown_shape() {
+        let store = Store::open_in_memory().unwrap();
+
+        // A guided id whose row was never created.
+        assert!(remove_training_group(&store, "guided:999999")
+            .unwrap()
+            .is_none());
+        // A guided id that fails to parse as a row id at all.
+        assert!(remove_training_group(&store, "guided:not-a-number")
+            .unwrap()
+            .is_none());
+        // Not an event uuid either.
+        assert!(remove_training_group(&store, "not-a-real-uuid")
+            .unwrap()
+            .is_none());
     }
 }

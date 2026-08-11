@@ -288,10 +288,7 @@ pub enum Deletion {
 /// Remove enrollments per `what`, returning how many rows were removed.
 pub fn delete(store: &Store, what: Deletion) -> Result<usize> {
     match what {
-        Deletion::One(id) => {
-            store.delete_enrollment(id)?;
-            Ok(1)
-        }
+        Deletion::One(id) => Ok(store.delete_enrollment(id)?.removed as usize),
         Deletion::Class(class) => store.delete_enrollments_for_class(class),
         // Event feedback is one canonical unit. The legacy "forget reports"
         // action must remove the whole unit rather than leaving a correction's

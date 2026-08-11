@@ -29,7 +29,9 @@ final class EngineHost {
         // Closes chunk 12's gap: the tray app requests a sync after every
         // flag, and Swift did not. A hook rather than a reference to
         // `SyncModel`, so `HistoryModel` keeps not knowing what else exists.
-        history.onFlagged = { [weak self] in self?.sync.syncNow() }
+        // Fires only when the feedback result actually requires a sync —
+        // not on every flag, since a device-local confirm need not upload.
+        history.onSyncRequired = { [weak self] in self?.sync.syncNow() }
         sync.onStatusChanged = { [weak history] in history?.refresh() }
         training.onTrainingChanged = { [weak self] in self?.sync.syncNow() }
         monitor.onCaptureStopped = { [weak training] in training?.cancelTake() }

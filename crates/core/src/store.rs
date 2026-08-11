@@ -75,6 +75,17 @@ pub struct StoredEnrollment {
     pub synced: bool,
 }
 
+/// Outcome of removing one physical enrollment row.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct EnrollmentDeletion {
+    /// Whether a row actually went — a stale or already-removed id deletes nothing.
+    pub removed: bool,
+    /// Whether the PHR still needs to hear about the removal: a row it had
+    /// already seen leaves a tombstone behind even though the deletion itself
+    /// happened entirely locally.
+    pub sync_required: bool,
+}
+
 /// Fields for a new enrollment example.
 #[derive(Debug, Clone)]
 pub struct EnrollmentInsert<'a> {
@@ -255,6 +266,10 @@ pub struct PendingFlag {
 pub struct EventWithSyncStatus {
     pub event: Event,
     pub synced: bool,
+    /// Whether canonical feedback for this event is currently `confirmed` —
+    /// distinct from an untouched event, so a UI can render a confirmed badge
+    /// and route Undo instead of treating the two the same.
+    pub confirmed: bool,
 }
 
 /// After this many server rejections an event stops being re-sent and is left for
@@ -1218,15 +1233,18 @@ impl Store {
         limit: usize,
     ) -> Result<Vec<EventWithSyncStatus>> {
         let mut stmt = self.conn.prepare(
-            "SELECT *,
-                    uploaded_at IS NOT NULL
+            "SELECT events.*,
+                    events.uploaded_at IS NOT NULL
                     AND (
-                        flag_updated_at IS NULL
-                        OR (flag_synced_at IS NOT NULL AND flag_synced_at >= flag_updated_at)
-                    ) AS sync_current
+                        events.flag_updated_at IS NULL
+                        OR (events.flag_synced_at IS NOT NULL
+                            AND events.flag_synced_at >= events.flag_updated_at)
+                    ) AS sync_current,
+                    COALESCE(event_feedback.state, 'none') = 'confirmed' AS confirmed
              FROM events
-             WHERE occurred_at >= ?1 AND occurred_at < ?2 AND deleted = 0
-             ORDER BY occurred_at DESC
+             LEFT JOIN event_feedback ON event_feedback.event_uuid = events.uuid
+             WHERE events.occurred_at >= ?1 AND events.occurred_at < ?2 AND events.deleted = 0
+             ORDER BY events.occurred_at DESC
              LIMIT ?3",
         )?;
         let rows = stmt.query_map(
@@ -1238,6 +1256,7 @@ impl Store {
                 Ok(Some(EventWithSyncStatus {
                     event,
                     synced: row.get::<_, i64>("sync_current")? != 0,
+                    confirmed: row.get::<_, i64>("confirmed")? != 0,
                 }))
             },
         )?;
@@ -1664,6 +1683,21 @@ impl Store {
         Ok(counts)
     }
 
+    /// Whether `id` names a live guided Teach take — the same filter
+    /// `training_groups` applies before it mints that row's `guided:{id}`
+    /// group id. Lets `remove_training_group` tell a stale or foreign id
+    /// apart from one it can actually delete, the same way it checks an event
+    /// uuid's existence before clearing canonical feedback.
+    pub fn guided_take_exists(&self, id: i64) -> Result<bool> {
+        Ok(self.conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM enrollment_examples
+               WHERE id = ?1 AND deleted = 0 AND is_negative = 0
+                 AND source_event_uuid IS NULL)",
+            params![id],
+            |row| row.get(0),
+        )?)
+    }
+
     /// Rust-owned training provenance. Guided takes are individual units;
     /// feedback is grouped by event even when it derives two matcher examples.
     pub fn training_groups(&self) -> Result<Vec<TrainingGroup>> {
@@ -1763,19 +1797,38 @@ impl Store {
 
     /// Delete one enrollment example. Unsynced rows vanish immediately; rows the
     /// server has seen become tombstones so the removal can be propagated.
-    pub fn delete_enrollment(&self, id: i64) -> Result<()> {
+    pub fn delete_enrollment(&self, id: i64) -> Result<EnrollmentDeletion> {
         let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
-        tx.execute(
+        let deleted = tx.execute(
             "DELETE FROM enrollment_examples WHERE id = ?1 AND synced_at IS NULL",
             params![id],
         )?;
-        tx.execute(
+        let tombstoned = tx.execute(
             "UPDATE enrollment_examples SET deleted = 1
               WHERE id = ?1 AND synced_at IS NOT NULL AND deleted = 0",
             params![id],
         )?;
+        let sync_required = Self::enrollment_tombstone_pending(&tx, id)?;
         tx.commit()?;
-        Ok(())
+        Ok(EnrollmentDeletion {
+            removed: deleted > 0 || tombstoned > 0,
+            sync_required,
+        })
+    }
+
+    /// Whether a tombstoned enrollment row still owes the PHR a deletion.
+    /// Mirrors the enrollment half of the `sync_required` EXISTS check
+    /// `apply_event_feedback` and `clear_all_event_feedback` run for the same
+    /// question, scoped to one row's id rather than to an event uuid — a
+    /// guided Teach take has no owning event, so there is nothing else for
+    /// its removal to depend on.
+    fn enrollment_tombstone_pending(conn: &Connection, id: i64) -> Result<bool> {
+        Ok(conn.query_row(
+            "SELECT EXISTS(SELECT 1 FROM enrollment_examples
+               WHERE id = ?1 AND deleted = 1 AND synced_at IS NOT NULL)",
+            params![id],
+            |row| row.get(0),
+        )?)
     }
 
     /// Delete all positive and negative physical examples for one class.
@@ -2530,6 +2583,38 @@ mod tests {
             .recent_events_with_sync_status_limited(from, to, 10)
             .unwrap();
         assert!(recent[0].synced, "the latest edit reached the PHR");
+    }
+
+    #[test]
+    fn recent_sync_status_reports_confirmation_until_undone() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_event(&sample_event("event")).unwrap();
+        let from = Utc::now() - chrono::Duration::days(1);
+        let to = Utc::now() + chrono::Duration::days(1);
+
+        let recent = store
+            .recent_events_with_sync_status_limited(from, to, 10)
+            .unwrap();
+        assert!(!recent[0].confirmed, "an untouched event is not confirmed");
+
+        store
+            .apply_event_feedback("event", feedback_input(EventFeedbackState::Confirmed, None))
+            .unwrap();
+        let recent = store
+            .recent_events_with_sync_status_limited(from, to, 10)
+            .unwrap();
+        assert!(recent[0].confirmed);
+
+        store
+            .apply_event_feedback("event", feedback_input(EventFeedbackState::None, None))
+            .unwrap();
+        let recent = store
+            .recent_events_with_sync_status_limited(from, to, 10)
+            .unwrap();
+        assert!(
+            !recent[0].confirmed,
+            "undo must be indistinguishable from never having confirmed"
+        );
     }
 
     #[test]
