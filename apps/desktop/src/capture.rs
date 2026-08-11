@@ -157,7 +157,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     // boundary merge, cooldowns persist, and the noise floor converges. Detected
     // events carry sample-counter timestamps relative to the stream start; map that
     // origin to wall-clock ONCE, here, rather than doing per-chunk `Utc::now()` math.
-    let mut config = PipelineConfig::default();
+    let mut config = PipelineConfig::passive_live_monitoring();
     config.decision.sensitivity = settings::sensitivity(&store);
     let mut pipeline = StreamingPipeline::new(config, embedder);
     if let Some(prototypes) = prototypes {

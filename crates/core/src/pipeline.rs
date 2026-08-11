@@ -24,7 +24,7 @@ use crate::classify::embed::Embedder;
 use crate::classify::native::AudiosetMap;
 use crate::classify::proto::PrototypeMatcher;
 use crate::error::Result;
-use crate::gate::{Gate, GateEdge};
+use crate::gate::{Gate, GateDiagnostics, GateEdge, GateStartupMode};
 use crate::mel::{
     MelFrontend, MelPatch, MelScratch, FRAME_LEN, HOP_LEN, N_MEL, PATCH_FRAMES, PATCH_HOP_FRAMES,
 };
@@ -37,6 +37,26 @@ pub struct PipelineConfig {
     pub gate: crate::gate::GateConfig,
     pub decision: crate::classify::decision::DecisionConfig,
     pub session: SessionConfig,
+}
+
+impl PipelineConfig {
+    /// Finite-buffer and user-triggered processing: detect from sample zero.
+    pub fn batch() -> Self {
+        Self::default()
+    }
+
+    /// Passive desktop monitoring can spend a visible first second learning a
+    /// stable room before it starts inference.
+    pub fn passive_live_monitoring() -> Self {
+        let mut config = Self::default();
+        config.gate.startup_mode = GateStartupMode::Calibrate { duration_ms: 1000 };
+        config
+    }
+
+    /// Explicit short sessions (notably iOS) must not have a blind lead-in.
+    pub fn user_initiated_live_monitoring() -> Self {
+        Self::default()
+    }
 }
 
 /// Per-window diagnostic record (drives `cli classify` output).
@@ -619,7 +639,10 @@ impl<E: Embedder> StreamingPipeline<E> {
     /// model and personalized prototypes. Used after a real microphone pause so
     /// events cannot merge across an unmonitored gap.
     pub fn reset_stream(&mut self) {
+        let mut gate = self.state.gate.clone();
+        gate.reset_temporal();
         self.state = StreamState::new(&self.inner.cfg, &self.inner.mel);
+        self.state.gate = gate;
     }
 
     /// Whether the energy gate is currently open — i.e. the app is analyzing a
@@ -649,6 +672,10 @@ impl<E: Embedder> StreamingPipeline<E> {
     /// state persists across pushes.
     pub fn gate_floor_db(&self) -> f32 {
         self.state.gate.floor_db()
+    }
+
+    pub fn gate_diagnostics(&self) -> GateDiagnostics {
+        self.state.gate.diagnostics()
     }
 
     #[cfg(test)]
@@ -736,6 +763,16 @@ mod tests {
     }
 
     #[test]
+    fn finite_event_from_sample_zero_is_not_consumed_by_calibration() {
+        let pipe = Pipeline::new(PipelineConfig::batch(), BandHeuristicEmbedder);
+        let signal = synth::sine(16_000 * 2, 16_000, 300.0, 0.6);
+        let result = pipe.process(&signal).unwrap();
+        assert!(result.windows.iter().any(|window| window.active));
+        assert_eq!(result.events.len(), 1, "events: {:?}", result.events);
+        assert_eq!(result.events[0].event_type, EventType::Cough);
+    }
+
+    #[test]
     fn personalized_match_overrides_a_conflicting_native_label() {
         let mut native_scores = vec![0.0; crate::classify::embed::AUDIOSET_CLASSES];
         native_scores[AudiosetMap::default().sneeze] = 0.99;
@@ -761,8 +798,7 @@ mod tests {
             0.05,
         );
         let pipeline = Pipeline::new(PipelineConfig::default(), embedder).with_prototypes(matcher);
-        let mut signal = synth::white_noise(16_000, 0.003, 101);
-        signal.extend(synth::sine(16_000 * 2, 16_000, 500.0, 0.8));
+        let signal = synth::sine(16_000 * 2, 16_000, 500.0, 0.8);
         let result = pipeline.process(&signal).unwrap();
         assert!(!result.events.is_empty());
         assert!(result
@@ -797,8 +833,7 @@ mod tests {
             0.05,
         );
         let pipeline = Pipeline::new(PipelineConfig::default(), embedder).with_prototypes(matcher);
-        let mut signal = synth::white_noise(16_000, 0.003, 102);
-        signal.extend(synth::sine(16_000 * 2, 16_000, 500.0, 0.8));
+        let signal = synth::sine(16_000 * 2, 16_000, 500.0, 0.8);
         let result = pipeline.process(&signal).unwrap();
         assert!(result.events.is_empty());
     }
@@ -818,8 +853,7 @@ mod tests {
             },
             version: "test".to_string(),
         };
-        let mut signal = synth::white_noise(16_000, 0.003, 103);
-        signal.extend(synth::sine(16_000 * 2, 16_000, 500.0, 0.8));
+        let signal = synth::sine(16_000 * 2, 16_000, 500.0, 0.8);
 
         // Without the negative the native path fires…
         let baseline = Pipeline::new(PipelineConfig::default(), embedder())
@@ -884,6 +918,58 @@ mod tests {
             "streaming must reproduce the batch events exactly"
         );
         assert!(!batch.is_empty(), "the rich signal should yield events");
+    }
+
+    #[test]
+    fn batch_and_streaming_agree_with_explicit_live_calibration() {
+        let sig = rich_signal();
+        let cfg = PipelineConfig::passive_live_monitoring();
+        let batch = Pipeline::new(cfg.clone(), BandHeuristicEmbedder)
+            .process(&sig)
+            .unwrap()
+            .events;
+        let mut streamed = Vec::new();
+        let mut pipeline = StreamingPipeline::new(cfg, BandHeuristicEmbedder);
+        for chunk in sig.chunks(777) {
+            streamed.extend(pipeline.push(chunk).unwrap());
+        }
+        streamed.extend(pipeline.flush().unwrap());
+        assert_eq!(batch, streamed);
+        assert!(!batch.is_empty());
+    }
+
+    #[test]
+    fn immediate_live_mode_hears_events_after_start_and_resume() {
+        let cfg = PipelineConfig::user_initiated_live_monitoring();
+        let mut pipeline = StreamingPipeline::new(cfg, BandHeuristicEmbedder);
+        let hop = pipeline.inner.cfg.gate.hop_samples();
+        let first_hop = synth::sine_hops(1, hop, 16_000, 300.0, 0.6);
+
+        pipeline.reset_stream();
+        pipeline.push(&first_hop).unwrap();
+        assert!(pipeline.gate_open(), "first session must hear hop zero");
+
+        pipeline.reset_stream();
+        pipeline.push(&first_hop).unwrap();
+        assert!(pipeline.gate_open(), "resumed session must hear hop zero");
+    }
+
+    #[test]
+    fn temporal_reset_preserves_the_learned_ambient_floor() {
+        let cfg = PipelineConfig::passive_live_monitoring();
+        let mut pipeline = StreamingPipeline::new(cfg.clone(), BandHeuristicEmbedder);
+        let hop = cfg.gate.hop_samples();
+        let fan = synth::sine_hops(20, hop, 16_000, 120.0, 0.014);
+        pipeline.push(&fan).unwrap();
+        let before = pipeline.gate_diagnostics();
+        assert!(!before.calibrating);
+        assert!(before.ambient_floor_db > -43.0, "{before:?}");
+
+        pipeline.reset_stream();
+        let after = pipeline.gate_diagnostics();
+        assert!(!after.open);
+        assert_eq!(after.ambient_floor_db, before.ambient_floor_db);
+        assert_eq!(after.short_floor_db, before.short_floor_db);
     }
 
     /// An event whose loud span straddles a push boundary is ONE event, not two.

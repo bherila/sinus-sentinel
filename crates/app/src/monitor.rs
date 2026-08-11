@@ -11,6 +11,7 @@ use chrono::{DateTime, Utc};
 use sinus_core::classify::embed::Embedder;
 use sinus_core::classify::proto::PrototypeMatcher;
 use sinus_core::error::{Error, Result};
+use sinus_core::gate::GateDiagnostics;
 use sinus_core::pipeline::{EventContext, PipelineConfig, StreamingPipeline};
 use sinus_core::store::Store;
 use sinus_core::types::{Event, EventType, Source};
@@ -57,7 +58,13 @@ impl<E: Embedder> MonitoringEngine<E> {
     }
 
     pub fn from_store(store: Store, embedder: E, config: MonitoringConfig) -> Result<Self> {
-        let mut pipeline = StreamingPipeline::new(PipelineConfig::default(), embedder);
+        let pipeline_config = match config.source {
+            Source::DesktopMac | Source::DesktopWin => PipelineConfig::passive_live_monitoring(),
+            Source::MobileIos | Source::MobileAndroid => {
+                PipelineConfig::user_initiated_live_monitoring()
+            }
+        };
+        let mut pipeline = StreamingPipeline::new(pipeline_config, embedder);
         // Sensitivity is a synced, user-visible setting: honor whatever the store
         // holds instead of letting each shell impose its own starting value.
         pipeline.set_sensitivity(crate::settings::sensitivity(&store));
@@ -141,6 +148,10 @@ impl<E: Embedder> MonitoringEngine<E> {
     /// Drives the UI's "heard something" indicator.
     pub fn gate_open(&self) -> bool {
         self.pipeline.gate_open()
+    }
+
+    pub fn gate_diagnostics(&self) -> GateDiagnostics {
+        self.pipeline.gate_diagnostics()
     }
 
     pub fn model_version(&self) -> String {
@@ -245,6 +256,15 @@ mod tests {
         .unwrap()
     }
 
+    fn desktop_engine() -> MonitoringEngine<BandHeuristicEmbedder> {
+        MonitoringEngine::from_store(
+            Store::open_in_memory().unwrap(),
+            BandHeuristicEmbedder,
+            MonitoringConfig::new(Source::DesktopMac),
+        )
+        .unwrap()
+    }
+
     #[test]
     fn pcm_requires_an_explicit_session() {
         let mut engine = engine();
@@ -273,6 +293,59 @@ mod tests {
         assert_eq!(emitted[0].source, Source::MobileIos);
         assert_eq!(engine.store().event_count().unwrap(), 1);
         assert!(!engine.is_monitoring());
+    }
+
+    #[test]
+    fn mobile_session_detects_an_event_that_begins_at_sample_zero() {
+        let mut engine = engine();
+        let mut signal = synth::sine(32_000, 16_000, 300.0, 0.6);
+        signal.extend(synth::white_noise(16_000, 0.003, 211));
+        engine.start_session(Utc::now(), 0);
+        let mut emitted = Vec::new();
+        for chunk in signal.chunks(777) {
+            emitted.extend(engine.push_pcm_16k(chunk).unwrap());
+        }
+        emitted.extend(engine.stop_session().unwrap());
+        assert_eq!(emitted.len(), 1, "events: {emitted:?}");
+    }
+
+    #[test]
+    fn desktop_resume_preserves_room_floor_without_recalibrating() {
+        let mut engine = desktop_engine();
+        engine.start_session(Utc::now(), 0);
+        engine
+            .push_pcm_16k(&synth::white_noise(16_000, 0.003, 221))
+            .unwrap();
+        assert!(!engine.gate_diagnostics().calibrating);
+        let learned = engine.gate_diagnostics().ambient_floor_db;
+        engine.stop_session().unwrap();
+
+        engine.start_session(Utc::now(), 0);
+        assert!(!engine.gate_diagnostics().calibrating);
+        assert_eq!(engine.gate_diagnostics().ambient_floor_db, learned);
+        engine
+            .push_pcm_16k(&synth::sine(800, 16_000, 300.0, 0.6))
+            .unwrap();
+        assert!(engine.gate_open(), "the first resumed hop must be heard");
+    }
+
+    #[test]
+    fn sustained_ambient_adaptation_persists_at_most_one_false_session() {
+        let mut engine = mock_cough_engine_for(Source::DesktopMac, 0.99);
+        engine.start_session(Utc::now(), 0);
+        let mut signal = synth::white_noise(16_000, 0.003, 231);
+        signal.extend(synth::sine(16_000 * 12, 16_000, 120.0, 0.014));
+
+        let mut emitted = Vec::new();
+        for chunk in signal.chunks(777) {
+            emitted.extend(engine.push_pcm_16k(chunk).unwrap());
+        }
+        emitted.extend(engine.stop_session().unwrap());
+        assert!(
+            emitted.len() <= 1,
+            "one stationary ambient onset must not create repeated persisted events: {emitted:?}"
+        );
+        assert!(engine.gate_diagnostics().ambient_floor_db > -43.0);
     }
 
     /// The cough signal `session_persists_events_and_stops_cleanly` relies on —
@@ -338,6 +411,13 @@ mod tests {
     /// of the audio fed in, which is what lets a plain amplitude signal (needed
     /// to open the real energy gate) drive a controlled decision score.
     fn mock_cough_engine(cough_score: f32) -> MonitoringEngine<sinus_core::classify::MockEmbedder> {
+        mock_cough_engine_for(Source::MobileIos, cough_score)
+    }
+
+    fn mock_cough_engine_for(
+        source: Source,
+        cough_score: f32,
+    ) -> MonitoringEngine<sinus_core::classify::MockEmbedder> {
         use sinus_core::classify::{
             embed::AUDIOSET_CLASSES, AudiosetMap, MockEmbedder, WindowFeatures, EMBED_DIM,
         };
@@ -355,7 +435,7 @@ mod tests {
         MonitoringEngine::from_store(
             Store::open_in_memory().unwrap(),
             embedder,
-            MonitoringConfig::new(Source::MobileIos),
+            MonitoringConfig::new(source),
         )
         .unwrap()
     }
