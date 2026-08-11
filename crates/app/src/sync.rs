@@ -29,7 +29,7 @@ use sinus_core::types::Source;
 
 use crate::settings;
 
-pub use sinus_core::sync::Mode;
+pub use sinus_core::sync::{ConnectionCheck, Mode};
 
 /// When-to-flush thresholds (SPEC §4.3).
 #[derive(Debug, Clone)]
@@ -192,6 +192,39 @@ pub fn sync_config(store: &Store, source: Source) -> Option<SyncConfig> {
         model_version,
         batch_size: 500,
     })
+}
+
+/// Validate the PHR connection Settings shows, live (the incident this
+/// exists for: "Check token" proved only that a token existed, never that the
+/// server still accepted it). Assembles [`SyncConfig`] exactly as
+/// [`sync_config`] does, but — unlike it — names which ingredient is missing
+/// instead of collapsing every case to `None`, and probes with the exact
+/// token the sync driver would use rather than a fresh read.
+pub fn check_connection(
+    store: &Store,
+    source: Source,
+    token: Arc<dyn TokenStore>,
+) -> ConnectionCheck {
+    let mode = settings::mode(store);
+    if !mode.allows_network() {
+        return ConnectionCheck::OfflineStrict;
+    }
+    let base_url = settings::server_url(store);
+    if base_url.trim().is_empty() {
+        return ConnectionCheck::NoServerUrl;
+    }
+    if settings::patient_id(store).is_none() {
+        return ConnectionCheck::NoPatientId;
+    }
+    // Neither ingredient `sync_config` can fail on is missing at this point —
+    // both were just confirmed present above.
+    let cfg = sync_config(store, source).expect("server url and patient id are present");
+    match SyncEngine::for_mode(mode, cfg, token) {
+        Some(engine) => engine.check_connection(),
+        // Unreachable given the `allows_network` guard above, but keeps this
+        // total rather than trading one `expect` for another.
+        None => ConnectionCheck::OfflineStrict,
+    }
 }
 
 /// Construct the engine for `mode`, or `None` if offline-strict or unconfigured.
@@ -754,6 +787,101 @@ mod tests {
             server.request_count(),
             1,
             "a tick before the retry deadline must not attempt another flush"
+        );
+    }
+
+    // --- check_connection -------------------------------------------------
+
+    /// A one-route server that always answers a fixed status, for the one
+    /// live probe test below — `FailingServer` above is hardcoded to 500.
+    struct StatusServer {
+        url: String,
+        shutdown: Arc<std::sync::atomic::AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StatusServer {
+        fn start(status: u16) -> Self {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", server.server_addr());
+            let shutdown = Arc::new(std::sync::atomic::AtomicBool::new(false));
+            let stop = Arc::clone(&shutdown);
+            let handle = std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let Ok(Some(req)) = server.recv_timeout(Duration::from_millis(50)) else {
+                        continue;
+                    };
+                    let resp =
+                        tiny_http::Response::from_string("{}".to_string()).with_status_code(status);
+                    req.respond(resp).ok();
+                }
+            });
+            StatusServer {
+                url,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for StatusServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                handle.join().ok();
+            }
+        }
+    }
+
+    #[test]
+    fn check_connection_names_the_missing_ingredient_instead_of_a_generic_none() {
+        let store = Store::open_in_memory().unwrap();
+        let token: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::new());
+
+        settings::set_server_url(&store, "").unwrap();
+        assert_eq!(
+            check_connection(&store, Source::DesktopMac, Arc::clone(&token)),
+            ConnectionCheck::NoServerUrl
+        );
+
+        settings::set_server_url(&store, "https://phr.example").unwrap();
+        assert_eq!(
+            check_connection(&store, Source::DesktopMac, Arc::clone(&token)),
+            ConnectionCheck::NoPatientId
+        );
+
+        settings::set_patient_id(&store, Some(7)).unwrap();
+        assert_eq!(
+            check_connection(&store, Source::DesktopMac, token),
+            ConnectionCheck::NoToken
+        );
+    }
+
+    #[test]
+    fn check_connection_is_structurally_blocked_in_offline_strict() {
+        let store = Store::open_in_memory().unwrap();
+        settings::set_server_url(&store, "https://phr.example").unwrap();
+        settings::set_patient_id(&store, Some(7)).unwrap();
+        settings::set_mode(&store, Mode::OfflineStrict).unwrap();
+        let token: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::with_token("secret"));
+
+        assert_eq!(
+            check_connection(&store, Source::DesktopMac, token),
+            ConnectionCheck::OfflineStrict
+        );
+    }
+
+    #[test]
+    fn check_connection_reaches_the_configured_server_and_maps_the_status() {
+        let server = StatusServer::start(401);
+        let store = Store::open_in_memory().unwrap();
+        settings::set_server_url(&store, &server.url).unwrap();
+        settings::set_patient_id(&store, Some(7)).unwrap();
+        let token: Arc<dyn TokenStore> = Arc::new(InMemoryTokenStore::with_token("secret"));
+
+        assert_eq!(
+            check_connection(&store, Source::DesktopMac, token),
+            ConnectionCheck::Unauthenticated
         );
     }
 }

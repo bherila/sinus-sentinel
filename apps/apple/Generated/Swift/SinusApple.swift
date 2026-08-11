@@ -471,6 +471,22 @@ private let UNIFFI_CALLBACK_UNEXPECTED_ERROR: Int32 = 2
 #if swift(>=5.8)
 @_documentation(visibility: private)
 #endif
+fileprivate struct FfiConverterUInt16: FfiConverterPrimitive {
+    typealias FfiType = UInt16
+    typealias SwiftType = UInt16
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> UInt16 {
+        return try lift(readInt(&buf))
+    }
+
+    public static func write(_ value: SwiftType, into buf: inout [UInt8]) {
+        writeInt(&buf, lower(value))
+    }
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
 fileprivate struct FfiConverterUInt32: FfiConverterPrimitive {
     typealias FfiType = UInt32
     typealias SwiftType = UInt32
@@ -1630,6 +1646,18 @@ public func FfiConverterTypeModelRunner_lower(_ value: ModelRunner) -> UInt64 {
 public protocol SyncControllerProtocol: AnyObject, Sendable {
 
     /**
+     * Validate the PHR connection live — Settings › PHR "Test connection".
+     * `has_token` above only ever proved a token was stored; this asks the
+     * server whether it is still good, using exactly the token the driver
+     * thread would (this controller's `ForeignTokenStore`), against exactly
+     * the settings that thread reads.
+     *
+     * Performs blocking network I/O (up to the HTTP client's 30-second
+     * timeout) — Swift must call this off the main thread.
+     */
+    func checkConnection()  -> AppleConnectionCheck
+
+    /**
      * See [`Self::set_token`] — routes through the same store for the same reason.
      */
     func clearToken() throws
@@ -1740,6 +1768,25 @@ public convenience init(engine: AppleEngine, tokens: TokenProvider, observer: Sy
 
 
 
+
+    /**
+     * Validate the PHR connection live — Settings › PHR "Test connection".
+     * `has_token` above only ever proved a token was stored; this asks the
+     * server whether it is still good, using exactly the token the driver
+     * thread would (this controller's `ForeignTokenStore`), against exactly
+     * the settings that thread reads.
+     *
+     * Performs blocking network I/O (up to the HTTP client's 30-second
+     * timeout) — Swift must call this off the main thread.
+     */
+open func checkConnection() -> AppleConnectionCheck  {
+    return try!  FfiConverterTypeAppleConnectionCheck_lift(try! rustCall() {
+        uniffiCallStatus in
+    uniffi_sinus_apple_fn_method_synccontroller_check_connection(
+            self.uniffiCloneHandle(),uniffiCallStatus
+    )
+})
+}
 
     /**
      * See [`Self::set_token`] — routes through the same store for the same reason.
@@ -3896,6 +3943,141 @@ public func FfiConverterTypeTrainingSnapshot_lower(_ value: TrainingSnapshot) ->
 }
 
 
+/**
+ * Mirrors `sinus_core::sync::ConnectionCheck` — see its doc for the incident
+ * ("Check token" proved only that a token existed, never that the server
+ * still accepted it) and for what each variant means. `Http`/`Unreachable`
+ * carry data, so this is a struct-variant enum rather than the fieldless
+ * ones elsewhere in this file (mirrors `TrainingStatus::Inactive`).
+ */
+
+public enum AppleConnectionCheck: Equatable, Hashable {
+
+    case ok
+    case unauthenticated
+    case patientNotFound
+    case forbidden
+    case http(status: UInt16
+    )
+    case unreachable(detail: String
+    )
+    case noServerUrl
+    case noPatientId
+    case noToken
+    case offlineStrict
+
+
+
+
+
+}
+
+#if compiler(>=6)
+extension AppleConnectionCheck: Sendable {}
+#endif
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public struct FfiConverterTypeAppleConnectionCheck: FfiConverterRustBuffer {
+    typealias SwiftType = AppleConnectionCheck
+
+    public static func read(from buf: inout (data: Data, offset: Data.Index)) throws -> AppleConnectionCheck {
+        let variant: Int32 = try readInt(&buf)
+        switch variant {
+
+        case 1: return .ok
+
+        case 2: return .unauthenticated
+
+        case 3: return .patientNotFound
+
+        case 4: return .forbidden
+
+        case 5: return .http(status: try FfiConverterUInt16.read(from: &buf)
+        )
+
+        case 6: return .unreachable(detail: try FfiConverterString.read(from: &buf)
+        )
+
+        case 7: return .noServerUrl
+
+        case 8: return .noPatientId
+
+        case 9: return .noToken
+
+        case 10: return .offlineStrict
+
+        default: throw UniffiInternalError.unexpectedEnumCase
+        }
+    }
+
+    public static func write(_ value: AppleConnectionCheck, into buf: inout [UInt8]) {
+        switch value {
+
+
+        case .ok:
+            writeInt(&buf, Int32(1))
+
+
+        case .unauthenticated:
+            writeInt(&buf, Int32(2))
+
+
+        case .patientNotFound:
+            writeInt(&buf, Int32(3))
+
+
+        case .forbidden:
+            writeInt(&buf, Int32(4))
+
+
+        case let .http(status):
+            writeInt(&buf, Int32(5))
+            FfiConverterUInt16.write(status, into: &buf)
+
+
+        case let .unreachable(detail):
+            writeInt(&buf, Int32(6))
+            FfiConverterString.write(detail, into: &buf)
+
+
+        case .noServerUrl:
+            writeInt(&buf, Int32(7))
+
+
+        case .noPatientId:
+            writeInt(&buf, Int32(8))
+
+
+        case .noToken:
+            writeInt(&buf, Int32(9))
+
+
+        case .offlineStrict:
+            writeInt(&buf, Int32(10))
+
+        }
+    }
+}
+
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleConnectionCheck_lift(_ buf: RustBuffer) throws -> AppleConnectionCheck {
+    return try FfiConverterTypeAppleConnectionCheck.lift(buf)
+}
+
+#if swift(>=5.8)
+@_documentation(visibility: private)
+#endif
+public func FfiConverterTypeAppleConnectionCheck_lower(_ value: AppleConnectionCheck) -> RustBuffer {
+    return FfiConverterTypeAppleConnectionCheck.lower(value)
+}
+
+
+
 public
 enum AppleEngineError: Swift.Error, Equatable, Hashable, Foundation.LocalizedError {
 
@@ -5326,6 +5508,9 @@ private let initializationResult: InitializationResult = {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_modelrunner_infer() != 54452) {
+        return InitializationResult.apiChecksumMismatch
+    }
+    if (uniffi_sinus_apple_checksum_method_synccontroller_check_connection() != 19280) {
         return InitializationResult.apiChecksumMismatch
     }
     if (uniffi_sinus_apple_checksum_method_synccontroller_clear_token() != 27506) {

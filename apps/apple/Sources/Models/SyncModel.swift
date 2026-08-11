@@ -17,6 +17,21 @@ final class SyncModel {
     private(set) var phr: PhrSettings?
     private(set) var tokenStatus: String
     private(set) var message: String?
+    /// Result of the last live "Test connection", or `nil` before one has run.
+    /// Distinct from `status.error`: that reports the *background* driver's
+    /// last flush failure, this reports an explicit, on-demand probe of the
+    /// server — the thing "Check token" never actually did (see
+    /// `AppleConnectionCheck`'s doc for the incident).
+    private(set) var connectionStatus: String?
+    /// Whether `connectionStatus` describes a failure — kept as a structured
+    /// flag rather than having the view sniff the text, so a wording change
+    /// to `ConnectionCheckMessage` can never silently change which color a
+    /// result renders in.
+    private(set) var connectionFailed = false
+    /// Set for the duration of `checkConnection()`'s blocking network call,
+    /// so the view can disable the button rather than let a user queue up
+    /// several probes against a server that has not answered the first one.
+    private(set) var isCheckingConnection = false
     /// Set by `suspend()`, cleared by `resume()` — distinct from "no engine"
     /// (this device never got as far as starting sync at all): `resume()`
     /// only rebuilds the controller when this is true.
@@ -136,14 +151,27 @@ final class SyncModel {
         phr = try? engine.phrSettings()
     }
 
-    func setServerUrl(_ url: String) {
+    /// Validates and normalizes `raw` before saving — SPEC's motivating
+    /// incident is half "the token was invalid" and half "the field applied
+    /// silently on focus-loss with no feedback at all", so a rejected URL now
+    /// sets `message` instead of being written verbatim, and an accepted one
+    /// gets a confirmation plus an immediate live check rather than leaving
+    /// the user to wonder whether it actually works.
+    func setServerUrl(_ raw: String) {
         guard let engine else { return }
-        do {
-            try engine.setServerUrl(url: url)
-            reload()
-            wakeDriver()
-        } catch {
-            message = "Could not save server URL: \(error.localizedDescription)"
+        switch ServerUrlNormalizer.normalize(raw) {
+        case .failure(let reason):
+            message = reason
+        case .success(let normalized):
+            do {
+                try engine.setServerUrl(url: normalized)
+                reload()
+                message = "Server URL saved."
+                wakeDriver()
+                checkConnection()
+            } catch {
+                message = "Could not save server URL: \(error.localizedDescription)"
+            }
         }
     }
 
@@ -201,15 +229,45 @@ final class SyncModel {
 
     /// Checks only whether a token exists; never reads it into the UI —
     /// same promise the desktop tray's "Check token" hover text makes.
+    ///
+    /// This is deliberately not "is sync working": SPEC's motivating incident
+    /// was a token that existed here and was still rejected by the server
+    /// (revoked after a key-expiry policy landed on the PHR), and this check
+    /// alone cannot see that — hence the wording pointing at `checkConnection`
+    /// instead of implying validity it never had.
     func checkToken() {
         guard let controller else { return }
         do {
             tokenStatus = try controller.hasToken()
-                ? "Token stored in the OS keychain."
+                ? "A token is stored in the OS keychain (existence only — use Test connection to validate it)."
                 : "No API token is stored."
         } catch {
             tokenStatus = "Could not check token: \(error.localizedDescription)"
         }
+    }
+
+    /// Live "Test connection": asks the PHR whether the stored token is
+    /// actually accepted for this patient, rather than only confirming one
+    /// exists (see `checkToken`). Blocks on the network for up to the Rust
+    /// HTTP client's 30-second timeout, so the call runs detached and hops
+    /// back to the main actor only to publish the result.
+    func checkConnection() {
+        guard let controller, !isCheckingConnection else { return }
+        isCheckingConnection = true
+        // Mirrors `TrainingModel.finishTake`: call back into a `@MainActor`
+        // method on `self?` rather than wrapping the publish in a nested
+        // `MainActor.run` closure, which the Swift 6 concurrency checker
+        // flags for capturing `self` across the actor hop.
+        Task.detached { [weak self] in
+            let outcome = controller.checkConnection()
+            await self?.publishConnectionResult(outcome)
+        }
+    }
+
+    private func publishConnectionResult(_ outcome: AppleConnectionCheck) {
+        connectionStatus = ConnectionCheckMessage.message(for: outcome)
+        connectionFailed = ConnectionCheckMessage.isFailure(outcome)
+        isCheckingConnection = false
     }
 
     func removeToken() {

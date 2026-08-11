@@ -24,7 +24,7 @@ struct PhrSettingsView: View {
             Section("Connection") {
                 TextField("Server URL", text: $serverUrlText)
                     .focused($focusedField, equals: .serverUrl)
-                    .onSubmit { sync.setServerUrl(serverUrlText) }
+                    .onSubmit { commitServerUrl(sync) }
 
                 TextField("Patient id", text: $patientIdText)
                     .focused($focusedField, equals: .patientId)
@@ -38,6 +38,18 @@ struct PhrSettingsView: View {
                     Text("Auto-batch").tag(SyncMode.autoBatch)
                     Text("Offline-first").tag(SyncMode.offlineFirst)
                     Text("Offline-strict (never uploads)").tag(SyncMode.offlineStrict)
+                }
+
+                Button("Test connection") {
+                    sync.checkConnection()
+                }
+                .disabled(sync.isCheckingConnection)
+                .help("Asks the server whether the stored token is actually accepted — \"Check token\" below only proves one is stored")
+
+                if let connectionStatus = sync.connectionStatus {
+                    Text(connectionStatus)
+                        .font(.footnote)
+                        .foregroundStyle(sync.connectionFailed ? .red : .secondary)
                 }
             }
 
@@ -104,7 +116,7 @@ struct PhrSettingsView: View {
         .formStyle(.grouped)
         .onChange(of: focusedField) { oldValue, newValue in
             if oldValue == .serverUrl && newValue != .serverUrl {
-                sync.setServerUrl(serverUrlText)
+                commitServerUrl(sync)
             }
             if oldValue == .patientId && newValue != .patientId {
                 sync.setPatientId(patientIdText)
@@ -115,5 +127,15 @@ struct PhrSettingsView: View {
             serverUrlText = sync.phr?.serverUrl ?? ""
             patientIdText = sync.phr?.patientId.map(String.init) ?? ""
         }
+    }
+
+    /// Saves whatever is in the field, then reads the field back from what
+    /// actually landed (`sync.phr?.serverUrl`, refreshed by `setServerUrl`'s
+    /// own `reload()`) — a normalized save shows the user the root that was
+    /// actually stored, and a rejected one reverts the field to the last
+    /// value that did save rather than leaving invalid text sitting there.
+    private func commitServerUrl(_ sync: SyncModel) {
+        sync.setServerUrl(serverUrlText)
+        serverUrlText = sync.phr?.serverUrl ?? serverUrlText
     }
 }
