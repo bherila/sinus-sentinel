@@ -149,6 +149,7 @@ pub struct SharedStatus {
     teach_separation: Arc<AtomicU32>,
     enrollment_reload: Arc<AtomicBool>,
     settings_reload: Arc<AtomicBool>,
+    calibrating: Arc<AtomicBool>,
     analyzing: Arc<AtomicBool>,
     last_heard_ms: Arc<AtomicI64>,
     pause_until_ms: Arc<AtomicI64>,
@@ -177,6 +178,7 @@ impl Default for SharedStatus {
             teach_separation: Arc::new(AtomicU32::new(0.0f32.to_bits())),
             enrollment_reload: Arc::new(AtomicBool::new(false)),
             settings_reload: Arc::new(AtomicBool::new(false)),
+            calibrating: Arc::new(AtomicBool::new(false)),
             analyzing: Arc::new(AtomicBool::new(false)),
             last_heard_ms: Arc::new(AtomicI64::new(0)),
             pause_until_ms: Arc::new(AtomicI64::new(0)),
@@ -407,6 +409,9 @@ impl SharedStatus {
     #[cfg_attr(test, allow(dead_code))]
     pub fn set_quitting(&self, on: bool) {
         self.quitting.store(on, Ordering::Relaxed);
+        if on {
+            self.set_calibrating(false);
+        }
         self.wake_capture();
         self.notify_sync();
     }
@@ -500,6 +505,20 @@ impl SharedStatus {
     #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
     pub fn take_settings_reload(&self) -> bool {
         self.settings_reload.swap(false, Ordering::AcqRel)
+    }
+
+    /// Passive desktop capture intentionally suppresses detection while it
+    /// validates the initial room window. Publish that blind interval so the
+    /// tray and native window never claim ordinary listening readiness.
+    #[cfg_attr(not(feature = "live-audio"), allow(dead_code))]
+    pub fn set_calibrating(&self, on: bool) {
+        if self.calibrating.swap(on, Ordering::Relaxed) != on {
+            self.notify_ui();
+        }
+    }
+
+    pub fn calibrating(&self) -> bool {
+        self.calibrating.load(Ordering::Relaxed)
     }
 
     /// Published by the capture thread while the energy gate is open — the app
@@ -644,5 +663,14 @@ mod tests {
         shared.notify_sync();
         let next = shared.wait_for_sync_signal(observed, Duration::from_secs(1));
         assert_ne!(next, observed);
+    }
+
+    #[test]
+    fn calibration_state_is_shared_and_cleared_on_quit() {
+        let shared = SharedStatus::default();
+        shared.set_calibrating(true);
+        assert!(shared.calibrating());
+        shared.set_quitting(true);
+        assert!(!shared.calibrating());
     }
 }

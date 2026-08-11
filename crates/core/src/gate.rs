@@ -1,11 +1,26 @@
 //! Stage ① — energy gate (SPEC §4.1). Runs always at ≈0 CPU (no FFT): per 50 ms
-//! hop it computes RMS energy in dB and maintains an adaptive noise floor (EMA
-//! that rises slowly / falls fast). The gate opens at `floor + open_margin` and,
-//! once open, stays open until energy sits below the (hysteresis-lowered) close
-//! threshold for a full tail. A 1 s pre-roll is pulled from the ring buffer on
-//! the opening edge so the *onset* of the sound is analyzed, not just its tail.
+//! hop it computes RMS energy in dB and maintains an adaptive noise floor.
+//! Startup calibration is an explicit live-capture policy; finite clips default
+//! to immediate detection. A lower-quantile estimator tracks sustained ambient
+//! sound without treating frequent foreground bursts as the room. The gate opens
+//! at `floor + open_margin` and, once open, stays
+//! open until energy sits below the (hysteresis-lowered) close threshold for a
+//! full tail. A 1 s pre-roll is pulled from the ring buffer on the opening edge
+//! so the *onset* of the sound is analyzed, not just its tail.
+
+use std::collections::VecDeque;
 
 use crate::types::SAMPLE_RATE;
+
+/// Whether a new gate is immediately usable or first observes a live room.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum GateStartupMode {
+    /// Detect from the first hop. Used by finite clips and user-triggered mobile
+    /// sessions, where consuming an ambient lead-in would silently lose events.
+    Immediate,
+    /// Hold the gate closed while collecting a candidate room estimate.
+    Calibrate { duration_ms: u32 },
+}
 
 /// Gate tuning. Defaults follow SPEC §4.1.
 #[derive(Debug, Clone)]
@@ -29,6 +44,20 @@ pub struct GateConfig {
     pub fall_tau_s: f32,
     /// Initial floor estimate in dBFS.
     pub floor_init_db: f32,
+    /// Levels below this are treated as invalid device/digital silence rather
+    /// than evidence about the physical room.
+    pub min_valid_dbfs: f32,
+    /// A live calibration cannot lower the authoritative floor below this bound.
+    pub min_calibrated_floor_dbfs: f32,
+    /// Robust quantile over the recent level horizon (0.25 means foreground
+    /// must occupy roughly 75% before it can replace ordinary quiet gaps).
+    pub ambient_quantile: f32,
+    /// Startup behavior. The shared default is immediate; passive live capture
+    /// opts into calibration explicitly.
+    pub startup_mode: GateStartupMode,
+    /// Rolling RMS window used to distinguish sustained ambient sound from a
+    /// short foreground event.
+    pub ambient_window_ms: u32,
 }
 
 impl Default for GateConfig {
@@ -43,6 +72,11 @@ impl Default for GateConfig {
             rise_tau_s: 3.0,
             fall_tau_s: 0.2,
             floor_init_db: -60.0,
+            min_valid_dbfs: -115.0,
+            min_calibrated_floor_dbfs: -95.0,
+            ambient_quantile: 0.25,
+            startup_mode: GateStartupMode::Immediate,
+            ambient_window_ms: 10_000,
         }
     }
 }
@@ -60,6 +94,17 @@ impl GateConfig {
 
     fn tail_hops(&self) -> u32 {
         self.tail_ms / self.hop_ms
+    }
+
+    fn calibration_hops(&self) -> u32 {
+        match self.startup_mode {
+            GateStartupMode::Immediate => 0,
+            GateStartupMode::Calibrate { duration_ms } => duration_ms.div_ceil(self.hop_ms),
+        }
+    }
+
+    fn ambient_window_hops(&self) -> usize {
+        self.ambient_window_ms.div_ceil(self.hop_ms).max(1) as usize
     }
 }
 
@@ -88,15 +133,40 @@ pub struct HopReport {
     pub edge: Option<GateEdge>,
 }
 
+/// Current gate estimator state, kept separate so a miss can be attributed to
+/// the short floor, robust floor, or their effective maximum.
+#[derive(Debug, Clone, Copy, PartialEq)]
+pub struct GateDiagnostics {
+    pub calibrating: bool,
+    pub short_floor_db: f32,
+    pub ambient_floor_db: f32,
+    pub effective_floor_db: f32,
+    pub current_rms_db: f32,
+    pub open: bool,
+}
+
 /// Adaptive-noise-floor energy gate.
 #[derive(Debug, Clone)]
 pub struct Gate {
     cfg: GateConfig,
+    /// Fast closed-gate EMA.
     floor_db: f32,
+    /// Robust baseline across recent audio, including open-gate spans.
+    ambient_floor_db: f32,
+    /// One entry per hop so invalid/silent spans still age old observations out.
+    ambient_levels: VecDeque<Option<f32>>,
+    calibration_levels: Vec<f32>,
+    calibration_hops_remaining: u32,
+    hops_until_ambient_refresh: u32,
+    quieter_closed_hops: u32,
+    /// Once a formerly loud room is falling, stale loud observations must not
+    /// promote it again until recent robust evidence has replaced that source.
+    ambient_recovery_active: bool,
     open: bool,
     hops_below: u32,
     alpha_rise: f32,
     alpha_fall: f32,
+    current_rms_db: f32,
 }
 
 impl Gate {
@@ -105,13 +175,23 @@ impl Gate {
         let alpha_rise = 1.0 - (-dt / cfg.rise_tau_s).exp();
         let alpha_fall = 1.0 - (-dt / cfg.fall_tau_s).exp();
         let floor_db = cfg.floor_init_db;
+        let calibration_hops_remaining = cfg.calibration_hops();
+        let ambient_capacity = cfg.ambient_window_hops();
         Gate {
             cfg,
             floor_db,
+            ambient_floor_db: floor_db,
+            ambient_levels: VecDeque::with_capacity(ambient_capacity),
+            calibration_levels: Vec::with_capacity(calibration_hops_remaining as usize),
+            calibration_hops_remaining,
+            hops_until_ambient_refresh: 0,
+            quieter_closed_hops: 0,
+            ambient_recovery_active: false,
             open: false,
             hops_below: 0,
             alpha_rise,
             alpha_fall,
+            current_rms_db: floor_db,
         }
     }
 
@@ -124,11 +204,30 @@ impl Gate {
     }
 
     pub fn floor_db(&self) -> f32 {
-        self.floor_db
+        self.floor_db.max(self.ambient_floor_db)
+    }
+
+    pub fn diagnostics(&self) -> GateDiagnostics {
+        GateDiagnostics {
+            calibrating: self.calibration_hops_remaining > 0,
+            short_floor_db: self.floor_db,
+            ambient_floor_db: self.ambient_floor_db,
+            effective_floor_db: self.floor_db(),
+            current_rms_db: self.current_rms_db,
+            open: self.open,
+        }
     }
 
     pub fn is_open(&self) -> bool {
         self.open
+    }
+
+    /// Reset only state that could join events across an unmonitored gap. Room
+    /// observations and an in-progress first calibration deliberately survive.
+    pub fn reset_temporal(&mut self) {
+        self.open = false;
+        self.hops_below = 0;
+        self.quieter_closed_hops = 0;
     }
 
     /// Compute the RMS level of a hop in dBFS.
@@ -141,16 +240,152 @@ impl Gate {
         20.0 * (rms + 1e-9).log10() as f32
     }
 
+    fn valid_level(&self, rms_db: f32) -> bool {
+        // Digital silence is about -180 dBFS with the RMS epsilon above. It is
+        // not evidence about microphone gain or the physical room.
+        rms_db.is_finite() && rms_db >= self.cfg.min_valid_dbfs
+    }
+
+    fn quantile(mut levels: Vec<f32>, fraction: f32) -> Option<f32> {
+        if levels.is_empty() {
+            return None;
+        }
+        let index = ((levels.len() - 1) as f32 * fraction.clamp(0.0, 1.0)).round() as usize;
+        let (_, value, _) = levels.select_nth_unstable_by(index, f32::total_cmp);
+        Some(*value)
+    }
+
+    fn ambient_quantile(&self) -> Option<f32> {
+        Self::quantile(
+            self.ambient_levels.iter().flatten().copied().collect(),
+            self.cfg.ambient_quantile,
+        )
+    }
+
+    fn stable_recent_level(&self) -> Option<f32> {
+        let count = 3000u32.div_ceil(self.cfg.hop_ms).max(1) as usize;
+        if self.ambient_levels.len() < count {
+            return None;
+        }
+        let recent: Vec<f32> = self
+            .ambient_levels
+            .iter()
+            .rev()
+            .take(count)
+            .copied()
+            .collect::<Option<Vec<_>>>()?;
+        let q25 = Self::quantile(recent.clone(), 0.25)?;
+        let q75 = Self::quantile(recent, 0.75)?;
+        (q75 - q25 <= 2.0).then_some(q25)
+    }
+
+    fn finish_calibration(&mut self) {
+        let expected = self.cfg.calibration_hops() as usize;
+        // Calibration is a fixed wall-clock window. Missing hops are invalid
+        // evidence, not permission to learn only the foreground that followed
+        // a muted/zero-filled device startup.
+        if self.calibration_levels.len() != expected {
+            return;
+        }
+        let q25 = Self::quantile(self.calibration_levels.clone(), 0.25).unwrap();
+        let q75 = Self::quantile(self.calibration_levels.clone(), 0.75).unwrap();
+        // A stable room is safe to adopt. Handling noise, speech and coughs are
+        // variable; retain the prior/default estimate and keep adapting instead.
+        if q75 - q25 <= 6.0 {
+            let estimate = q25.max(self.cfg.min_calibrated_floor_dbfs);
+            self.floor_db = estimate;
+            self.ambient_floor_db = estimate;
+        }
+    }
+
+    /// Record every hop, including open-gate audio. The 25th percentile means a
+    /// foreground level must occupy roughly 75% of the time horizon before it
+    /// can replace ordinary quiet gaps. A stable source can be promoted sooner.
+    fn observe_ambient(&mut self, rms_db: f32) {
+        let capacity = self.cfg.ambient_window_hops();
+        if self.ambient_levels.len() == capacity {
+            self.ambient_levels.pop_front();
+        }
+        self.ambient_levels
+            .push_back(self.valid_level(rms_db).then_some(rms_db));
+
+        let minimum = (capacity / 2).max(1);
+        let valid_count = self.ambient_levels.iter().flatten().count();
+
+        if self.ambient_recovery_active {
+            // Keep stale upward candidates disabled until either the full robust
+            // horizon or a consecutive stable lower window says the old source
+            // has actually been replaced. Always return on the exit hop so the
+            // same observation cannot both end recovery and promote upward.
+            let robust_replaced = valid_count >= minimum
+                && self
+                    .ambient_quantile()
+                    .is_some_and(|level| level <= self.ambient_floor_db);
+            let stable_lower = self
+                .stable_recent_level()
+                .is_some_and(|level| level <= self.ambient_floor_db);
+            if robust_replaced || stable_lower {
+                self.ambient_recovery_active = false;
+                self.quieter_closed_hops = 0;
+            }
+            return;
+        }
+
+        // Refresh at 2 Hz; recalculating on every 50 ms hop adds no useful
+        // responsiveness. Closed-gate evidence that the room became quieter is
+        // handled separately below and must not be overwritten by stale history.
+        if valid_count < minimum {
+            return;
+        }
+        if self.hops_until_ambient_refresh > 0 {
+            self.hops_until_ambient_refresh -= 1;
+            return;
+        }
+        if let Some(stable) = self.stable_recent_level() {
+            if stable > self.ambient_floor_db + 3.0 {
+                self.ambient_floor_db = stable;
+            }
+        } else if let Some(candidate) = self.ambient_quantile() {
+            if candidate > self.ambient_floor_db {
+                self.ambient_floor_db = candidate;
+            }
+        }
+        self.hops_until_ambient_refresh = 500u32.div_ceil(self.cfg.hop_ms).max(1) - 1;
+    }
+
     /// Process one 50 ms hop of samples and update gate state.
     pub fn process_hop(&mut self, samples: &[f32]) -> HopReport {
         let rms_db = Self::rms_db(samples);
+        self.current_rms_db = rms_db;
 
-        let open_threshold = self.floor_db + self.cfg.open_margin_db;
-        let close_threshold = self.floor_db + self.cfg.open_margin_db - self.cfg.hysteresis_db;
+        let calibrating = self.calibration_hops_remaining > 0;
+        if calibrating {
+            if self.valid_level(rms_db) {
+                self.calibration_levels.push(rms_db);
+            }
+            self.observe_ambient(rms_db);
+            self.calibration_hops_remaining -= 1;
+            if self.calibration_hops_remaining == 0 {
+                self.finish_calibration();
+            }
+            return HopReport {
+                rms_db,
+                floor_db: self.floor_db(),
+                open: false,
+                energy_peak: false,
+                edge: None,
+            };
+        }
+
+        self.observe_ambient(rms_db);
+
+        let effective_floor = self.floor_db();
+        let open_threshold = effective_floor + self.cfg.open_margin_db;
+        let close_threshold = effective_floor + self.cfg.open_margin_db - self.cfg.hysteresis_db;
         // An energy peak = well above the floor, used for weak-class coincidence
         // and burst counting. Uses half the open margin so it flags the loud core
         // of a segment even mid-session.
-        let energy_peak = rms_db > self.floor_db + self.cfg.open_margin_db * 0.5;
+        let energy_peak = rms_db > effective_floor + self.cfg.open_margin_db * 0.5;
 
         let mut edge = None;
         if self.open {
@@ -170,25 +405,41 @@ impl Gate {
             edge = Some(GateEdge::Opened);
         }
 
-        // Update the adaptive floor: slow rise, fast fall — but ONLY while the gate
-        // is closed. Freezing the floor while the gate is open is standard
-        // noise-gate practice: an open gate is measuring signal+noise, not the room
-        // floor, so letting the ~3 s rise track a loud event would erode the
-        // open/close margin for the duration of a long event (SPEC §4.1 ①). The
-        // slow-rise "a persistent fan raises the floor" behaviour still holds while
-        // the gate is closed, where the ambient level is what's being measured.
-        if !self.open {
+        // Update the short-term EMA only while closed: a brief open-gate event is
+        // signal+noise, not the room floor. The separate rolling median observes
+        // every hop and only moves when a level dominates the longer window, so a
+        // truly sustained fan can still become background without one cough
+        // eroding the margin.
+        if !self.open && self.valid_level(rms_db) {
             let alpha = if rms_db > self.floor_db {
                 self.alpha_rise
             } else {
                 self.alpha_fall
             };
             self.floor_db += alpha * (rms_db - self.floor_db);
+
+            // The short EMA can lag low immediately after a fan is promoted.
+            // Require the current closed-gate audio to be lower too, otherwise
+            // the still-running fan would trigger its own downward recovery.
+            if rms_db < self.ambient_floor_db - 3.0 && self.floor_db < self.ambient_floor_db - 3.0 {
+                self.quieter_closed_hops += 1;
+                let recovery_hops = 500u32.div_ceil(self.cfg.hop_ms).max(1);
+                if self.quieter_closed_hops >= recovery_hops {
+                    self.ambient_recovery_active = true;
+                }
+            } else if !self.ambient_recovery_active {
+                self.quieter_closed_hops = 0;
+            }
+            if self.ambient_recovery_active && self.floor_db < self.ambient_floor_db {
+                self.ambient_floor_db += self.alpha_fall * (self.floor_db - self.ambient_floor_db);
+            }
+        } else if self.open {
+            self.quieter_closed_hops = 0;
         }
 
         HopReport {
             rms_db,
-            floor_db: self.floor_db,
+            floor_db: self.floor_db(),
             open: self.open,
             energy_peak: energy_peak && self.open,
             edge,
@@ -200,6 +451,13 @@ impl Gate {
 mod tests {
     use super::*;
     use crate::synth;
+
+    fn live_config() -> GateConfig {
+        GateConfig {
+            startup_mode: GateStartupMode::Calibrate { duration_ms: 1000 },
+            ..GateConfig::default()
+        }
+    }
 
     /// Feed silence-ish noise, then a loud burst, then quiet again, and assert
     /// the gate opens on the burst and closes ~1 s (tail) after it ends.
@@ -282,32 +540,87 @@ mod tests {
     }
 
     #[test]
-    fn floor_frozen_while_gate_open() {
-        // Standard noise-gate behaviour: once the gate opens on a loud event, the
-        // noise floor is frozen so the long event can't erode the margin (SPEC
-        // §4.1, review finding #3). Verify the floor barely moves across a
-        // multi-second open span even though the signal is far above it.
+    fn a_short_open_gate_does_not_redefine_the_ambient_floor() {
+        // Fill the baseline with quiet room noise, then open for two seconds. The
+        // foreground sound occupies less than half the ten-second window, so it
+        // must not become the new ambient level.
         let cfg = GateConfig::default();
         let mut gate = Gate::new(cfg.clone());
         let hop = cfg.hop_samples();
 
-        // Open the gate with a loud tone.
-        let loud = synth::sine_hops(1, hop, cfg.sample_rate, 900.0, 0.5);
-        let r = gate.process_hop(&loud);
-        assert!(r.open, "loud tone should open the gate");
+        let quiet = synth::white_noise_hops(200, hop, 0.003, 31);
+        for chunk in quiet.chunks(hop) {
+            assert!(!gate.process_hop(chunk).open);
+        }
         let floor_at_open = gate.floor_db();
 
-        // Hold it open for ~2 s of loud signal; the frozen floor must not drift.
         let hold = synth::sine_hops(40, hop, cfg.sample_rate, 900.0, 0.5);
         for chunk in hold.chunks(hop) {
             let r = gate.process_hop(chunk);
             assert!(r.open, "gate should stay open under sustained signal");
         }
         assert!(
-            (gate.floor_db() - floor_at_open).abs() < 0.01,
-            "floor must stay frozen while open: {floor_at_open} -> {}",
+            (gate.floor_db() - floor_at_open).abs() < 0.5,
+            "a short foreground sound must not redefine ambient: {floor_at_open} -> {}",
             gate.floor_db()
         );
+    }
+
+    #[test]
+    fn startup_calibration_ignores_an_already_running_background() {
+        let cfg = live_config();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+
+        // About -40 dBFS RMS: loud enough to open immediately against the old
+        // fixed -60 dBFS initialization, but now learned as the room baseline.
+        let background = synth::sine_hops(40, hop, cfg.sample_rate, 120.0, 0.014);
+        for chunk in background.chunks(hop) {
+            let report = gate.process_hop(chunk);
+            assert!(
+                !report.open,
+                "calibrated background must stay below the gate"
+            );
+        }
+        assert!(gate.floor_db() > -43.0, "floor = {}", gate.floor_db());
+
+        let foreground = synth::sine_hops(1, hop, cfg.sample_rate, 900.0, 0.2);
+        let report = gate.process_hop(&foreground);
+        assert!(
+            report.open,
+            "a real foreground burst must still open the gate"
+        );
+    }
+
+    #[test]
+    fn sustained_new_background_becomes_the_baseline() {
+        let cfg = GateConfig::default();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+
+        let quiet = synth::white_noise_hops(200, hop, 0.003, 41);
+        for chunk in quiet.chunks(hop) {
+            gate.process_hop(chunk);
+        }
+
+        // A fan starting after calibration initially opens the gate, but once it
+        // occupies most of the rolling window it becomes ambient and the gate
+        // closes instead of classifying it forever.
+        let fan = synth::sine_hops(240, hop, cfg.sample_rate, 120.0, 0.014);
+        let mut opened = false;
+        for chunk in fan.chunks(hop) {
+            let report = gate.process_hop(chunk);
+            opened |= report.edge == Some(GateEdge::Opened);
+        }
+        assert!(
+            opened,
+            "the abrupt background onset should initially be heard"
+        );
+        assert!(
+            !gate.is_open(),
+            "sustained background should be gated back out"
+        );
+        assert!(gate.floor_db() > -43.0, "floor = {}", gate.floor_db());
     }
 
     #[test]
@@ -315,5 +628,210 @@ mod tests {
         let cfg = GateConfig::default();
         assert_eq!(cfg.hop_samples(), 800); // 16 kHz * 50 ms
         assert_eq!(cfg.preroll_hops(), 20); // 1 s / 50 ms
+        assert_eq!(cfg.calibration_hops(), 0); // finite clips detect immediately
+        assert_eq!(live_config().calibration_hops(), 20); // 1 s / 50 ms
+        assert_eq!(cfg.ambient_window_hops(), 200); // 10 s / 50 ms
+    }
+
+    #[test]
+    fn digital_silence_does_not_poison_live_calibration() {
+        let cfg = live_config();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+
+        for _ in 0..cfg.calibration_hops() {
+            assert!(!gate.process_hop(&vec![0.0; hop]).open);
+        }
+        assert_eq!(gate.diagnostics().ambient_floor_db, cfg.floor_init_db);
+
+        let room = synth::white_noise_hops(80, hop, 0.003, 71);
+        for chunk in room.chunks(hop) {
+            assert!(
+                !gate.process_hop(chunk).open,
+                "ordinary room noise after a zero-filled device startup must stay gated"
+            );
+        }
+    }
+
+    #[test]
+    fn variable_foreground_during_calibration_is_not_adopted_as_the_room() {
+        let cfg = live_config();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+        let mut startup = synth::sine_hops(8, hop, cfg.sample_rate, 300.0, 0.6);
+        startup.extend(synth::white_noise_hops(12, hop, 0.003, 73));
+        for chunk in startup.chunks(hop) {
+            gate.process_hop(chunk);
+        }
+
+        assert!(
+            gate.diagnostics().ambient_floor_db < -50.0,
+            "a variable startup foreground must not leave a high ambient floor: {:?}",
+            gate.diagnostics()
+        );
+        let event = synth::sine_hops(1, hop, cfg.sample_rate, 300.0, 0.1);
+        assert!(gate.process_hop(&event).open);
+    }
+
+    #[test]
+    fn incomplete_valid_calibration_does_not_adopt_the_following_foreground() {
+        let cfg = live_config();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+        let silence = vec![0.0; hop];
+        for _ in 0..10 {
+            gate.process_hop(&silence);
+        }
+        let foreground = synth::sine_hops(11, hop, cfg.sample_rate, 300.0, 0.2);
+        for chunk in foreground[..10 * hop].chunks(hop) {
+            assert!(!gate.process_hop(chunk).open);
+        }
+
+        assert_eq!(gate.diagnostics().ambient_floor_db, cfg.floor_init_db);
+        assert!(
+            gate.process_hop(&foreground[10 * hop..]).open,
+            "the continuing foreground must open immediately after the fixed calibration window"
+        );
+    }
+
+    #[test]
+    fn invalid_slots_do_not_make_one_foreground_hop_ready_for_promotion() {
+        let cfg = GateConfig::default();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+        let silence = vec![0.0; hop];
+        for _ in 0..109 {
+            gate.process_hop(&silence);
+        }
+        let before = gate.diagnostics().ambient_floor_db;
+        let foreground = synth::sine_hops(1, hop, cfg.sample_rate, 300.0, 0.2);
+        let report = gate.process_hop(&foreground);
+        assert_eq!(gate.diagnostics().ambient_floor_db, before);
+        assert!(report.open, "one valid foreground hop must open the gate");
+    }
+
+    #[test]
+    fn ambient_promotion_waits_for_enough_valid_observations_after_invalid_audio() {
+        let cfg = GateConfig::default();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+        let silence = vec![0.0; hop];
+        for _ in 0..200 {
+            gate.process_hop(&silence);
+        }
+        let initial = gate.diagnostics().ambient_floor_db;
+        let room = synth::white_noise_hops(100, hop, 0.003, 75);
+        for chunk in room[..99 * hop].chunks(hop) {
+            gate.process_hop(chunk);
+        }
+        assert_eq!(gate.diagnostics().ambient_floor_db, initial);
+
+        gate.process_hop(&room[99 * hop..]);
+        assert!(
+            gate.diagnostics().ambient_floor_db > initial,
+            "promotion should become eligible at the configured valid-observation minimum"
+        );
+    }
+
+    #[test]
+    fn repeated_foreground_bursts_do_not_become_ambient() {
+        let cfg = GateConfig::default();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+        for chunk in synth::white_noise_hops(200, hop, 0.003, 79).chunks(hop) {
+            gate.process_hop(chunk);
+        }
+
+        let mut saw_peak_late = false;
+        for cycle in 0..15 {
+            for chunk in synth::sine_hops(12, hop, cfg.sample_rate, 300.0, 0.2).chunks(hop) {
+                let report = gate.process_hop(chunk);
+                if cycle >= 10 {
+                    saw_peak_late |= report.energy_peak;
+                }
+            }
+            for chunk in synth::white_noise_hops(8, hop, 0.003, 100 + cycle).chunks(hop) {
+                gate.process_hop(chunk);
+            }
+        }
+
+        assert!(saw_peak_late, "late symptom bursts must remain foreground");
+        assert!(
+            gate.diagnostics().ambient_floor_db < -45.0,
+            "60% symptom occupancy must not replace the quiet baseline: {:?}",
+            gate.diagnostics()
+        );
+    }
+
+    #[test]
+    fn ambient_floor_recovers_after_sustained_background_stops() {
+        let cfg = GateConfig::default();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+        for chunk in synth::white_noise_hops(200, hop, 0.003, 91).chunks(hop) {
+            gate.process_hop(chunk);
+        }
+        for chunk in synth::sine_hops(240, hop, cfg.sample_rate, 120.0, 0.014).chunks(hop) {
+            gate.process_hop(chunk);
+        }
+        assert!(gate.diagnostics().ambient_floor_db > -43.0);
+
+        let quiet = synth::white_noise_hops(100, hop, 0.003, 92);
+        let mut chunks = quiet.chunks(hop);
+        let mut recovered_at = None;
+        for index in 0..60 {
+            gate.process_hop(chunks.next().unwrap());
+            if gate.diagnostics().ambient_floor_db < -48.0 {
+                recovered_at = Some(index + 1);
+                break;
+            }
+        }
+        let recovered_at = recovered_at.expect("ambient floor should recover after the fan stops");
+        assert!(
+            recovered_at <= 40,
+            "recovery took {recovered_at} hops ({:.2}s)",
+            recovered_at as f32 * cfg.hop_ms as f32 / 1000.0
+        );
+
+        for chunk in chunks.by_ref().take(40) {
+            gate.process_hop(chunk);
+            assert!(
+                gate.diagnostics().ambient_floor_db < -48.0,
+                "recovered ambient floor rebounded: {:?}",
+                gate.diagnostics()
+            );
+        }
+    }
+
+    #[test]
+    fn a_quiet_event_opens_during_the_former_rebound_window() {
+        let cfg = GateConfig::default();
+        let mut gate = Gate::new(cfg.clone());
+        let hop = cfg.hop_samples();
+        for chunk in synth::white_noise_hops(200, hop, 0.003, 93).chunks(hop) {
+            gate.process_hop(chunk);
+        }
+        for chunk in synth::sine_hops(240, hop, cfg.sample_rate, 120.0, 0.014).chunks(hop) {
+            gate.process_hop(chunk);
+        }
+
+        let quiet = synth::white_noise_hops(80, hop, 0.003, 94);
+        let mut quiet_chunks = quiet.chunks(hop);
+        while gate.diagnostics().ambient_floor_db >= -48.0 {
+            gate.process_hop(
+                quiet_chunks
+                    .next()
+                    .expect("floor should recover before quiet input ends"),
+            );
+        }
+        for chunk in quiet_chunks.by_ref().take(10) {
+            gate.process_hop(chunk);
+        }
+
+        let quiet_event = synth::sine_hops(1, hop, cfg.sample_rate, 900.0, 0.03);
+        assert!(
+            gate.process_hop(&quiet_event).open,
+            "a quiet event at the former stale-history rebound must open"
+        );
     }
 }

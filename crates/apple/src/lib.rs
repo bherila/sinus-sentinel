@@ -4,7 +4,7 @@
 //! converted 16 kHz mono PCM and owns the detector, persistence, and projections.
 
 use std::fmt;
-use std::sync::atomic::{AtomicBool, AtomicI64, Ordering};
+use std::sync::atomic::{AtomicBool, AtomicI64, AtomicU32, Ordering};
 use std::sync::{Arc, Condvar, Mutex, MutexGuard};
 use std::thread::JoinHandle;
 use std::time::{Duration, Instant};
@@ -616,9 +616,16 @@ pub struct PhrSettings {
 #[derive(Debug, Clone, uniffi::Record)]
 pub struct EngineStatus {
     pub monitoring: bool,
+    /// Passive desktop capture is intentionally holding detection closed while
+    /// it validates the initial room estimate. Mobile sessions start immediately.
+    pub calibrating: bool,
     /// The energy gate is open — a sound is arriving and is being classified.
     /// Drives the "heard something — classifying…" indicator.
     pub gate_open: bool,
+    pub short_floor_dbfs: f32,
+    pub ambient_floor_dbfs: f32,
+    pub effective_floor_dbfs: f32,
+    pub current_rms_dbfs: f32,
     /// When the gate last opened, for a UI that wants "last heard 4s ago"
     /// rather than a flicker. `None` if it has not opened this session.
     pub last_heard_epoch_ms: Option<i64>,
@@ -654,6 +661,11 @@ pub struct AppleEngine {
     /// read connection, which is what lets a UI poll several times a second
     /// without ever contending with the audio thread.
     gate_open: AtomicBool,
+    calibrating: AtomicBool,
+    short_floor_dbfs: AtomicU32,
+    ambient_floor_dbfs: AtomicU32,
+    effective_floor_dbfs: AtomicU32,
+    current_rms_dbfs: AtomicU32,
     /// Epoch milliseconds when the gate was last observed open; 0 for "never".
     last_heard_epoch_ms: AtomicI64,
     /// Mirrors `MonitoringEngine::is_monitoring`, updated on the transitions.
@@ -713,12 +725,18 @@ impl AppleEngine {
             embedder,
             MonitoringConfig::new(config.platform.source()),
         )?;
+        let diagnostics = engine.gate_diagnostics();
         let reader = Store::open(&config.database_path)?;
         let database_path = config.database_path.clone();
         Ok(Arc::new(Self {
             inner: Mutex::new(engine),
             reader: Mutex::new(reader),
             gate_open: AtomicBool::new(false),
+            calibrating: AtomicBool::new(diagnostics.calibrating),
+            short_floor_dbfs: AtomicU32::new(diagnostics.short_floor_db.to_bits()),
+            ambient_floor_dbfs: AtomicU32::new(diagnostics.ambient_floor_db.to_bits()),
+            effective_floor_dbfs: AtomicU32::new(diagnostics.effective_floor_db.to_bits()),
+            current_rms_dbfs: AtomicU32::new(diagnostics.current_rms_db.to_bits()),
             last_heard_epoch_ms: AtomicI64::new(0),
             monitoring: AtomicBool::new(false),
             model_version: version,
@@ -735,9 +753,12 @@ impl AppleEngine {
     ) -> Result<(), AppleEngineError> {
         let started_at = timestamp(started_at_epoch_ms)?;
         check_timezone_offset(timezone_offset_minutes)?;
-        self.lock()?
-            .start_session(started_at, timezone_offset_minutes);
+        let mut engine = self.lock()?;
+        engine.start_session(started_at, timezone_offset_minutes);
+        let diagnostics = engine.gate_diagnostics();
         self.gate_open.store(false, Ordering::Relaxed);
+        self.calibrating
+            .store(diagnostics.calibrating, Ordering::Relaxed);
         self.monitoring.store(true, Ordering::Relaxed);
         Ok(())
     }
@@ -750,7 +771,18 @@ impl AppleEngine {
         // and a second acquisition would be a needless contention point against
         // any UI thread waiting on `status()`.
         let gate_open = engine.gate_open();
+        let diagnostics = engine.gate_diagnostics();
         self.gate_open.store(gate_open, Ordering::Relaxed);
+        self.calibrating
+            .store(diagnostics.calibrating, Ordering::Relaxed);
+        self.short_floor_dbfs
+            .store(diagnostics.short_floor_db.to_bits(), Ordering::Relaxed);
+        self.ambient_floor_dbfs
+            .store(diagnostics.ambient_floor_db.to_bits(), Ordering::Relaxed);
+        self.effective_floor_dbfs
+            .store(diagnostics.effective_floor_db.to_bits(), Ordering::Relaxed);
+        self.current_rms_dbfs
+            .store(diagnostics.current_rms_db.to_bits(), Ordering::Relaxed);
         if gate_open {
             self.last_heard_epoch_ms
                 .store(Utc::now().timestamp_millis(), Ordering::Relaxed);
@@ -1002,9 +1034,15 @@ impl AppleEngine {
                 end_hour,
             });
         let last_heard = self.last_heard_epoch_ms.load(Ordering::Relaxed);
+        let monitoring = self.monitoring.load(Ordering::Relaxed);
         Ok(EngineStatus {
-            monitoring: self.monitoring.load(Ordering::Relaxed),
+            monitoring,
+            calibrating: monitoring && self.calibrating.load(Ordering::Relaxed),
             gate_open: self.gate_open.load(Ordering::Relaxed),
+            short_floor_dbfs: f32::from_bits(self.short_floor_dbfs.load(Ordering::Relaxed)),
+            ambient_floor_dbfs: f32::from_bits(self.ambient_floor_dbfs.load(Ordering::Relaxed)),
+            effective_floor_dbfs: f32::from_bits(self.effective_floor_dbfs.load(Ordering::Relaxed)),
+            current_rms_dbfs: f32::from_bits(self.current_rms_dbfs.load(Ordering::Relaxed)),
             last_heard_epoch_ms: if last_heard == 0 {
                 None
             } else {
@@ -2073,7 +2111,12 @@ mod tests {
         let (engine, dir) = temp_engine();
         let status = engine.status().unwrap();
         assert!(!status.monitoring);
+        assert!(!status.calibrating);
         assert!(!status.gate_open);
+        assert_eq!(status.short_floor_dbfs, -60.0);
+        assert_eq!(status.ambient_floor_dbfs, -60.0);
+        assert_eq!(status.effective_floor_dbfs, -60.0);
+        assert_eq!(status.current_rms_dbfs, -60.0);
         assert_eq!(status.last_heard_epoch_ms, None);
         assert_eq!(status.sensitivity, sinus_app::settings::DEFAULT_SENSITIVITY);
         assert!(matches!(status.pause.kind, PauseKind::Running));
@@ -2081,6 +2124,36 @@ mod tests {
         assert!(status.quiet_hours.is_none());
         assert!(!status.in_quiet_hours);
 
+        drop(engine);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    #[test]
+    fn macos_status_exposes_live_calibration_and_floor_diagnostics() {
+        let dir = temp_dir();
+        let engine = AppleEngine::new(
+            AppleEngineConfig {
+                database_path: dir.join("events.db").to_string_lossy().into_owned(),
+                platform: ApplePlatform::Macos,
+            },
+            Arc::new(TestModel),
+        )
+        .unwrap();
+        assert!(!engine.status().unwrap().calibrating);
+        engine
+            .start_monitoring(Utc::now().timestamp_millis(), 0)
+            .unwrap();
+        assert!(engine.status().unwrap().calibrating);
+
+        engine
+            .push_pcm_16k(sinus_core::synth::white_noise(16_000, 0.003, 241))
+            .unwrap();
+        let status = engine.status().unwrap();
+        assert!(!status.calibrating);
+        assert!(status.ambient_floor_dbfs < -45.0);
+        assert_eq!(status.effective_floor_dbfs, status.ambient_floor_dbfs);
+
+        engine.stop_monitoring().unwrap();
         drop(engine);
         let _ = std::fs::remove_dir_all(dir);
     }

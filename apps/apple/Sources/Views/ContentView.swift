@@ -132,6 +132,14 @@ struct ContentView: View {
                 .orange
             )
         }
+        if host.monitor.isCapturing && host.monitor.status?.calibrating == true {
+            return (
+                "Calibrating room…",
+                "Listening briefly for a stable background level. Detection starts automatically when calibration finishes.",
+                "waveform.badge.magnifyingglass",
+                .orange
+            )
+        }
         if host.monitor.isCapturing {
             return (
                 "Monitoring is active",

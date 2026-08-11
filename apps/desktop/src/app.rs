@@ -43,6 +43,7 @@ enum Tab {
 #[derive(Debug, Clone, Copy, PartialEq, Eq)]
 enum TrayState {
     Listening,
+    Calibrating,
     Paused,
     Warning,
     Offline,
@@ -52,6 +53,7 @@ impl TrayState {
     fn glyph(self) -> &'static str {
         match self {
             TrayState::Listening => "🟢",
+            TrayState::Calibrating => "⏳",
             TrayState::Paused => "⏸",
             TrayState::Warning => "⚠",
             TrayState::Offline => "📴",
@@ -62,6 +64,7 @@ impl TrayState {
     fn color(self) -> [u8; 3] {
         match self {
             TrayState::Listening => [0x2e, 0xa0, 0x43],
+            TrayState::Calibrating => [0xf0, 0xad, 0x4e],
             TrayState::Paused => [0xf0, 0xad, 0x4e],
             TrayState::Warning => [0xd9, 0x53, 0x4f],
             TrayState::Offline => [0x77, 0x77, 0x77],
@@ -72,6 +75,7 @@ impl TrayState {
     fn tooltip(self) -> &'static str {
         match self {
             TrayState::Listening => "Sinus Sentinel — listening",
+            TrayState::Calibrating => "Sinus Sentinel — Calibrating room…",
             TrayState::Paused => "Sinus Sentinel — paused",
             TrayState::Warning => "Sinus Sentinel — model unavailable",
             TrayState::Offline => "Sinus Sentinel — offline-strict",
@@ -392,12 +396,9 @@ impl SinusApp {
                 TrayState::Paused
             }
             _ if self.shared.model() == ModelStatus::Missing => TrayState::Warning,
+            _ if self.shared.calibrating() => TrayState::Calibrating,
             _ => TrayState::Listening,
         }
-    }
-
-    fn status_glyph(&mut self) -> &'static str {
-        self.current_tray_state().glyph()
     }
 
     #[cfg(not(test))]
@@ -576,7 +577,9 @@ impl SinusApp {
 
         // The gate can be open for a second or two before a classification
         // lands. Say so, rather than looking idle while the app is working.
-        if self.shared.analyzing() {
+        if self.shared.calibrating() {
+            ui.colored_label(egui::Color32::YELLOW, "⏳ Calibrating room…");
+        } else if self.shared.analyzing() {
             let heard = self
                 .shared
                 .last_heard()
@@ -980,7 +983,7 @@ impl SinusApp {
 
         ui.separator();
         ui.label(
-            "Menu-bar status: 🟢 listening • ⏸ paused • ⚠ model unavailable • 📴 offline-strict.",
+            "Menu-bar status: 🟢 listening • ⏳ calibrating room • ⏸ paused • ⚠ model unavailable • 📴 offline-strict.",
         );
         ui.label("macOS: Sinus Sentinel stays in the menu bar without a Dock icon. Closing this window hides it; use the menu-bar icon to reopen or quit.");
         ui.label(format!("device id: {}", self.device_id));
@@ -1115,7 +1118,11 @@ impl eframe::App for SinusApp {
 
         egui::TopBottomPanel::top("top").show(ctx, |ui| {
             ui.horizontal(|ui| {
-                ui.label(self.status_glyph());
+                let tray_state = self.current_tray_state();
+                ui.label(tray_state.glyph());
+                if tray_state == TrayState::Calibrating {
+                    ui.label("Calibrating room…");
+                }
                 ui.selectable_value(&mut self.tab, Tab::History, "History");
                 ui.selectable_value(&mut self.tab, Tab::Settings, "Settings");
                 ui.separator();

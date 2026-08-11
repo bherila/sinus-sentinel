@@ -2598,10 +2598,19 @@ public func FfiConverterTypeDayBucket_lower(_ value: DayBucket) -> RustBuffer {
 public struct EngineStatus: Equatable, Hashable {
     public let monitoring: Bool
     /**
+     * Passive desktop capture is intentionally holding detection closed while
+     * it validates the initial room estimate. Mobile sessions start immediately.
+     */
+    public let calibrating: Bool
+    /**
      * The energy gate is open — a sound is arriving and is being classified.
      * Drives the "heard something — classifying…" indicator.
      */
     public let gateOpen: Bool
+    public let shortFloorDbfs: Float
+    public let ambientFloorDbfs: Float
+    public let effectiveFloorDbfs: Float
+    public let currentRmsDbfs: Float
     /**
      * When the gate last opened, for a UI that wants "last heard 4s ago"
      * rather than a flicker. `None` if it has not opened this session.
@@ -2621,9 +2630,13 @@ public struct EngineStatus: Equatable, Hashable {
     // declare one manually.
     public init(monitoring: Bool,
         /**
+         * Passive desktop capture is intentionally holding detection closed while
+         * it validates the initial room estimate. Mobile sessions start immediately.
+         */calibrating: Bool,
+        /**
          * The energy gate is open — a sound is arriving and is being classified.
          * Drives the "heard something — classifying…" indicator.
-         */gateOpen: Bool,
+         */gateOpen: Bool, shortFloorDbfs: Float, ambientFloorDbfs: Float, effectiveFloorDbfs: Float, currentRmsDbfs: Float,
         /**
          * When the gate last opened, for a UI that wants "last heard 4s ago"
          * rather than a flicker. `None` if it has not opened this session.
@@ -2632,7 +2645,12 @@ public struct EngineStatus: Equatable, Hashable {
          * Whether *now* falls inside the quiet-hours window.
          */inQuietHours: Bool, pauseOnLowPower: Bool, modelVersion: String) {
         self.monitoring = monitoring
+        self.calibrating = calibrating
         self.gateOpen = gateOpen
+        self.shortFloorDbfs = shortFloorDbfs
+        self.ambientFloorDbfs = ambientFloorDbfs
+        self.effectiveFloorDbfs = effectiveFloorDbfs
+        self.currentRmsDbfs = currentRmsDbfs
         self.lastHeardEpochMs = lastHeardEpochMs
         self.sensitivity = sensitivity
         self.pause = pause
@@ -2659,7 +2677,12 @@ public struct FfiConverterTypeEngineStatus: FfiConverterRustBuffer {
         return
             try EngineStatus(
                 monitoring: FfiConverterBool.read(from: &buf),
+                calibrating: FfiConverterBool.read(from: &buf),
                 gateOpen: FfiConverterBool.read(from: &buf),
+                shortFloorDbfs: FfiConverterFloat.read(from: &buf),
+                ambientFloorDbfs: FfiConverterFloat.read(from: &buf),
+                effectiveFloorDbfs: FfiConverterFloat.read(from: &buf),
+                currentRmsDbfs: FfiConverterFloat.read(from: &buf),
                 lastHeardEpochMs: FfiConverterOptionInt64.read(from: &buf),
                 sensitivity: FfiConverterFloat.read(from: &buf),
                 pause: FfiConverterTypePauseSnapshot.read(from: &buf),
@@ -2672,7 +2695,12 @@ public struct FfiConverterTypeEngineStatus: FfiConverterRustBuffer {
 
     public static func write(_ value: EngineStatus, into buf: inout [UInt8]) {
         FfiConverterBool.write(value.monitoring, into: &buf)
+        FfiConverterBool.write(value.calibrating, into: &buf)
         FfiConverterBool.write(value.gateOpen, into: &buf)
+        FfiConverterFloat.write(value.shortFloorDbfs, into: &buf)
+        FfiConverterFloat.write(value.ambientFloorDbfs, into: &buf)
+        FfiConverterFloat.write(value.effectiveFloorDbfs, into: &buf)
+        FfiConverterFloat.write(value.currentRmsDbfs, into: &buf)
         FfiConverterOptionInt64.write(value.lastHeardEpochMs, into: &buf)
         FfiConverterFloat.write(value.sensitivity, into: &buf)
         FfiConverterTypePauseSnapshot.write(value.pause, into: &buf)

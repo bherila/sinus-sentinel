@@ -124,7 +124,10 @@ fn configure_ort_dylib_path() {}
 /// exits. Errors (no device, permission denied) are logged, not fatal.
 pub fn spawn_capture(db_path: PathBuf, shared: SharedStatus) -> JoinHandle<()> {
     std::thread::spawn(move || {
+        let published = shared.clone();
         if let Err(e) = run(db_path, shared) {
+            published.set_calibrating(false);
+            published.set_analyzing(false);
             eprintln!("capture: {e}");
         }
     })
@@ -157,7 +160,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     // boundary merge, cooldowns persist, and the noise floor converges. Detected
     // events carry sample-counter timestamps relative to the stream start; map that
     // origin to wall-clock ONCE, here, rather than doing per-chunk `Utc::now()` math.
-    let mut config = PipelineConfig::default();
+    let mut config = PipelineConfig::passive_live_monitoring();
     config.decision.sensitivity = settings::sensitivity(&store);
     let mut pipeline = StreamingPipeline::new(config, embedder);
     if let Some(prototypes) = prototypes {
@@ -180,6 +183,8 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
     let mut last_quiet_check: Option<std::time::Instant> = None;
     loop {
         if shared.quitting() {
+            shared.set_calibrating(false);
+            shared.set_analyzing(false);
             return Ok(());
         }
 
@@ -223,6 +228,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
                 shared.fail_teach(capture.class());
             }
             gate_was_open = false;
+            shared.set_calibrating(false);
             shared.set_analyzing(false);
             std::thread::park_timeout(shared.suspension_wait(now));
             continue;
@@ -234,6 +240,7 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             ctx.base_time = Utc::now();
             ctx.tz_offset_min = local_offset_minutes();
             gate_was_open = false;
+            shared.set_calibrating(pipeline.gate_diagnostics().calibrating);
         }
 
         if teach_capture.is_none() {
@@ -257,31 +264,44 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
             }
         }
 
-        // Publish "we can hear something" so the UI isn't silent during the
-        // second or two between a sound arriving and its classification.
-        let gate_open = pipeline.gate_open();
+        // Advance first, then publish the state produced by this buffer. Reading
+        // before `push` made every UI transition one audio buffer stale and hid
+        // the beginning/end of calibration.
+        let events = match pipeline.push(&buf[..n]) {
+            Ok(events) => events,
+            Err(error) => {
+                // A transient inference failure must not terminate the only
+                // capture worker. Publish the gate's current calibration state,
+                // clear the in-progress UI hint, and try the next audio buffer.
+                eprintln!("capture: pipeline push failed: {error}");
+                let diagnostics = pipeline.gate_diagnostics();
+                shared.set_calibrating(diagnostics.calibrating);
+                shared.set_analyzing(false);
+                gate_was_open = diagnostics.open;
+                continue;
+            }
+        };
+        let diagnostics = pipeline.gate_diagnostics();
+        let gate_open = diagnostics.open;
+        shared.set_calibrating(diagnostics.calibrating);
         if gate_open && !gate_was_open {
             shared.note_heard(Utc::now());
         }
         gate_was_open = gate_open;
         shared.set_analyzing(gate_open && !teaching);
 
-        if let Ok(events) = pipeline.push(&buf[..n]) {
-            // Quiet-hour suppression already released the microphone and
-            // `continue`d above (capture_suspended) before any of this code
-            // runs, so `shared.quiet()` cannot be true here — the pipeline never
-            // keeps streaming through a suppressed window. This check is a
-            // defensive belt-and-suspenders guard, not the suppression mechanism.
-            if !shared.quiet() && !teaching {
-                for detected in &events {
-                    let event = pipeline.to_event(detected, &ctx);
-                    if store.insert_event(&event).is_ok() {
-                        shared.notify_event_persisted();
-                    }
-                    // Kept locally only (never uploaded) so a false-positive
-                    // report can enroll this exact sound as a negative example.
-                    let _ = store.put_event_embedding(&event.uuid, &detected.embedding);
+        // Quiet-hour suppression already released the microphone and `continue`d
+        // above before any of this code runs, so `shared.quiet()` cannot be true
+        // here. This check remains a defensive guard.
+        if !shared.quiet() && !teaching {
+            for detected in &events {
+                let event = pipeline.to_event(detected, &ctx);
+                if store.insert_event(&event).is_ok() {
+                    shared.notify_event_persisted();
                 }
+                // Kept locally only (never uploaded) so a false-positive report
+                // can enroll this exact sound as a negative example.
+                let _ = store.put_event_embedding(&event.uuid, &detected.embedding);
             }
         }
 
