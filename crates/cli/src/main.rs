@@ -136,12 +136,7 @@ fn build_pipeline(
     let mut pipeline = Pipeline::new(PipelineConfig::default(), build_embedder(model_path)?);
     if let Some(path) = enrollments_path {
         let store = Store::open(path).map_err(|e| format!("open enrollments {path:?}: {e}"))?;
-        let enrollments: Vec<_> = store
-            .enrollments()
-            .map_err(|e| e.to_string())?
-            .into_iter()
-            .map(|stored| stored.enrollment)
-            .collect();
+        let enrollments = store.classifier_enrollments().map_err(|e| e.to_string())?;
         if !enrollments.is_empty() {
             pipeline = pipeline.with_prototypes(PrototypeMatcher::from_enrollments(
                 &enrollments,

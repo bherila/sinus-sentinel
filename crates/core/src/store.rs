@@ -4,10 +4,10 @@
 //! migrations from day one. Killing/relaunching the app never loses events.
 
 use chrono::{DateTime, Utc};
-use rusqlite::{params, Connection, OptionalExtension};
+use rusqlite::{params, Connection, OptionalExtension, Transaction, TransactionBehavior};
 
 use crate::classify::proto::Enrollment;
-use crate::error::Result;
+use crate::error::{Error, Result};
 use crate::types::{Event, EventType, Source};
 
 /// "Now", truncated to whole seconds.
@@ -89,6 +89,112 @@ pub struct EnrollmentInsert<'a> {
     /// See [`Enrollment::negative_scoped`] — false (unscoped) for a plain
     /// false-positive report, true for the negative half of a correction.
     pub negative_scoped: bool,
+}
+
+/// The one canonical feedback state owned by an event.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EventFeedbackState {
+    None,
+    Confirmed,
+    Corrected,
+    FalsePositive,
+}
+
+impl EventFeedbackState {
+    fn as_str(self) -> &'static str {
+        match self {
+            Self::None => "none",
+            Self::Confirmed => "confirmed",
+            Self::Corrected => "corrected",
+            Self::FalsePositive => "false_positive",
+        }
+    }
+
+    fn parse(value: &str) -> Option<Self> {
+        match value {
+            "none" => Some(Self::None),
+            "confirmed" => Some(Self::Confirmed),
+            "corrected" => Some(Self::Corrected),
+            "false_positive" => Some(Self::FalsePositive),
+            _ => None,
+        }
+    }
+}
+
+/// A locally-authoritative event-feedback document. The retained embedding is
+/// deliberately local-only until the dedicated feedback sync added by #21.
+#[derive(Debug, Clone, PartialEq)]
+pub struct EventFeedback {
+    pub event_uuid: String,
+    pub state: EventFeedbackState,
+    pub target_class: Option<EventType>,
+    pub embedding: Option<Vec<f32>>,
+    pub embedding_dim: Option<usize>,
+    pub model_version: Option<String>,
+    pub peak_dbfs: Option<f32>,
+    pub mean_dbfs: Option<f32>,
+    pub noise_floor_dbfs: Option<f32>,
+    pub capture_device_id: Option<String>,
+    pub actor_device_id: String,
+    pub feedback_updated_at: String,
+    pub synced_at: Option<String>,
+    pub server_revision: i64,
+}
+
+/// Desired state for one atomic feedback mutation.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub struct FeedbackMutationInput {
+    pub desired_state: EventFeedbackState,
+    pub target_class: Option<EventType>,
+    pub actor_device_id: String,
+}
+
+/// Storage-level facts returned to the Rust policy layer.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct FeedbackMutationResult {
+    pub event_changed: bool,
+    pub classifier_changed: bool,
+    pub sync_required: bool,
+    pub embedding_available: bool,
+    pub positive_class: Option<EventType>,
+}
+
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub struct BulkFeedbackMutationResult {
+    pub groups_changed: usize,
+    pub classifier_changed: bool,
+    pub sync_required: bool,
+}
+
+/// Why a user-visible training unit exists.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum EnrollmentProvenance {
+    GuidedTake,
+    ConfirmedEvent,
+    CorrectedEvent,
+    FalsePositiveSuppression,
+}
+
+/// One removable/displayable unit in Training. A correction is one group even
+/// though it derives both a scoped negative and a positive matcher example.
+#[derive(Debug, Clone, PartialEq)]
+pub struct TrainingGroup {
+    pub group_id: String,
+    pub provenance: EnrollmentProvenance,
+    pub class: EventType,
+    pub original_class: Option<EventType>,
+    pub created_at: String,
+    pub peak_dbfs: Option<f32>,
+    pub model_version: Option<String>,
+    pub synced: bool,
+}
+
+struct FeedbackEventRow {
+    original_class: String,
+    false_positive_at: Option<String>,
+    corrected_to: Option<String>,
+    model_version: String,
+    device_id: String,
 }
 
 /// An enrollment example pulled down from the PHR.
@@ -317,6 +423,86 @@ impl Store {
                 10,
                 "ALTER TABLE enrollment_examples
                      ADD COLUMN negative_scoped INTEGER NOT NULL DEFAULT 0;",
+            ),
+            (
+                // Event-derived classifier examples are a virtual projection of
+                // one canonical document, not independently synced enrollment
+                // rows. Preserve one recoverable legacy embedding before cleaning
+                // up the obsolete physical rows.
+                11,
+                "CREATE TABLE event_feedback (
+                    event_uuid          TEXT PRIMARY KEY
+                                        REFERENCES events(uuid) ON DELETE CASCADE,
+                    state               TEXT NOT NULL
+                                        CHECK (state IN ('none','confirmed','corrected','false_positive')),
+                    target_class        TEXT NULL,
+                    embedding           BLOB NULL,
+                    embedding_dim       INTEGER NULL,
+                    model_version       TEXT NULL,
+                    peak_dbfs           REAL NULL,
+                    mean_dbfs           REAL NULL,
+                    noise_floor_dbfs    REAL NULL,
+                    capture_device_id   TEXT NULL,
+                    actor_device_id     TEXT NOT NULL,
+                    feedback_updated_at TEXT NOT NULL,
+                    synced_at           TEXT NULL,
+                    server_revision     INTEGER NOT NULL DEFAULT 0,
+                    CHECK ((state = 'corrected' AND target_class IS NOT NULL)
+                        OR (state != 'corrected' AND target_class IS NULL)),
+                    CHECK ((embedding IS NULL AND embedding_dim IS NULL)
+                        OR (embedding IS NOT NULL AND embedding_dim > 0
+                            AND length(embedding) = embedding_dim * 4))
+                );
+                CREATE INDEX idx_event_feedback_state ON event_feedback (state);
+                CREATE INDEX idx_enroll_source_event
+                    ON enrollment_examples (source_event_uuid);
+
+                INSERT INTO event_feedback
+                    (event_uuid, state, target_class, embedding, embedding_dim,
+                     model_version, peak_dbfs, mean_dbfs, noise_floor_dbfs,
+                     capture_device_id, actor_device_id, feedback_updated_at,
+                     synced_at, server_revision)
+                SELECT e.uuid,
+                       CASE WHEN e.false_positive_at IS NOT NULL THEN 'false_positive'
+                            ELSE 'corrected' END,
+                       CASE WHEN e.false_positive_at IS NOT NULL THEN NULL
+                            ELSE e.corrected_to END,
+                       COALESCE(ee.embedding, le.embedding),
+                       CASE WHEN COALESCE(ee.embedding, le.embedding) IS NULL THEN NULL
+                            ELSE length(COALESCE(ee.embedding, le.embedding)) / 4 END,
+                       CASE WHEN ee.embedding IS NOT NULL THEN e.model_version
+                            ELSE COALESCE(le.model_version, e.model_version) END,
+                       NULL, NULL, NULL,
+                       e.device_id,
+                       e.device_id,
+                       COALESCE(e.flag_updated_at, e.corrected_at,
+                                e.false_positive_at, e.occurred_at),
+                       NULL,
+                       0
+                FROM events e
+                LEFT JOIN event_embeddings ee ON ee.uuid = e.uuid
+                    AND length(ee.embedding) > 0
+                    AND length(ee.embedding) % 4 = 0
+                LEFT JOIN enrollment_examples le ON le.id = (
+                    SELECT candidate.id
+                    FROM enrollment_examples candidate
+                    WHERE candidate.source_event_uuid = e.uuid
+                      AND candidate.deleted = 0
+                      AND length(candidate.embedding) > 0
+                      AND length(candidate.embedding) % 4 = 0
+                    ORDER BY candidate.id
+                    LIMIT 1
+                )
+                WHERE e.false_positive_at IS NOT NULL OR e.corrected_to IS NOT NULL;
+
+                DELETE FROM enrollment_examples
+                 WHERE synced_at IS NULL
+                   AND (deleted = 1 OR source_event_uuid IS NOT NULL);
+                UPDATE enrollment_examples
+                   SET deleted = 1
+                 WHERE source_event_uuid IS NOT NULL
+                   AND synced_at IS NOT NULL
+                   AND deleted = 0;",
             ),
         ];
 
@@ -561,6 +747,382 @@ impl Store {
         Ok(())
     }
 
+    fn row_to_event_feedback(row: &rusqlite::Row<'_>) -> rusqlite::Result<EventFeedback> {
+        let state_text: String = row.get("state")?;
+        let state = EventFeedbackState::parse(&state_text).ok_or_else(|| {
+            rusqlite::Error::FromSqlConversionFailure(
+                1,
+                rusqlite::types::Type::Text,
+                format!("unknown event feedback state {state_text:?}").into(),
+            )
+        })?;
+        let target_text: Option<String> = row.get("target_class")?;
+        let embedding_blob: Option<Vec<u8>> = row.get("embedding")?;
+        let embedding_dim: Option<i64> = row.get("embedding_dim")?;
+        Ok(EventFeedback {
+            event_uuid: row.get("event_uuid")?,
+            state,
+            target_class: target_text.as_deref().and_then(EventType::parse),
+            embedding: embedding_blob.as_deref().map(blob_to_f32),
+            embedding_dim: embedding_dim.map(|dimension| dimension as usize),
+            model_version: row.get("model_version")?,
+            peak_dbfs: row.get("peak_dbfs")?,
+            mean_dbfs: row.get("mean_dbfs")?,
+            noise_floor_dbfs: row.get("noise_floor_dbfs")?,
+            capture_device_id: row.get("capture_device_id")?,
+            actor_device_id: row.get("actor_device_id")?,
+            feedback_updated_at: row.get("feedback_updated_at")?,
+            synced_at: row.get("synced_at")?,
+            server_revision: row.get("server_revision")?,
+        })
+    }
+
+    fn event_feedback_from(conn: &Connection, event_uuid: &str) -> Result<Option<EventFeedback>> {
+        Ok(conn
+            .query_row(
+                "SELECT event_uuid, state, target_class, embedding, embedding_dim,
+                        model_version, peak_dbfs, mean_dbfs, noise_floor_dbfs,
+                        capture_device_id, actor_device_id, feedback_updated_at,
+                        synced_at, server_revision
+                   FROM event_feedback WHERE event_uuid = ?1",
+                params![event_uuid],
+                Self::row_to_event_feedback,
+            )
+            .optional()?)
+    }
+
+    /// Fetch the canonical local feedback document for one event.
+    pub fn event_feedback(&self, event_uuid: &str) -> Result<Option<EventFeedback>> {
+        Self::event_feedback_from(&self.conn, event_uuid)
+    }
+
+    /// Atomically replace one event's feedback state. The transaction also
+    /// maintains the legacy event-flag projection and retires any physical
+    /// source-derived enrollment rows left by an older client.
+    pub fn apply_event_feedback(
+        &self,
+        event_uuid: &str,
+        input: FeedbackMutationInput,
+    ) -> Result<FeedbackMutationResult> {
+        if input.actor_device_id.is_empty() {
+            return Err(Error::Config(
+                "feedback actor device id is empty".to_string(),
+            ));
+        }
+        match (input.desired_state, input.target_class) {
+            (EventFeedbackState::Corrected, None) => {
+                return Err(Error::Config(
+                    "corrected feedback requires a target class".to_string(),
+                ));
+            }
+            (EventFeedbackState::Corrected, Some(_)) => {}
+            (_, Some(_)) => {
+                return Err(Error::Config(
+                    "only corrected feedback may have a target class".to_string(),
+                ));
+            }
+            (_, None) => {}
+        }
+
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let event: Option<FeedbackEventRow> = tx
+            .query_row(
+                "SELECT event_type, false_positive_at, corrected_to, model_version, device_id
+                   FROM events WHERE uuid = ?1",
+                params![event_uuid],
+                |row| {
+                    Ok(FeedbackEventRow {
+                        original_class: row.get(0)?,
+                        false_positive_at: row.get(1)?,
+                        corrected_to: row.get(2)?,
+                        model_version: row.get(3)?,
+                        device_id: row.get(4)?,
+                    })
+                },
+            )
+            .optional()?;
+        let Some(event) = event else {
+            return Err(Error::Config(format!("no such event: {event_uuid}")));
+        };
+        let original_class = EventType::parse(&event.original_class)
+            .ok_or_else(|| Error::Config(format!("event {event_uuid} has invalid class")))?;
+        if input.desired_state == EventFeedbackState::Corrected
+            && input.target_class == Some(original_class)
+        {
+            return Err(Error::Config(
+                "correcting to the original class must be represented as none".to_string(),
+            ));
+        }
+
+        let previous = Self::event_feedback_from(&tx, event_uuid)?;
+
+        // Lookup order is contractual: the still-retained event embedding wins,
+        // then the canonical document, then a legacy source-derived row.
+        let retained: Option<Vec<u8>> = tx
+            .query_row(
+                "SELECT embedding FROM event_embeddings
+                  WHERE uuid = ?1 AND length(embedding) > 0 AND length(embedding) % 4 = 0",
+                params![event_uuid],
+                |row| row.get(0),
+            )
+            .optional()?;
+        let legacy_embedding: Option<(Vec<u8>, Option<String>)> = tx
+            .query_row(
+                "SELECT embedding, model_version FROM enrollment_examples
+                  WHERE source_event_uuid = ?1 AND deleted = 0
+                    AND length(embedding) > 0 AND length(embedding) % 4 = 0
+                  ORDER BY id LIMIT 1",
+                params![event_uuid],
+                |row| Ok((row.get(0)?, row.get(1)?)),
+            )
+            .optional()?;
+        let previous_blob = previous
+            .as_ref()
+            .and_then(|feedback| feedback.embedding.as_deref().map(f32_to_blob));
+        let embedding_blob = retained
+            .clone()
+            .or(previous_blob)
+            .or_else(|| legacy_embedding.as_ref().map(|(blob, _)| blob.clone()));
+        let model_version = if retained.is_some() {
+            Some(event.model_version)
+        } else if previous
+            .as_ref()
+            .is_some_and(|feedback| feedback.embedding.is_some())
+        {
+            previous
+                .as_ref()
+                .and_then(|feedback| feedback.model_version.clone())
+        } else {
+            legacy_embedding
+                .as_ref()
+                .and_then(|(_, version)| version.clone())
+        };
+
+        let canonical_changed = previous.as_ref().is_none_or(|feedback| {
+            feedback.state != input.desired_state || feedback.target_class != input.target_class
+        });
+        let previous_projection = (
+            event.false_positive_at.is_some(),
+            event.corrected_to.as_deref().and_then(EventType::parse),
+        );
+        let desired_projection = match input.desired_state {
+            EventFeedbackState::FalsePositive => (true, None),
+            EventFeedbackState::Corrected => (false, input.target_class),
+            EventFeedbackState::None | EventFeedbackState::Confirmed => (false, None),
+        };
+        let legacy_changed = previous_projection != desired_projection;
+        let embedding_changed = previous.as_ref().is_some_and(|feedback| {
+            feedback.embedding.as_deref().map(f32_to_blob) != embedding_blob
+        });
+        let should_write_document =
+            previous.is_some() || input.desired_state != EventFeedbackState::None || legacy_changed;
+        let document_changed =
+            should_write_document && (previous.is_none() || canonical_changed || embedding_changed);
+        let now = flag_stamp();
+
+        if should_write_document && document_changed {
+            let previous_levels = previous.as_ref();
+            tx.execute(
+                "INSERT INTO event_feedback
+                    (event_uuid, state, target_class, embedding, embedding_dim,
+                     model_version, peak_dbfs, mean_dbfs, noise_floor_dbfs,
+                     capture_device_id, actor_device_id, feedback_updated_at,
+                     synced_at, server_revision)
+                 VALUES (?1,?2,?3,?4,?5,?6,?7,?8,?9,?10,?11,?12,NULL,
+                         COALESCE((SELECT server_revision FROM event_feedback
+                                   WHERE event_uuid = ?1), 0))
+                 ON CONFLICT(event_uuid) DO UPDATE SET
+                    state = excluded.state,
+                    target_class = excluded.target_class,
+                    embedding = excluded.embedding,
+                    embedding_dim = excluded.embedding_dim,
+                    model_version = excluded.model_version,
+                    peak_dbfs = excluded.peak_dbfs,
+                    mean_dbfs = excluded.mean_dbfs,
+                    noise_floor_dbfs = excluded.noise_floor_dbfs,
+                    capture_device_id = excluded.capture_device_id,
+                    actor_device_id = excluded.actor_device_id,
+                    feedback_updated_at = excluded.feedback_updated_at,
+                    synced_at = NULL",
+                params![
+                    event_uuid,
+                    input.desired_state.as_str(),
+                    input.target_class.map(EventType::as_str),
+                    embedding_blob,
+                    embedding_blob.as_ref().map(|blob| (blob.len() / 4) as i64),
+                    model_version,
+                    previous_levels.and_then(|feedback| feedback.peak_dbfs),
+                    previous_levels.and_then(|feedback| feedback.mean_dbfs),
+                    previous_levels.and_then(|feedback| feedback.noise_floor_dbfs),
+                    previous_levels
+                        .and_then(|feedback| feedback.capture_device_id.as_deref())
+                        .unwrap_or(&event.device_id),
+                    input.actor_device_id,
+                    now,
+                ],
+            )?;
+        }
+
+        if legacy_changed {
+            match input.desired_state {
+                EventFeedbackState::FalsePositive => {
+                    tx.execute(
+                        "UPDATE events
+                            SET false_positive_at = ?2, corrected_to = NULL,
+                                corrected_at = NULL, flag_updated_at = ?2
+                          WHERE uuid = ?1",
+                        params![event_uuid, now],
+                    )?;
+                }
+                EventFeedbackState::Corrected => {
+                    tx.execute(
+                        "UPDATE events
+                            SET false_positive_at = NULL, corrected_to = ?3,
+                                corrected_at = ?2, flag_updated_at = ?2
+                          WHERE uuid = ?1",
+                        params![event_uuid, now, input.target_class.map(EventType::as_str)],
+                    )?;
+                }
+                EventFeedbackState::None | EventFeedbackState::Confirmed => {
+                    tx.execute(
+                        "UPDATE events
+                            SET false_positive_at = NULL, corrected_to = NULL,
+                                corrected_at = NULL, flag_updated_at = ?2
+                          WHERE uuid = ?1",
+                        params![event_uuid, now],
+                    )?;
+                }
+            }
+        }
+
+        let _deleted_legacy = tx.execute(
+            "DELETE FROM enrollment_examples
+              WHERE source_event_uuid = ?1 AND synced_at IS NULL",
+            params![event_uuid],
+        )?;
+        let _tombstoned_legacy = tx.execute(
+            "UPDATE enrollment_examples SET deleted = 1
+              WHERE source_event_uuid = ?1 AND synced_at IS NOT NULL AND deleted = 0",
+            params![event_uuid],
+        )?;
+
+        let current = if should_write_document {
+            Self::event_feedback_from(&tx, event_uuid)?
+        } else {
+            None
+        };
+        let old_effect = previous.as_ref().map_or_else(Vec::new, |feedback| {
+            feedback_classifier_effect(feedback, original_class)
+        });
+        let new_effect = current.as_ref().map_or_else(Vec::new, |feedback| {
+            feedback_classifier_effect(feedback, original_class)
+        });
+        let classifier_changed = old_effect != new_effect;
+        let sync_required: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM events
+                 WHERE uuid = ?1 AND flag_updated_at IS NOT NULL
+                   AND (flag_synced_at IS NULL OR flag_synced_at < flag_updated_at)
+                UNION ALL
+                SELECT 1 FROM enrollment_examples
+                 WHERE source_event_uuid = ?1 AND deleted = 1 AND synced_at IS NOT NULL
+             )",
+            params![event_uuid],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+
+        let positive_class = match input.desired_state {
+            EventFeedbackState::Confirmed => Some(original_class),
+            EventFeedbackState::Corrected => input.target_class,
+            EventFeedbackState::None | EventFeedbackState::FalsePositive => None,
+        };
+        Ok(FeedbackMutationResult {
+            event_changed: document_changed || legacy_changed,
+            classifier_changed,
+            sync_required,
+            embedding_available: embedding_blob.is_some(),
+            positive_class,
+        })
+    }
+
+    /// Clear every active feedback unit in one transaction, preserving each
+    /// document and retained embedding as `none` so a later canonical sync can
+    /// propagate the removal.
+    pub fn clear_all_event_feedback(
+        &self,
+        actor_device_id: &str,
+    ) -> Result<BulkFeedbackMutationResult> {
+        if actor_device_id.is_empty() {
+            return Err(Error::Config(
+                "feedback actor device id is empty".to_string(),
+            ));
+        }
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let groups_changed: usize = tx.query_row(
+            "SELECT COUNT(*) FROM event_feedback WHERE state != 'none'",
+            [],
+            |row| row.get::<_, i64>(0),
+        )? as usize;
+        let active_effects: bool = tx.query_row(
+            "SELECT EXISTS(SELECT 1 FROM event_feedback
+                            WHERE state != 'none' AND embedding IS NOT NULL)",
+            [],
+            |row| row.get(0),
+        )?;
+        let now = flag_stamp();
+        if groups_changed > 0 {
+            tx.execute(
+                "UPDATE event_feedback
+                    SET state = 'none', target_class = NULL,
+                        actor_device_id = ?1, feedback_updated_at = ?2,
+                        synced_at = NULL
+                  WHERE state != 'none'",
+                params![actor_device_id, now],
+            )?;
+            // Only an actual legacy projection change is durable work for the
+            // pre-#21 flag endpoint. Confirmation has no legacy representation.
+            tx.execute(
+                "UPDATE events
+                    SET false_positive_at = NULL, corrected_to = NULL,
+                        corrected_at = NULL, flag_updated_at = ?1
+                  WHERE uuid IN (SELECT event_uuid FROM event_feedback)
+                    AND (false_positive_at IS NOT NULL OR corrected_to IS NOT NULL)",
+                params![now],
+            )?;
+        }
+        let _deleted_legacy = tx.execute(
+            "DELETE FROM enrollment_examples
+              WHERE source_event_uuid IS NOT NULL AND synced_at IS NULL",
+            [],
+        )?;
+        let _tombstoned_legacy = tx.execute(
+            "UPDATE enrollment_examples SET deleted = 1
+              WHERE source_event_uuid IS NOT NULL
+                AND synced_at IS NOT NULL AND deleted = 0",
+            [],
+        )?;
+        let sync_required: bool = tx.query_row(
+            "SELECT EXISTS(
+                SELECT 1 FROM events
+                 WHERE flag_updated_at IS NOT NULL
+                   AND (flag_synced_at IS NULL OR flag_synced_at < flag_updated_at)
+                UNION ALL
+                SELECT 1 FROM enrollment_examples
+                 WHERE source_event_uuid IS NOT NULL
+                   AND deleted = 1 AND synced_at IS NOT NULL
+             )",
+            [],
+            |row| row.get(0),
+        )?;
+        tx.commit()?;
+        Ok(BulkFeedbackMutationResult {
+            groups_changed,
+            classifier_changed: active_effects,
+            sync_required,
+        })
+    }
+
     /// Flags whose current state has not reached the server yet.
     pub fn pending_flags(&self, limit: usize) -> Result<Vec<PendingFlag>> {
         let mut stmt = self.conn.prepare(
@@ -744,8 +1306,8 @@ impl Store {
 
         let enrollments: i64 = self.conn.query_row(
             "SELECT COUNT(*) FROM enrollment_examples
-             WHERE (deleted = 0 AND synced_at IS NULL)
-                OR (deleted = 1 AND synced_at IS NOT NULL)",
+             WHERE ((deleted = 0 AND synced_at IS NULL AND source_event_uuid IS NULL)
+                OR (deleted = 1 AND synced_at IS NOT NULL))",
             [],
             |r| r.get(0),
         )?;
@@ -1036,6 +1598,146 @@ impl Store {
         Ok(rows.collect::<rusqlite::Result<Vec<_>>>()?)
     }
 
+    /// The exact live matcher view: physical guided Teach rows plus virtual
+    /// examples derived from canonical event feedback. Legacy physical rows
+    /// carrying `source_event_uuid` never participate.
+    pub fn classifier_enrollments(&self) -> Result<Vec<Enrollment>> {
+        let mut stmt = self.conn.prepare(
+            "SELECT class, embedding, is_negative, negative_scoped FROM (
+                SELECT class, embedding, is_negative, negative_scoped, id AS ordering
+                  FROM enrollment_examples
+                 WHERE deleted = 0 AND source_event_uuid IS NULL
+                UNION ALL
+                SELECT CASE feedback.state
+                           WHEN 'corrected' THEN feedback.target_class
+                           ELSE events.event_type
+                       END,
+                       feedback.embedding, 0, 0,
+                       1000000000000 + events.rowid * 2
+                  FROM event_feedback feedback
+                  JOIN events ON events.uuid = feedback.event_uuid
+                 WHERE feedback.embedding IS NOT NULL
+                   AND feedback.state IN ('confirmed', 'corrected')
+                UNION ALL
+                SELECT events.event_type, feedback.embedding, 1,
+                       CASE feedback.state WHEN 'corrected' THEN 1 ELSE 0 END,
+                       1000000000001 + events.rowid * 2
+                  FROM event_feedback feedback
+                  JOIN events ON events.uuid = feedback.event_uuid
+                 WHERE feedback.embedding IS NOT NULL
+                   AND feedback.state IN ('corrected', 'false_positive')
+             ) ORDER BY ordering",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let class: String = row.get(0)?;
+            let blob: Vec<u8> = row.get(1)?;
+            let Some(class) = EventType::parse(&class) else {
+                return Ok(None);
+            };
+            let is_negative = row.get::<_, i64>(2)? != 0;
+            let negative_scoped = row.get::<_, i64>(3)? != 0;
+            Ok(Some(Enrollment {
+                class,
+                embedding: blob_to_f32(&blob),
+                is_negative,
+                negative_scoped,
+            }))
+        })?;
+        Ok(rows
+            .collect::<rusqlite::Result<Vec<_>>>()?
+            .into_iter()
+            .flatten()
+            .collect())
+    }
+
+    /// Positive matcher examples per class, including virtual feedback-derived
+    /// positives and excluding obsolete physical source rows.
+    pub fn classifier_enrollment_counts(
+        &self,
+    ) -> Result<std::collections::HashMap<EventType, i64>> {
+        let mut counts = std::collections::HashMap::new();
+        for enrollment in self.classifier_enrollments()? {
+            if !enrollment.is_negative {
+                *counts.entry(enrollment.class).or_insert(0) += 1;
+            }
+        }
+        Ok(counts)
+    }
+
+    /// Rust-owned training provenance. Guided takes are individual units;
+    /// feedback is grouped by event even when it derives two matcher examples.
+    pub fn training_groups(&self) -> Result<Vec<TrainingGroup>> {
+        let mut groups = Vec::new();
+        for stored in self.enrollments()? {
+            if stored.source_event_uuid.is_some() || stored.enrollment.is_negative {
+                continue;
+            }
+            groups.push(TrainingGroup {
+                group_id: format!("guided:{}", stored.id),
+                provenance: EnrollmentProvenance::GuidedTake,
+                class: stored.enrollment.class,
+                original_class: None,
+                created_at: stored.created_at,
+                peak_dbfs: stored.peak_dbfs,
+                model_version: stored.model_version,
+                synced: stored.synced,
+            });
+        }
+
+        let mut stmt = self.conn.prepare(
+            "SELECT feedback.event_uuid, feedback.state, feedback.target_class,
+                    events.event_type, feedback.feedback_updated_at,
+                    feedback.peak_dbfs, feedback.model_version, feedback.synced_at
+               FROM event_feedback feedback
+               JOIN events ON events.uuid = feedback.event_uuid
+              WHERE feedback.state != 'none'
+              ORDER BY feedback.feedback_updated_at, feedback.event_uuid",
+        )?;
+        let rows = stmt.query_map([], |row| {
+            let state: String = row.get(1)?;
+            let target: Option<String> = row.get(2)?;
+            let original: String = row.get(3)?;
+            let Some(original_class) = EventType::parse(&original) else {
+                return Ok(None);
+            };
+            let (provenance, class, group_original) = match state.as_str() {
+                "confirmed" => (EnrollmentProvenance::ConfirmedEvent, original_class, None),
+                "corrected" => {
+                    let Some(class) = target.as_deref().and_then(EventType::parse) else {
+                        return Ok(None);
+                    };
+                    (
+                        EnrollmentProvenance::CorrectedEvent,
+                        class,
+                        Some(original_class),
+                    )
+                }
+                "false_positive" => (
+                    EnrollmentProvenance::FalsePositiveSuppression,
+                    original_class,
+                    None,
+                ),
+                _ => return Ok(None),
+            };
+            Ok(Some(TrainingGroup {
+                group_id: row.get(0)?,
+                provenance,
+                class,
+                original_class: group_original,
+                created_at: row.get(4)?,
+                peak_dbfs: row.get(5)?,
+                model_version: row.get(6)?,
+                synced: row.get::<_, Option<String>>(7)?.is_some(),
+            }))
+        })?;
+        groups.extend(
+            rows.collect::<rusqlite::Result<Vec<_>>>()?
+                .into_iter()
+                .flatten(),
+        );
+        Ok(groups)
+    }
+
     fn row_to_enrollment(row: &rusqlite::Row) -> rusqlite::Result<StoredEnrollment> {
         let class: String = row.get("class")?;
         let blob: Vec<u8> = row.get("embedding")?;
@@ -1059,30 +1761,55 @@ impl Store {
         })
     }
 
-    /// Soft-delete one enrollment example. Soft, not hard, so the removal can be
-    /// propagated to the PHR instead of just vanishing from this machine.
+    /// Delete one enrollment example. Unsynced rows vanish immediately; rows the
+    /// server has seen become tombstones so the removal can be propagated.
     pub fn delete_enrollment(&self, id: i64) -> Result<()> {
-        self.conn.execute(
-            "UPDATE enrollment_examples SET deleted = 1 WHERE id = ?1",
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        tx.execute(
+            "DELETE FROM enrollment_examples WHERE id = ?1 AND synced_at IS NULL",
             params![id],
         )?;
+        tx.execute(
+            "UPDATE enrollment_examples SET deleted = 1
+              WHERE id = ?1 AND synced_at IS NOT NULL AND deleted = 0",
+            params![id],
+        )?;
+        tx.commit()?;
         Ok(())
     }
 
-    /// Soft-delete all positive and negative examples for one class.
+    /// Delete all positive and negative physical examples for one class.
     pub fn delete_enrollments_for_class(&self, class: EventType) -> Result<usize> {
-        Ok(self.conn.execute(
-            "UPDATE enrollment_examples SET deleted = 1 WHERE class = ?1 AND deleted = 0",
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
+            "DELETE FROM enrollment_examples
+              WHERE class = ?1 AND deleted = 0 AND synced_at IS NULL",
             params![class.as_str()],
-        )?)
+        )?;
+        let tombstoned = tx.execute(
+            "UPDATE enrollment_examples SET deleted = 1
+              WHERE class = ?1 AND deleted = 0 AND synced_at IS NOT NULL",
+            params![class.as_str()],
+        )?;
+        tx.commit()?;
+        Ok(deleted + tombstoned)
     }
 
-    /// Soft-delete every local enrollment example. Event history is untouched.
+    /// Delete every physical enrollment example. Event history and canonical
+    /// feedback documents are untouched.
     pub fn delete_all_enrollments(&self) -> Result<usize> {
-        Ok(self.conn.execute(
-            "UPDATE enrollment_examples SET deleted = 1 WHERE deleted = 0",
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
+            "DELETE FROM enrollment_examples WHERE deleted = 0 AND synced_at IS NULL",
             [],
-        )?)
+        )?;
+        let tombstoned = tx.execute(
+            "UPDATE enrollment_examples SET deleted = 1
+              WHERE deleted = 0 AND synced_at IS NOT NULL",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(deleted + tombstoned)
     }
 
     /// Count of negative examples (learned false-positive suppressions).
@@ -1096,10 +1823,19 @@ impl Store {
 
     /// Forget every learned false-positive suppression, keeping taught takes.
     pub fn delete_negative_enrollments(&self) -> Result<usize> {
-        Ok(self.conn.execute(
-            "UPDATE enrollment_examples SET deleted = 1 WHERE is_negative = 1 AND deleted = 0",
+        let tx = Transaction::new_unchecked(&self.conn, TransactionBehavior::Immediate)?;
+        let deleted = tx.execute(
+            "DELETE FROM enrollment_examples
+              WHERE is_negative = 1 AND deleted = 0 AND synced_at IS NULL",
             [],
-        )?)
+        )?;
+        let tombstoned = tx.execute(
+            "UPDATE enrollment_examples SET deleted = 1
+              WHERE is_negative = 1 AND deleted = 0 AND synced_at IS NOT NULL",
+            [],
+        )?;
+        tx.commit()?;
+        Ok(deleted + tombstoned)
     }
 
     // ----- enrollment sync ----------------------------------------------------
@@ -1110,7 +1846,7 @@ impl Store {
             "SELECT id, uuid, class, embedding, is_negative, created_at, similarity, separation,
                     peak_dbfs, model_version, source_event_uuid, synced_at, negative_scoped
              FROM enrollment_examples
-             WHERE deleted = 0 AND synced_at IS NULL
+             WHERE deleted = 0 AND synced_at IS NULL AND source_event_uuid IS NULL
              ORDER BY id LIMIT ?1",
         )?;
         let rows = stmt.query_map(params![limit as i64], Self::row_to_enrollment)?;
@@ -1158,8 +1894,8 @@ impl Store {
         let changed = self.conn.execute(
             "INSERT OR IGNORE INTO enrollment_examples
                 (uuid, class, embedding, is_negative, created_at, similarity, separation,
-                 peak_dbfs, model_version, source_event_uuid, synced_at, negative_scoped)
-             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12)",
+                 peak_dbfs, model_version, source_event_uuid, synced_at, negative_scoped, deleted)
+             VALUES (?1, ?2, ?3, ?4, ?5, ?6, ?7, ?8, ?9, ?10, ?11, ?12, ?13)",
             params![
                 remote.uuid,
                 remote.class.as_str(),
@@ -1173,6 +1909,7 @@ impl Store {
                 remote.source_event_uuid,
                 now_stamp(),
                 remote.negative_scoped as i64,
+                remote.source_event_uuid.is_some() as i64,
             ],
         )?;
         Ok(changed > 0)
@@ -1197,6 +1934,34 @@ impl Store {
             }
         }
         Ok(out)
+    }
+}
+
+fn feedback_classifier_effect(
+    feedback: &EventFeedback,
+    original_class: EventType,
+) -> Vec<(EventType, bool, bool, Vec<u8>)> {
+    let Some(embedding) = feedback.embedding.as_deref() else {
+        return Vec::new();
+    };
+    let blob = f32_to_blob(embedding);
+    match feedback.state {
+        EventFeedbackState::None => Vec::new(),
+        EventFeedbackState::Confirmed => {
+            vec![(original_class, false, false, blob)]
+        }
+        EventFeedbackState::Corrected => {
+            let Some(target) = feedback.target_class else {
+                return Vec::new();
+            };
+            vec![
+                (original_class, true, true, blob.clone()),
+                (target, false, false, blob),
+            ]
+        }
+        EventFeedbackState::FalsePositive => {
+            vec![(original_class, true, false, blob)]
+        }
     }
 }
 
@@ -1238,14 +2003,356 @@ mod tests {
         }
     }
 
+    fn feedback_input(
+        desired_state: EventFeedbackState,
+        target_class: Option<EventType>,
+    ) -> FeedbackMutationInput {
+        FeedbackMutationInput {
+            desired_state,
+            target_class,
+            actor_device_id: "actor-device".to_string(),
+        }
+    }
+
     #[test]
     fn migrations_apply_and_are_idempotent() {
         let store = Store::open_in_memory().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
         // Re-running migrate on the same connection is a no-op.
         let mut store = store;
         store.migrate().unwrap();
-        assert_eq!(store.schema_version().unwrap(), 10);
+        assert_eq!(store.schema_version().unwrap(), 11);
+    }
+
+    #[test]
+    fn canonical_feedback_derives_virtual_classifier_examples_idempotently() {
+        let store = Store::open_in_memory().unwrap();
+        let mut event = sample_event("feedback");
+        event.event_type = EventType::Cough;
+        store.insert_event(&event).unwrap();
+        store
+            .put_event_embedding(&event.uuid, &[0.1, 0.2, 0.3])
+            .unwrap();
+        store
+            .add_enrollment(EventType::Hawk, &[0.8, 0.1, 0.0], false)
+            .unwrap();
+
+        let applied = store
+            .apply_event_feedback(
+                &event.uuid,
+                feedback_input(EventFeedbackState::Corrected, Some(EventType::Sniffle)),
+            )
+            .unwrap();
+        assert!(applied.event_changed);
+        assert!(applied.classifier_changed);
+        assert!(applied.sync_required);
+        assert!(applied.embedding_available);
+        assert_eq!(applied.positive_class, Some(EventType::Sniffle));
+        assert_eq!(
+            store.enrollments().unwrap().len(),
+            1,
+            "only guided rows are physical"
+        );
+
+        let classifier = store.classifier_enrollments().unwrap();
+        assert_eq!(classifier.len(), 3);
+        assert!(classifier.iter().any(|example| {
+            example.class == EventType::Cough && example.is_negative && example.negative_scoped
+        }));
+        assert!(classifier
+            .iter()
+            .any(|example| { example.class == EventType::Sniffle && !example.is_negative }));
+        assert_eq!(
+            store.classifier_enrollment_counts().unwrap()[&EventType::Sniffle],
+            1
+        );
+
+        let repeated = store
+            .apply_event_feedback(
+                &event.uuid,
+                feedback_input(EventFeedbackState::Corrected, Some(EventType::Sniffle)),
+            )
+            .unwrap();
+        assert!(!repeated.event_changed);
+        assert!(!repeated.classifier_changed);
+        assert!(
+            repeated.sync_required,
+            "the earlier flag mutation is still pending"
+        );
+        assert_eq!(store.classifier_enrollments().unwrap().len(), 3);
+
+        // Re-correction survives expiry of the short-lived event embedding by
+        // reusing the copy retained in the canonical document.
+        store.delete_event_embedding(&event.uuid).unwrap();
+        let replaced = store
+            .apply_event_feedback(
+                &event.uuid,
+                feedback_input(EventFeedbackState::Corrected, Some(EventType::NoseBlow)),
+            )
+            .unwrap();
+        assert!(replaced.classifier_changed);
+        assert!(replaced.embedding_available);
+        let classifier = store.classifier_enrollments().unwrap();
+        assert!(!classifier
+            .iter()
+            .any(|example| { example.class == EventType::Sniffle && !example.is_negative }));
+        assert!(classifier
+            .iter()
+            .any(|example| { example.class == EventType::NoseBlow && !example.is_negative }));
+
+        let removed = store
+            .apply_event_feedback(&event.uuid, feedback_input(EventFeedbackState::None, None))
+            .unwrap();
+        assert!(removed.event_changed);
+        assert!(removed.classifier_changed);
+        let document = store.event_feedback(&event.uuid).unwrap().unwrap();
+        assert_eq!(document.state, EventFeedbackState::None);
+        assert_eq!(document.embedding, Some(vec![0.1, 0.2, 0.3]));
+        assert_eq!(store.classifier_enrollments().unwrap().len(), 1);
+    }
+
+    #[test]
+    fn confirmation_is_device_local_and_unavailable_feedback_still_persists() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_event(&sample_event("confirmed")).unwrap();
+        let confirmed = store
+            .apply_event_feedback(
+                "confirmed",
+                feedback_input(EventFeedbackState::Confirmed, None),
+            )
+            .unwrap();
+        assert!(confirmed.event_changed);
+        assert!(!confirmed.classifier_changed);
+        assert!(
+            !confirmed.sync_required,
+            "confirmation has no legacy flag transport"
+        );
+        assert!(!confirmed.embedding_available);
+        assert!(store.classifier_enrollments().unwrap().is_empty());
+        let groups = store.training_groups().unwrap();
+        assert_eq!(
+            groups.len(),
+            1,
+            "unavailable feedback remains visible and removable"
+        );
+        assert_eq!(groups[0].provenance, EnrollmentProvenance::ConfirmedEvent);
+
+        let cleared = store
+            .apply_event_feedback("confirmed", feedback_input(EventFeedbackState::None, None))
+            .unwrap();
+        assert!(cleared.event_changed);
+        assert!(!cleared.classifier_changed);
+        assert!(!cleared.sync_required);
+        assert_eq!(
+            store.event_feedback("confirmed").unwrap().unwrap().state,
+            EventFeedbackState::None
+        );
+    }
+
+    #[test]
+    fn feedback_mutation_rolls_back_document_event_and_legacy_cleanup() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_event(&sample_event("rollback")).unwrap();
+        store.put_event_embedding("rollback", &[0.1, 0.2]).unwrap();
+        store
+            .add_enrollment_full(EnrollmentInsert {
+                class: EventType::Sniffle,
+                embedding: &[0.1, 0.2],
+                is_negative: false,
+                similarity: None,
+                separation: None,
+                peak_dbfs: None,
+                model_version: Some("legacy"),
+                source_event_uuid: Some("rollback"),
+                negative_scoped: false,
+            })
+            .unwrap();
+        store
+            .conn
+            .execute_batch(
+                "CREATE TRIGGER fail_feedback_event_update
+                 BEFORE UPDATE OF corrected_to ON events
+                 WHEN NEW.corrected_to IS NOT NULL
+                 BEGIN SELECT RAISE(ABORT, 'forced rollback'); END;",
+            )
+            .unwrap();
+
+        assert!(store
+            .apply_event_feedback(
+                "rollback",
+                feedback_input(EventFeedbackState::Corrected, Some(EventType::Hawk)),
+            )
+            .is_err());
+        assert!(store.event_feedback("rollback").unwrap().is_none());
+        assert!(store
+            .get_event("rollback")
+            .unwrap()
+            .unwrap()
+            .corrected_to
+            .is_none());
+        assert_eq!(
+            store.enrollments().unwrap().len(),
+            1,
+            "legacy cleanup rolled back"
+        );
+    }
+
+    #[test]
+    fn bulk_clear_preserves_documents_and_guided_take_isolation() {
+        let store = Store::open_in_memory().unwrap();
+        store.insert_event(&sample_event("one")).unwrap();
+        store.insert_event(&sample_event("two")).unwrap();
+        store.put_event_embedding("one", &[0.1, 0.2]).unwrap();
+        store.put_event_embedding("two", &[0.3, 0.4]).unwrap();
+        store
+            .add_enrollment(EventType::Hawk, &[0.8, 0.2], false)
+            .unwrap();
+        store
+            .apply_event_feedback(
+                "one",
+                feedback_input(EventFeedbackState::FalsePositive, None),
+            )
+            .unwrap();
+        store
+            .apply_event_feedback("two", feedback_input(EventFeedbackState::Confirmed, None))
+            .unwrap();
+        assert_eq!(store.training_groups().unwrap().len(), 3);
+
+        let result = store.clear_all_event_feedback("bulk-actor").unwrap();
+        assert_eq!(result.groups_changed, 2);
+        assert!(result.classifier_changed);
+        assert!(
+            result.sync_required,
+            "clearing the false positive is pending"
+        );
+        assert_eq!(store.enrollments().unwrap().len(), 1);
+        assert_eq!(store.training_groups().unwrap().len(), 1);
+        for uuid in ["one", "two"] {
+            let feedback = store.event_feedback(uuid).unwrap().unwrap();
+            assert_eq!(feedback.state, EventFeedbackState::None);
+            assert!(feedback.embedding.is_some());
+        }
+    }
+
+    #[test]
+    fn migration_backfills_feedback_then_hard_deletes_or_tombstones_legacy_rows() {
+        let dir =
+            std::env::temp_dir().join(format!("sinus-feedback-migrate-{}", uuid::Uuid::new_v4()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let path = dir.join("events.db");
+        let synced_uuid;
+        {
+            let store = Store::open(&path).unwrap();
+            store.insert_event(&sample_event("legacy-event")).unwrap();
+            store
+                .put_event_embedding("legacy-event", &[0.9, 0.8])
+                .unwrap();
+            store
+                .recharacterize("legacy-event", EventType::Hawk)
+                .unwrap();
+
+            store
+                .add_enrollment_full(EnrollmentInsert {
+                    class: EventType::Hawk,
+                    embedding: &[0.1, 0.2],
+                    is_negative: false,
+                    similarity: None,
+                    separation: None,
+                    peak_dbfs: None,
+                    model_version: Some("legacy-unsynced"),
+                    source_event_uuid: Some("legacy-event"),
+                    negative_scoped: false,
+                })
+                .unwrap();
+            store
+                .add_enrollment_full(EnrollmentInsert {
+                    class: EventType::Sniffle,
+                    embedding: &[0.3, 0.4],
+                    is_negative: true,
+                    similarity: None,
+                    separation: None,
+                    peak_dbfs: None,
+                    model_version: Some("legacy-synced"),
+                    source_event_uuid: Some("legacy-event"),
+                    negative_scoped: true,
+                })
+                .unwrap();
+            let source_rows: Vec<_> = store
+                .enrollments()
+                .unwrap()
+                .into_iter()
+                .filter(|row| row.source_event_uuid.is_some())
+                .collect();
+            synced_uuid = source_rows[1].uuid.clone();
+            store
+                .mark_enrollments_synced(std::slice::from_ref(&synced_uuid))
+                .unwrap();
+
+            let guided = store
+                .add_enrollment(EventType::NoseBlow, &[0.5, 0.6], false)
+                .unwrap();
+            let stranded = store
+                .add_enrollment(EventType::Cough, &[0.7, 0.8], false)
+                .unwrap();
+            store
+                .conn
+                .execute(
+                    "UPDATE enrollment_examples SET deleted = 1 WHERE id = ?1",
+                    params![stranded],
+                )
+                .unwrap();
+            assert!(guided > 0);
+
+            // Recreate the on-disk state immediately before migration 11.
+            store
+                .conn
+                .execute_batch(
+                    "DROP TABLE event_feedback;
+                     DROP INDEX idx_enroll_source_event;
+                     DELETE FROM schema_migrations WHERE version = 11;",
+                )
+                .unwrap();
+        }
+        {
+            let store = Store::open(&path).unwrap();
+            let feedback = store.event_feedback("legacy-event").unwrap().unwrap();
+            assert_eq!(feedback.state, EventFeedbackState::Corrected);
+            assert_eq!(feedback.target_class, Some(EventType::Hawk));
+            assert_eq!(feedback.embedding, Some(vec![0.9, 0.8]));
+            assert_eq!(
+                store.pending_enrollment_deletions(10).unwrap(),
+                vec![synced_uuid]
+            );
+            let physical = store.enrollments().unwrap();
+            assert_eq!(physical.len(), 1, "only the live guided take survives");
+            assert!(physical[0].source_event_uuid.is_none());
+            assert_eq!(store.pending_enrollments(10).unwrap().len(), 1);
+        }
+        std::fs::remove_dir_all(&dir).ok();
+    }
+
+    #[test]
+    fn remote_legacy_source_enrollment_is_immediately_tombstoned() {
+        let store = Store::open_in_memory().unwrap();
+        let remote = RemoteEnrollment {
+            uuid: uuid::Uuid::new_v4().as_bytes().to_vec(),
+            class: EventType::Cough,
+            embedding: vec![0.1, 0.2],
+            is_negative: true,
+            created_at: Utc::now().to_rfc3339(),
+            similarity: None,
+            separation: None,
+            peak_dbfs: None,
+            model_version: Some("legacy".to_string()),
+            source_event_uuid: Some("old-event".to_string()),
+            negative_scoped: false,
+        };
+        assert!(store.upsert_remote_enrollment(&remote).unwrap());
+        assert!(store.enrollments().unwrap().is_empty());
+        assert_eq!(
+            store.pending_enrollment_deletions(10).unwrap(),
+            vec![remote.uuid]
+        );
     }
 
     #[test]

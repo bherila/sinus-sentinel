@@ -266,23 +266,32 @@ impl SinusApp {
                 return;
             }
         };
-        if outcome.trained {
+        if outcome.classifier_changed {
             self.shared.request_enrollment_reload();
         }
-        self.shared.notify_history_changed();
-        self.shared.request_sync_now();
+        if outcome.event_changed {
+            self.shared.notify_history_changed();
+        }
+        if outcome.sync_required {
+            self.shared.request_sync_now();
+        }
 
         let class = label(event.event_type);
-        self.history_message = if outcome.trained {
-            format!(
-                "Reported the {class}: it no longer counts here or in the PHR, and the \
-                 detector will stop labelling that sound {class}."
-            )
-        } else {
-            format!(
-                "Reported the {class}: it no longer counts here or in the PHR. No embedding \
-                 was stored for it, so the detector was not adjusted."
-            )
+        self.history_message = match outcome.training_effect {
+            sinus_app::flag::TrainingEffect::Applied => format!(
+                "Reported the {class}: it no longer counts here or in the PHR, and detection \
+                 was updated from this event."
+            ),
+            sinus_app::flag::TrainingEffect::Unavailable => format!(
+                "Reported the {class}: it no longer counts here or in the PHR. No local \
+                 embedding was available, so detection was not retrained."
+            ),
+            sinus_app::flag::TrainingEffect::Unchanged => {
+                format!("This {class} was already reported; no duplicate training was added.")
+            }
+            sinus_app::flag::TrainingEffect::Removed => {
+                format!("Reported the {class} and removed its obsolete training.")
+            }
         };
     }
 
@@ -302,37 +311,71 @@ impl SinusApp {
                 return;
             }
         };
-        if outcome.trained {
+        if outcome.classifier_changed {
             self.shared.request_enrollment_reload();
         }
-        self.shared.notify_history_changed();
-        self.shared.request_sync_now();
+        if outcome.event_changed {
+            self.shared.notify_history_changed();
+        }
+        if outcome.sync_required {
+            self.shared.request_sync_now();
+        }
 
-        let was = label(event.event_type);
         let now = label(corrected);
-        // Be honest about what one correction can do: the negative takes effect
-        // immediately, but a personalized class needs three takes before it
-        // matches on its own.
-        self.history_message = format!(
-            "Recorded as {now} instead of {was} — it now counts as {now} here and in the \
-             PHR, and the detector will stop calling that sound {was}. Teach {now} a few \
-             more times for it to be recognised on its own."
-        );
+        self.history_message = match (outcome.training_effect, outcome.progress) {
+            (sinus_app::flag::TrainingEffect::Applied, Some(progress))
+                if progress.positive_examples < progress.activation_threshold =>
+            {
+                let needed = progress.activation_threshold - progress.positive_examples;
+                format!(
+                    "Corrected to {now} and learned from this event — {} of {} examples; \
+                     {needed} more needed.",
+                    progress.positive_examples, progress.activation_threshold
+                )
+            }
+            (sinus_app::flag::TrainingEffect::Applied, _) => {
+                format!("Corrected to {now} and updated detection immediately.")
+            }
+            (sinus_app::flag::TrainingEffect::Unavailable, _) => format!(
+                "Corrected to {now}, but this event no longer has a local embedding, so \
+                 detection was not retrained."
+            ),
+            (sinus_app::flag::TrainingEffect::Unchanged, _) => {
+                format!(
+                    "This event was already corrected to {now}; no duplicate training was added."
+                )
+            }
+            (sinus_app::flag::TrainingEffect::Removed, _) => {
+                format!("Corrected to {now} and removed obsolete training.")
+            }
+        };
     }
 
     /// Undo a false-positive report or a correction. See
     /// `report_false_positive` for why the rules live in `sinus_app::flag`.
     fn clear_flag(&mut self, event: &Event) {
-        if let Err(error) = sinus_app::flag::clear_flag(&self.store, &event.uuid) {
-            self.history_message = format!("Could not restore the event: {error}");
-            return;
+        let outcome = match sinus_app::flag::clear_flag(&self.store, &event.uuid) {
+            Ok(outcome) => outcome,
+            Err(error) => {
+                self.history_message = format!("Could not restore the event: {error}");
+                return;
+            }
+        };
+        if outcome.classifier_changed {
+            self.shared.request_enrollment_reload();
         }
-        self.shared.notify_history_changed();
-        self.shared.request_sync_now();
-        self.history_message =
-            "Restored the event here and in the PHR. Any training it produced is kept — \
-             use Settings › Teach mode to remove that too."
-                .to_string();
+        if outcome.event_changed {
+            self.shared.notify_history_changed();
+        }
+        if outcome.sync_required {
+            self.shared.request_sync_now();
+        }
+        self.history_message = if outcome.event_changed {
+            "Restored the original event and removed the training derived from this feedback."
+                .to_string()
+        } else {
+            "This event had no feedback to undo; detection was unchanged.".to_string()
+        };
     }
 
     #[cfg(not(test))]
