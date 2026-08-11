@@ -45,6 +45,8 @@ rust_library="$repo_root/target/release/libsinus_apple.a"
 # and silently widen this list every time an unrelated view is added.
 model_sources=(
   "$source_root/Models/FeedbackMessageFormatter.swift"
+  "$source_root/Models/ConnectionCheckMessage.swift"
+  "$source_root/Models/ServerUrlNormalizer.swift"
   "$source_root/Models/EventTypeDisplay.swift"
   "$source_root/Models/HistoryEngineProtocol.swift"
   "$source_root/Models/HistoryModel.swift"

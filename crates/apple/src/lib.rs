@@ -1466,6 +1466,43 @@ impl From<sinus_app::sync::SyncState> for SyncState {
     }
 }
 
+/// Mirrors `sinus_core::sync::ConnectionCheck` — see its doc for the incident
+/// ("Check token" proved only that a token existed, never that the server
+/// still accepted it) and for what each variant means. `Http`/`Unreachable`
+/// carry data, so this is a struct-variant enum rather than the fieldless
+/// ones elsewhere in this file (mirrors `TrainingStatus::Inactive`).
+#[derive(Debug, Clone, uniffi::Enum)]
+pub enum AppleConnectionCheck {
+    Ok,
+    Unauthenticated,
+    PatientNotFound,
+    Forbidden,
+    Http { status: u16 },
+    Unreachable { detail: String },
+    NoServerUrl,
+    NoPatientId,
+    NoToken,
+    OfflineStrict,
+}
+
+impl From<sinus_core::sync::ConnectionCheck> for AppleConnectionCheck {
+    fn from(value: sinus_core::sync::ConnectionCheck) -> Self {
+        use sinus_core::sync::ConnectionCheck;
+        match value {
+            ConnectionCheck::Ok => Self::Ok,
+            ConnectionCheck::Unauthenticated => Self::Unauthenticated,
+            ConnectionCheck::PatientNotFound => Self::PatientNotFound,
+            ConnectionCheck::Forbidden => Self::Forbidden,
+            ConnectionCheck::Http(status) => Self::Http { status },
+            ConnectionCheck::Unreachable(detail) => Self::Unreachable { detail },
+            ConnectionCheck::NoServerUrl => Self::NoServerUrl,
+            ConnectionCheck::NoPatientId => Self::NoPatientId,
+            ConnectionCheck::NoToken => Self::NoToken,
+            ConnectionCheck::OfflineStrict => Self::OfflineStrict,
+        }
+    }
+}
+
 /// One tick's worth of sync state, pushed to the shell rather than polled —
 /// the driver thread sleeps between ticks, so a poll would either be stale or
 /// force it awake.
@@ -1637,6 +1674,30 @@ impl SyncController {
             .tokens
             .get_token()?
             .is_some_and(|token| !token.is_empty()))
+    }
+
+    /// Validate the PHR connection live — Settings › PHR "Test connection".
+    /// `has_token` above only ever proved a token was stored; this asks the
+    /// server whether it is still good, using exactly the token the driver
+    /// thread would (this controller's `ForeignTokenStore`), against exactly
+    /// the settings that thread reads.
+    ///
+    /// Performs blocking network I/O (up to the HTTP client's 30-second
+    /// timeout) — Swift must call this off the main thread.
+    pub fn check_connection(&self) -> AppleConnectionCheck {
+        let store = match Store::open(&self._engine.database_path) {
+            Ok(store) => store,
+            Err(error) => {
+                // Opening the local database failed, not the network — still
+                // "could not check" from the user's point of view, and
+                // `Unreachable`'s free-text detail is the variant built for that.
+                return AppleConnectionCheck::Unreachable {
+                    detail: format!("could not open the local database: {error}"),
+                };
+            }
+        };
+        let source = self._engine.platform.source();
+        sinus_app::sync::check_connection(&store, source, Arc::clone(&self.tokens)).into()
     }
 
     /// The last snapshot pushed to the observer, for a view that appears after
@@ -2709,6 +2770,50 @@ mod tests {
         // A second shutdown, after the thread has already stopped, must not panic.
         controller.shutdown(2_000);
 
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// No network: a fresh engine has the default (non-empty) server URL but
+    /// no patient id, so `check_connection` must report that specific
+    /// missing ingredient rather than attempting a request.
+    #[test]
+    fn check_connection_reports_a_missing_ingredient_without_touching_the_network() {
+        let (engine, dir) = temp_engine();
+        let provider: Arc<dyn TokenProvider> = Arc::new(TestTokenProvider::new(None));
+        let observer: Arc<dyn SyncObserver> = Arc::new(TestObserver::default());
+        let controller = SyncController::new(Arc::clone(&engine), provider, observer).unwrap();
+
+        match controller.check_connection() {
+            AppleConnectionCheck::NoPatientId => {}
+            other => panic!("expected NoPatientId, got {other:?}"),
+        }
+
+        controller.shutdown(2_000);
+        let _ = std::fs::remove_dir_all(dir);
+    }
+
+    /// The one case an FFI-level test can exercise without a real network: a
+    /// closed local port, so the probe fails fast with connection-refused
+    /// instead of hanging on the client's 30-second timeout.
+    #[test]
+    fn check_connection_is_unreachable_against_a_closed_port() {
+        let (engine, dir) = temp_engine();
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+        engine.set_server_url(url).unwrap();
+        engine.set_patient_id(Some(7)).unwrap();
+
+        let provider: Arc<dyn TokenProvider> = Arc::new(TestTokenProvider::new(Some("secret")));
+        let observer: Arc<dyn SyncObserver> = Arc::new(TestObserver::default());
+        let controller = SyncController::new(Arc::clone(&engine), provider, observer).unwrap();
+
+        match controller.check_connection() {
+            AppleConnectionCheck::Unreachable { .. } => {}
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+
+        controller.shutdown(2_000);
         let _ = std::fs::remove_dir_all(dir);
     }
 

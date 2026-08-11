@@ -334,6 +334,85 @@ impl SyncConfig {
     }
 }
 
+/// Outcome of validating the PHR connection from Settings. SPEC's "Check
+/// token" affordance only ever proved a token existed in the Keychain, never
+/// that the server still accepted it — an expired or revoked token read
+/// "stored" forever, which is exactly the incident this exists to catch.
+///
+/// `Ok` through `Unreachable` come from an actual HTTP round trip against
+/// [`SyncConfig::settings_url`], the same request `sync_settings` starts
+/// with, so a passing probe means the next flush's first request will
+/// succeed too. `NoServerUrl` / `NoPatientId` / `NoToken` / `OfflineStrict`
+/// are pre-flight verdicts that never touch the network — the app-layer
+/// `sync_config` collapses all three missing-ingredient cases to `None`,
+/// which is exactly the ambiguity a user staring at a blank status line does
+/// not need repeated here.
+#[derive(Debug, Clone, PartialEq, Eq)]
+pub enum ConnectionCheck {
+    /// The server accepted the request: the token is valid for this patient.
+    Ok,
+    /// HTTP 401. Deliberately indistinguishable, server-side, from a token
+    /// that is missing, wrong, or revoked — the server answers exactly
+    /// `{"message":"Unauthenticated."}` in every one of those cases.
+    Unauthenticated,
+    /// HTTP 404: the token authenticated, but this patient id does not exist
+    /// (or is not visible to it).
+    PatientNotFound,
+    /// HTTP 403: the token authenticated, but does not grant access to this
+    /// patient.
+    Forbidden,
+    /// Any other HTTP status.
+    Http(u16),
+    /// The request never got a response — DNS, TLS, connection refused, or an
+    /// unparsable URL. The detail is `reqwest`'s message, concise enough to
+    /// show directly in a status line.
+    Unreachable(String),
+    /// No server URL is configured.
+    NoServerUrl,
+    /// No PHR patient id is configured.
+    NoPatientId,
+    /// No API token is stored.
+    NoToken,
+    /// Offline-strict is structural (SPEC §4.3/§8): no [`SyncEngine`] exists
+    /// in this mode, so there is no request to make — not even this one,
+    /// explicit and user-requested as it is.
+    OfflineStrict,
+}
+
+/// The live half of [`ConnectionCheck`]: one GET against `cfg.settings_url()`,
+/// built exactly as `sync_settings` builds it, so the probe tests the request
+/// a flush would actually make. A free function, not only a method on
+/// [`SyncEngine`], so a caller that already holds a bearer token — the
+/// app-layer policy wrapper — is not forced to go through
+/// [`SyncEngine::bearer`] and its `Result`-shaped "no token" error.
+pub fn probe_connection(
+    client: &reqwest::blocking::Client,
+    cfg: &SyncConfig,
+    token: &str,
+) -> ConnectionCheck {
+    let resp = match client
+        .get(cfg.settings_url())
+        .header(reqwest::header::ACCEPT, "application/json")
+        .bearer_auth(token)
+        .send()
+    {
+        Ok(resp) => resp,
+        Err(e) => return ConnectionCheck::Unreachable(e.to_string()),
+    };
+    let status = resp.status();
+    if status.is_success() {
+        ConnectionCheck::Ok
+    } else if status == reqwest::StatusCode::UNAUTHORIZED {
+        ConnectionCheck::Unauthenticated
+    } else if status == reqwest::StatusCode::NOT_FOUND {
+        ConnectionCheck::PatientNotFound
+    } else if status == reqwest::StatusCode::FORBIDDEN {
+        ConnectionCheck::Forbidden
+    } else {
+        ConnectionCheck::Http(status.as_u16())
+    }
+}
+
 /// Exponential backoff with full jitter (SPEC §4.3): 30 s → 30 min cap.
 #[derive(Debug, Clone)]
 pub struct Backoff {
@@ -454,6 +533,16 @@ impl<T: TokenStore> SyncEngine<T> {
             )));
         }
         Ok(())
+    }
+
+    /// Ask the server directly whether the stored token is still good for
+    /// this patient, rather than only confirming one is stored — see
+    /// [`ConnectionCheck`]'s doc for the incident that motivated this.
+    pub fn check_connection(&self) -> ConnectionCheck {
+        match self.bearer() {
+            Ok(token) => probe_connection(&self.client, &self.cfg, &token),
+            Err(_) => ConnectionCheck::NoToken,
+        }
     }
 
     /// Whether a response means "this PHR predates the feature" rather than a
@@ -1474,5 +1563,112 @@ mod tests {
         b.reset();
         assert_eq!(b.attempt(), 0);
         assert_eq!(b.ceiling().as_secs(), 30);
+    }
+
+    // --- check_connection -------------------------------------------------
+
+    /// A one-route server that always answers a fixed status. `Mock` cannot
+    /// produce anything but 200 (configured) or 404 (unmatched), which is not
+    /// enough to exercise 401/403 here.
+    struct StatusServer {
+        url: String,
+        shutdown: Arc<AtomicBool>,
+        handle: Option<std::thread::JoinHandle<()>>,
+    }
+
+    impl StatusServer {
+        fn start(status: u16) -> StatusServer {
+            let server = tiny_http::Server::http("127.0.0.1:0").unwrap();
+            let url = format!("http://{}", server.server_addr());
+            let shutdown = Arc::new(AtomicBool::new(false));
+            let stop = Arc::clone(&shutdown);
+            let handle = std::thread::spawn(move || {
+                while !stop.load(Ordering::Relaxed) {
+                    let Ok(Some(req)) = server.recv_timeout(std::time::Duration::from_millis(50))
+                    else {
+                        continue;
+                    };
+                    let resp =
+                        tiny_http::Response::from_string("{}".to_string()).with_status_code(status);
+                    req.respond(resp).ok();
+                }
+            });
+            StatusServer {
+                url,
+                shutdown,
+                handle: Some(handle),
+            }
+        }
+    }
+
+    impl Drop for StatusServer {
+        fn drop(&mut self) {
+            self.shutdown.store(true, Ordering::Relaxed);
+            if let Some(handle) = self.handle.take() {
+                handle.join().ok();
+            }
+        }
+    }
+
+    #[test]
+    fn check_connection_maps_200_to_ok() {
+        let server = StatusServer::start(200);
+        assert_eq!(
+            engine_for(server.url.clone()).check_connection(),
+            ConnectionCheck::Ok
+        );
+    }
+
+    #[test]
+    fn check_connection_maps_401_to_unauthenticated() {
+        let server = StatusServer::start(401);
+        assert_eq!(
+            engine_for(server.url.clone()).check_connection(),
+            ConnectionCheck::Unauthenticated
+        );
+    }
+
+    #[test]
+    fn check_connection_maps_404_to_patient_not_found() {
+        let server = StatusServer::start(404);
+        assert_eq!(
+            engine_for(server.url.clone()).check_connection(),
+            ConnectionCheck::PatientNotFound
+        );
+    }
+
+    #[test]
+    fn check_connection_maps_403_to_forbidden() {
+        let server = StatusServer::start(403);
+        assert_eq!(
+            engine_for(server.url.clone()).check_connection(),
+            ConnectionCheck::Forbidden
+        );
+    }
+
+    #[test]
+    fn check_connection_is_unreachable_once_the_server_is_gone() {
+        // Bind, note the port, then drop immediately — a socket nothing is
+        // listening on, so the probe hits connection-refused rather than
+        // hanging until the client timeout.
+        let listener = std::net::TcpListener::bind("127.0.0.1:0").unwrap();
+        let url = format!("http://{}", listener.local_addr().unwrap());
+        drop(listener);
+
+        match engine_for(url).check_connection() {
+            ConnectionCheck::Unreachable(_) => {}
+            other => panic!("expected Unreachable, got {other:?}"),
+        }
+    }
+
+    #[test]
+    fn check_connection_reports_no_token_without_touching_the_network() {
+        let engine = SyncEngine::for_mode(
+            Mode::AutoBatch,
+            config("http://127.0.0.1:1".into()),
+            InMemoryTokenStore::new(),
+        )
+        .unwrap();
+        assert_eq!(engine.check_connection(), ConnectionCheck::NoToken);
     }
 }

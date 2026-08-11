@@ -28,6 +28,8 @@ await MainActor.run {
     testFeedbackMessageFormatter()
     testHistoryModel()
     testTrainingModel()
+    testServerUrlNormalizer()
+    testConnectionCheckMessage()
 }
 
 if failureCount > 0 {
