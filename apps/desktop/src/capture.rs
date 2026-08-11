@@ -267,9 +267,20 @@ fn run(db_path: PathBuf, shared: SharedStatus) -> Result<(), String> {
         // Advance first, then publish the state produced by this buffer. Reading
         // before `push` made every UI transition one audio buffer stale and hid
         // the beginning/end of calibration.
-        let events = pipeline
-            .push(&buf[..n])
-            .map_err(|error| error.to_string())?;
+        let events = match pipeline.push(&buf[..n]) {
+            Ok(events) => events,
+            Err(error) => {
+                // A transient inference failure must not terminate the only
+                // capture worker. Publish the gate's current calibration state,
+                // clear the in-progress UI hint, and try the next audio buffer.
+                eprintln!("capture: pipeline push failed: {error}");
+                let diagnostics = pipeline.gate_diagnostics();
+                shared.set_calibrating(diagnostics.calibrating);
+                shared.set_analyzing(false);
+                gate_was_open = diagnostics.open;
+                continue;
+            }
+        };
         let diagnostics = pipeline.gate_diagnostics();
         let gate_open = diagnostics.open;
         shared.set_calibrating(diagnostics.calibrating);
