@@ -5,6 +5,9 @@ import SinusAppleFFI
 #if os(macOS)
 import AppKit
 #endif
+#if os(iOS)
+import UIKit
+#endif
 
 /// Owns the `SyncController` and everything Settings › PHR renders. Mirrors
 /// the desktop tray's `SettingsForm` PHR section (`app.rs:689-796`), including
@@ -32,6 +35,10 @@ final class SyncModel {
     /// so the view can disable the button rather than let a user queue up
     /// several probes against a server that has not answered the first one.
     private(set) var isCheckingConnection = false
+    /// Set for the duration of `signIn()`'s browser round trip, so the view
+    /// can disable the "Sign in with PHR…" button rather than let a second
+    /// tap open a second `ASWebAuthenticationSession` on top of the first.
+    private(set) var isSigningIn = false
     /// Set by `suspend()`, cleared by `resume()` — distinct from "no engine"
     /// (this device never got as far as starting sync at all): `resume()`
     /// only rebuilds the controller when this is true.
@@ -225,6 +232,81 @@ final class SyncModel {
         } catch {
             message = "Could not save token: \(error.localizedDescription)"
         }
+    }
+
+    /// "Sign in with PHR": runs the browser-based device-pairing flow
+    /// (`PhrSignInSession`) instead of asking the user to paste a token by
+    /// hand. Guards mirror `checkConnection`'s no-controller/already-running
+    /// checks, plus one of its own — there is no server to pair with until a
+    /// URL is saved.
+    func signIn() {
+        guard engine != nil, controller != nil, !isSigningIn else { return }
+        if phr == nil {
+            reload()
+        }
+        guard let phrSettings = phr else {
+            message = "Could not read this device's settings — try again."
+            return
+        }
+        guard !phrSettings.serverUrl.isEmpty else {
+            message = "Set the server URL above before signing in."
+            return
+        }
+
+        #if os(macOS)
+        let deviceName = Host.current().localizedName ?? "Mac"
+        #else
+        let deviceName = UIDevice.current.name
+        #endif
+
+        isSigningIn = true
+        message = nil
+        let session = PhrSignInSession(
+            serverRoot: phrSettings.serverUrl,
+            deviceId: phrSettings.deviceId,
+            deviceName: deviceName
+        )
+        // `session` is `@MainActor`-isolated, non-`Sendable` state; capturing
+        // it into an explicitly `@MainActor` task closure is the same
+        // established pattern as `start()`'s termination observer and
+        // `TrainingModel`'s take-completion hops, not `Task.detached`'s
+        // (`checkConnection`'s network call blocks a thread and so must
+        // leave the main actor; this one only ever awaits, so it need not).
+        Task { @MainActor [weak self] in
+            let outcome = await session.signIn()
+            self?.finishSignIn(outcome)
+        }
+    }
+
+    private func finishSignIn(_ outcome: PhrSignInSession.Outcome) {
+        isSigningIn = false
+        switch outcome {
+        case .success(let success):
+            saveToken(success.token)
+            message = "Signed in — this Mac now has its own key, expiring \(Self.formatExpiry(success.expiresAt))."
+            checkConnection()
+        case .failure(.cancelled):
+            message = "Sign-in was cancelled."
+        case .failure(.denied):
+            message = "The pairing request was denied in the browser."
+        case .failure(.invalidCode):
+            message = "The pairing code was invalid or expired — try signing in again."
+        case .failure(.network(let detail)):
+            message = "Could not reach the server: \(detail)"
+        case .failure(.server(let detail)):
+            message = detail
+        }
+    }
+
+    /// Best-effort human formatting of the exchange's ISO8601 `expires_at` —
+    /// falls back to the raw string rather than hiding a token that did save
+    /// just because its expiry did not parse.
+    private static func formatExpiry(_ iso8601: String) -> String {
+        guard let date = ISO8601DateFormatter().date(from: iso8601) else { return iso8601 }
+        let formatter = DateFormatter()
+        formatter.dateStyle = .medium
+        formatter.timeStyle = .short
+        return formatter.string(from: date)
     }
 
     /// Checks only whether a token exists; never reads it into the UI —

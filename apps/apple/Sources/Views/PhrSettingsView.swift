@@ -54,6 +54,24 @@ struct PhrSettingsView: View {
             }
 
             Section("API token") {
+                Button {
+                    sync.signIn()
+                } label: {
+                    if sync.isSigningIn {
+                        HStack {
+                            ProgressView()
+                                .controlSize(.small)
+                            Text("Signing in…")
+                        }
+                    } else {
+                        Text("Sign in with PHR…")
+                    }
+                }
+                .disabled(sync.isSigningIn)
+                Text("Opens your PHR in the browser to authorize this Mac — no key pasting needed.")
+                    .font(.footnote)
+                    .foregroundStyle(.secondary)
+
                 SecureField("API token", text: $tokenText)
                 HStack {
                     Button("Save token") {

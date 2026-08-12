@@ -30,6 +30,7 @@ await MainActor.run {
     testTrainingModel()
     testServerUrlNormalizer()
     testConnectionCheckMessage()
+    testDevicePairing()
 }
 
 if failureCount > 0 {
