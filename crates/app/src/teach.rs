@@ -187,7 +187,9 @@ pub fn peak_dbfs(samples: &[f32]) -> Option<f32> {
     const HOP: usize = SAMPLE_RATE as usize / 20;
 
     samples
-        .chunks_exact(HOP)
+        .as_chunks::<HOP>()
+        .0
+        .iter()
         .map(|hop| {
             let sum_sq: f64 = hop.iter().map(|&x| (x as f64) * (x as f64)).sum();
             let rms = (sum_sq / hop.len() as f64).sqrt();
